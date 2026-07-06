@@ -88,6 +88,11 @@ jobs:
             ./${{ env.PROJECT_RELEASE_PATH }}
             !./${{ env.PROJECT_RELEASE_PATH }}.zip
 
+    - name: Upload Pages Artifact
+      uses: actions/upload-pages-artifact@v5
+      with:
+        path: ./${{ env.PROJECT_RELEASE_PATH }}
+
     - name: Upload Artifact to Release
       uses: softprops/action-gh-release@v3
       with:
@@ -95,3 +100,18 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       if: github.event_name == 'release' && github.event.action == 'published'
+
+  deploy-pages:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v5
