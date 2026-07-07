@@ -47,11 +47,8 @@ vim.keymap.set("n", "<leader>r", function()
   })
 end, { desc = "Build and debug with gdbgui" })
 
--- Auto-reload files changed externally
-vim.o.autoread = true
-vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter", "CursorHold" }, {
-  callback = function() vim.cmd("checktime") end,
-})
+-- Live reload of external edits + AI-tagged undo tree (<leader>u)
+dofile(project_root .. "/nvim_project_plugins/ai_undotree.lua")
 
 -- Auto-reload this config when saved
 vim.api.nvim_create_autocmd("BufWritePost", {
