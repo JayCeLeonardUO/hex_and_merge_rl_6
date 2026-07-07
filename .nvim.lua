@@ -50,6 +50,26 @@ end, { desc = "Build and debug with gdbgui" })
 -- Live reload of external edits + AI-tagged undo tree (<leader>u)
 dofile(project_root .. "/nvim_project_plugins/ai_undotree.lua")
 
+-- clangd LSP (uses build/compile_commands.json via .clangd config)
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = { "c", "cpp" },
+  callback = function(ev)
+    vim.lsp.start({
+      name = "clangd",
+      cmd = { "clangd" },
+      root_dir = project_root,
+    }, { bufnr = ev.buf })
+  end,
+})
+
+-- Format on save via clangd (.clang-format = raylib style per CONVENTIONS.md)
+vim.api.nvim_create_autocmd("BufWritePre", {
+  pattern = { "*.c", "*.h", "*.cpp", "*.hpp" },
+  callback = function()
+    vim.lsp.buf.format({ async = false })
+  end,
+})
+
 -- Auto-reload this config when saved
 vim.api.nvim_create_autocmd("BufWritePost", {
   pattern = "*/.nvim.lua",

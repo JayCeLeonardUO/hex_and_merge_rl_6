@@ -73,7 +73,7 @@ function M.render()
   local lines, seqs, ai_lines = {}, {}, {}
   local name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(p.target_buf), ":t")
   table.insert(lines, " undo tree: " .. name .. "  (CR jump / q quit)")
-  table.insert(seqs, nil)
+  table.insert(seqs, false) -- header has no state; nil would collapse the table
 
   for i = #states, 1, -1 do -- newest first
     local s = states[i]

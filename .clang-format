@@ -1,0 +1,27 @@
+# raylib style, per CONVENTIONS.md
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 0
+
+# Braces: open-close aligned (Allman)
+BreakBeforeBraces: Allman
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+
+# Pointers: Type *pointer
+PointerAlignment: Right
+
+# Includes: keep template's grouping
+SortIncludes: false
+
+# Spaces
+SpaceBeforeParens: ControlStatements
+SpaceAfterCStyleCast: false
+
+# Switch
+IndentCaseLabels: true
