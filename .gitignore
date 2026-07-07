@@ -78,3 +78,7 @@ android.*
 *.js
 !src/minshell.html
 !src/shell.html
+
+# Build directories
+build/
+build-web/

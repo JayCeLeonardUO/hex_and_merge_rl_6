@@ -5,10 +5,11 @@ on:
   push:
     paths:
       - 'src/**'
+      - 'CMakeLists.txt'
       - '.github/workflows/build_windows.yml'
   release:
     types: [published]
-    
+
 permissions:
   contents: read
 
@@ -18,63 +19,35 @@ jobs:
       contents: write       # Required for actions/upload-release-asset to upload release asset
     runs-on: windows-latest
 
-    # WARNING: Project (internal) name could not be the same as repository name
     env:
-      PROJECT_NAME: raylib_game
-      PROJECT_REPO_NAME: ${{ github.event.repository.name }}
-      PROJECT_BUILD_PATH: "${{ github.event.repository.name }}\\projects\\VS2022\\build\\raylib_game\\bin\\x64\\Release"
+      PROJECT_NAME: ${{ github.event.repository.name }}
       PROJECT_RELEASE_PATH: ${{ github.event.repository.name }}_dev_win_x64
-      PROJECT_RESOURCES_SRC_PATH: src\resources
-      PROJECT_RESOURCES_DST_PATH: resources
+      # CMake project/target name, fixed in CMakeLists.txt
+      CMAKE_TARGET_NAME: raylib-game-template
 
     steps:
     - name: Checkout this repo
       uses: actions/checkout@master
-      with:
-        path: ${{ env.PROJECT_REPO_NAME }}
-      
-    - name: Checkout raylib repo
-      uses: actions/checkout@master
-      with:
-        repository: raysan5/raylib
-        path: raylib
 
-    # NOTE: Visual Studio project build configuration already defines all required directories where project is generated:
-    # $(SolutionDir)\build\$(ProjectName)\bin\$(Platform)\$(Configuration)\
     - name: Setup Release Paths
       run: |
         echo "PROJECT_RELEASE_PATH=${{ env.PROJECT_NAME }}_v${{ github.event.release.tag_name }}_win_x64" >> $GITHUB_ENV
       shell: bash
       if: github.event_name == 'release' && github.event.action == 'published'
 
-    - name: Setup Environment
+    - name: Build Product
       run: |
-        mkdir ${{ env.PROJECT_RELEASE_PATH }}
-        dir
-      shell: cmd
-
-    # Setup MSBuild.exe path if required
-    - name: Setup MSBuild path
-      uses: microsoft/setup-msbuild@v3
-
-    - name: Build raylib Library + Product (VS2022 solution)
-      run: |
-        dir
-        cd ${{ env.PROJECT_REPO_NAME }}/projects/VS2022
-        msbuild.exe ${{ env.PROJECT_NAME }}.sln /target:${{ env.PROJECT_NAME }} /property:Configuration=Release /property:Platform=x64 /property:RaylibSrcPath="..\..\..\..\raylib\src"
-        cd ../..
-      shell: cmd
+        cmake -B build
+        cmake --build build --config Release
 
     - name: Generate Artifacts
       run: |
-        dir ${{ env.PROJECT_BUILD_PATH }}
-        copy /Y ${{ env.PROJECT_BUILD_PATH }}\${{ env.PROJECT_NAME }}.exe ${{ env.PROJECT_RELEASE_PATH }}\${{ env.PROJECT_NAME }}.exe
-        xcopy ${{ env.PROJECT_REPO_NAME }}\${{ env.PROJECT_RESOURCES_SRC_PATH }} ${{ env.PROJECT_RELEASE_PATH }}\${{ env.PROJECT_RESOURCES_DST_PATH }} /s /e /i
-        copy /Y ${{ env.PROJECT_REPO_NAME }}\README.md ${{ env.PROJECT_RELEASE_PATH }}\README.md
-        copy /Y ${{ env.PROJECT_REPO_NAME }}\LICENSE ${{ env.PROJECT_RELEASE_PATH }}\LICENSE
-        dir ${{ env.PROJECT_RELEASE_PATH }}
-        7z a .\${{ env.PROJECT_RELEASE_PATH }}.zip .\${{ env.PROJECT_RELEASE_PATH }}
-      shell: cmd
+        mkdir -p ${{ env.PROJECT_RELEASE_PATH }}
+        cp -r build/${{ env.CMAKE_TARGET_NAME }}/Release/. ${{ env.PROJECT_RELEASE_PATH }}/
+        cp README.md LICENSE ${{ env.PROJECT_RELEASE_PATH }}/
+        ls ${{ env.PROJECT_RELEASE_PATH }}
+        7z a ./${{ env.PROJECT_RELEASE_PATH }}.zip ./${{ env.PROJECT_RELEASE_PATH }}
+      shell: bash
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v7

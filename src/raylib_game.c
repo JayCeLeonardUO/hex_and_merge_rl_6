@@ -11,6 +11,10 @@
 
 #include "raylib.h"
 
+#define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
+#include "cimgui.h"  // Dear ImGui C bindings
+#include "rlImGui.h" // raylib backend for Dear ImGui
+
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h> // Emscripten library
 #endif
@@ -183,7 +187,7 @@ static void UpdateEntity(Entity *entity)
     {
         case ENTITY_HEX_CELL:
         {
-            entity->hovered = ((entity->q == mouseHexQ) && (entity->r == mouseHexR));
+            entity->hovered = ((entity->q == mouseHexQ) && (entity->r == mouseHexR) && !uiWantsMouse);
 
             if (entity->hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             {
@@ -226,6 +230,10 @@ static void UpdateDrawFrame(void)
     //----------------------------------------------------------------------------------
     frameCounter++;
 
+    // When ImGui wants the mouse (hovering/dragging a UI window), the board
+    // must not see clicks; WantCaptureMouse lags one frame, which is fine
+    uiWantsMouse = igGetIO_Nil()->WantCaptureMouse;
+
     HexPixelToAxial(GetMousePosition(), &mouseHexQ, &mouseHexR);
 
     for (int i = 0; i < entityCount; i++) UpdateEntity(&entities[i]);
@@ -254,7 +262,27 @@ static void UpdateDrawFrame(void)
     DrawTexturePro(target.texture, (Rectangle){0, 0, (float)target.texture.width, -(float)target.texture.height},
                    (Rectangle){0, 0, (float)target.texture.width, (float)target.texture.height}, (Vector2){0, 0}, 0.0f, WHITE);
 
-    // TODO: Draw everything that requires to be drawn at this point, maybe UI?
+    // ImGui UI, drawn on top of the scaled game texture
+    rlImGuiBegin();
+
+    igBegin("hex debug", NULL, 0);
+    igText("entities: %d/%d", entityCount, MAX_ENTITIES);
+    igText("mouse cell: (q=%d, r=%d)", mouseHexQ, mouseHexR);
+
+    int selectedCount = 0;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if ((entities[i].kind == ENTITY_HEX_CELL) && entities[i].selected) selectedCount++;
+    }
+    igText("selected: %d", selectedCount);
+
+    if (igButton("clear selection", (ImVec2_c){0, 0}))
+    {
+        for (int i = 0; i < entityCount; i++) entities[i].selected = false;
+    }
+    igEnd();
+
+    rlImGuiEnd();
 
     EndDrawing();
     //----------------------------------------------------------------------------------
@@ -278,6 +306,8 @@ int main(void)
     target = LoadRenderTexture(screenWidth, screenHeight);
     SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
 
+    rlImGuiSetup(true); // Dear ImGui with the dark theme
+
     // Entity pool: one allocation for the whole game, entities live in a
     // packed array with swap-back removal
     entities = (Entity *)calloc(MAX_ENTITIES, sizeof(Entity));
@@ -300,6 +330,7 @@ int main(void)
 
     // De-Initialization
     //--------------------------------------------------------------------------------------
+    rlImGuiShutdown();
     UnloadRenderTexture(target);
     free(entities);
 

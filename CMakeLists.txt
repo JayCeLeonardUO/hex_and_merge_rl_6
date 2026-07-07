@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24...3.30)
-project(raylib-game-template)
+project(raylib-game-template LANGUAGES C CXX)
 
 include(FetchContent)
 
@@ -16,7 +16,27 @@ FetchContent_Declare(
     FIND_PACKAGE_ARGS
 )
 
-FetchContent_MakeAvailable(raylib)
+# cimgui: C bindings for Dear ImGui (bundles imgui as a submodule)
+set(IMGUI_STATIC "yes" CACHE STRING "Build cimgui as a static library" FORCE)
+FetchContent_Declare(
+    cimgui
+    GIT_REPOSITORY https://github.com/cimgui/cimgui.git
+    GIT_TAG d298666861ebf00dcfeb2407409931c04e47e33c
+)
+
+# rlImGui: raylib backend for Dear ImGui (no CMakeLists, built below)
+FetchContent_Declare(
+    rlimgui
+    GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
+    GIT_TAG ef129d1858373b6fe332c45f85a1dfc1421bebae
+)
+
+FetchContent_MakeAvailable(raylib cimgui rlimgui)
+
+add_library(rlimgui_lib STATIC ${rlimgui_SOURCE_DIR}/rlImGui.cpp)
+target_include_directories(rlimgui_lib PUBLIC ${rlimgui_SOURCE_DIR})
+target_link_libraries(rlimgui_lib PUBLIC cimgui raylib)
+target_compile_definitions(rlimgui_lib PUBLIC NO_FONT_AWESOME)
 
 # Our Project
 add_executable(${PROJECT_NAME})
@@ -42,13 +62,13 @@ else()
 endif()
 
 #set(raylib_VERBOSE 1)
-target_link_libraries(${PROJECT_NAME} raylib)
+target_link_libraries(${PROJECT_NAME} raylib rlimgui_lib)
 
 # Web Configurations
 if ("${PLATFORM}" STREQUAL "Web")
     # Tell Emscripten to build an example.html file.
     set_target_properties(${PROJECT_NAME} PROPERTIES SUFFIX ".html")
-    target_link_options(${PROJECT_NAME} PUBLIC -sUSE_GLFW=3 PUBLIC --preload-file resources)
+    target_link_options(${PROJECT_NAME} PUBLIC -sUSE_GLFW=3 PUBLIC --preload-file resources PUBLIC -sALLOW_MEMORY_GROWTH=1 PUBLIC --shell-file ${CMAKE_SOURCE_DIR}/src/minshell.html)
 endif()
 
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
