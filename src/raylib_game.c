@@ -21,7 +21,7 @@
 
 #include <stdio.h>  // Required for: printf()
 #include <stdlib.h> // Required for: calloc(), free(), abs()
-#include <string.h> // Required for:
+#include <string.h> // Required for: memset()
 #include <math.h>   // Required for: sqrtf(), roundf(), fabsf()
 
 //----------------------------------------------------------------------------------
@@ -38,7 +38,14 @@
 
 #define MAX_ENTITIES 1024 // Entity pool capacity, allocated once at startup
 #define GRID_RADIUS 4     // Hex board radius in cells around the center
-#define HEX_SIZE 40.0f    // Hex circumradius (center to vertex) in pixels
+#define HEX_SIZE 1.0f     // Hex circumradius (center to vertex) in world units
+
+// 2.5D: tiles are hexagonal prisms standing on the y=0 plane
+#define HEX_TILE_HEIGHT 0.2f          // Resting tile thickness
+#define HEX_TILE_HEIGHT_HOVER 0.4f    // Tile thickness while hovered
+#define HEX_TILE_HEIGHT_SELECTED 0.7f // Tile thickness while selected
+
+#define HEX_CELL_OFFBOARD 999 // Axial coord that can never be on the board
 
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
@@ -65,19 +72,19 @@ typedef struct Entity
 {
     EntityKind kind; // Behavior tag, ENTITY_NONE = free slot
 
-    // Spatial members
-    Vector2 position; // Pixel position on screen (hex cell: precomputed center)
-    Vector2 velocity; // Pixels per frame, for anything that moves
-    float radius;     // Pixel radius (hex cell: circumradius)
+    // Spatial members (world space, board lies on the y=0 plane)
+    Vector3 position; // World position (hex cell: base center on the board plane)
+    Vector3 velocity; // World units per frame, for anything that moves
+    float radius;     // World radius (hex cell: circumradius)
 
-    // Hex board members (axial coordinates, pointy-top)
+    // Hex board members (axial coordinates, pointy-top on the XZ plane)
     // https://www.redblobgames.com/grids/hexagons/
     int q; // Axial column, 0 at board center, range [-GRID_RADIUS, GRID_RADIUS]
     int r; // Axial row, 0 at board center, |q + r| <= GRID_RADIUS
 
     // Gameplay members
     int value;     // Merge value, 0 means empty
-    bool hovered;  // True while the mouse is over this entity (refreshed every frame)
+    bool hovered;  // True while the mouse ray hits this entity (refreshed every frame)
     bool selected; // True when toggled by a click
 
     // Visual members
@@ -118,35 +125,36 @@ static void EntityDespawn(int index)
     entityCount--;
 }
 
-// Convert axial coordinates to a pixel center (pointy-top layout)
-static Vector2 HexAxialToPixel(int q, int r)
+// Convert axial coordinates to a world position on the board plane (pointy-top layout)
+static Vector3 HexAxialToWorld(int q, int r)
 {
     float sqrt3 = sqrtf(3.0f);
-    Vector2 pixel = {0};
-    pixel.x = screenWidth / 2.0f + HEX_SIZE * (sqrt3 * (float)q + sqrt3 / 2.0f * (float)r);
-    pixel.y = screenHeight / 2.0f + HEX_SIZE * (3.0f / 2.0f) * (float)r;
-    return pixel;
+    Vector3 world = {0};
+    world.x = HEX_SIZE * (sqrt3 * (float)q + sqrt3 / 2.0f * (float)r);
+    world.y = 0.0f;
+    world.z = HEX_SIZE * (3.0f / 2.0f) * (float)r;
+    return world;
 }
 
-// Convert a pixel position to axial coordinates, rounded to the nearest cell
-static void HexPixelToAxial(Vector2 pixel, int *q, int *r)
+// Convert a point on the board plane to axial coordinates, rounded to the nearest cell
+static void HexWorldToAxial(float x, float z, int *q, int *r)
 {
     float sqrt3 = sqrtf(3.0f);
-    float px = (pixel.x - screenWidth / 2.0f) / HEX_SIZE;
-    float py = (pixel.y - screenHeight / 2.0f) / HEX_SIZE;
-    float qf = sqrt3 / 3.0f * px - 1.0f / 3.0f * py;
-    float rf = 2.0f / 3.0f * py;
+    float px = x / HEX_SIZE;
+    float pz = z / HEX_SIZE;
+    float qf = sqrt3 / 3.0f * px - 1.0f / 3.0f * pz;
+    float rf = 2.0f / 3.0f * pz;
 
     // Cube rounding: round each cube coord, then fix the one that drifted most
-    float x = qf;
-    float z = rf;
-    float y = -x - z;
-    float rx = roundf(x);
-    float ry = roundf(y);
-    float rz = roundf(z);
-    float dx = fabsf(rx - x);
-    float dy = fabsf(ry - y);
-    float dz = fabsf(rz - z);
+    float cx = qf;
+    float cz = rf;
+    float cy = -cx - cz;
+    float rx = roundf(cx);
+    float ry = roundf(cy);
+    float rz = roundf(cz);
+    float dx = fabsf(rx - cx);
+    float dy = fabsf(ry - cy);
+    float dz = fabsf(rz - cz);
 
     if ((dx > dy) && (dx > dz))
         rx = -ry - rz;
@@ -173,7 +181,7 @@ static void SpawnHexGrid(void)
 
             cell->q = q;
             cell->r = r;
-            cell->position = HexAxialToPixel(q, r);
+            cell->position = HexAxialToWorld(q, r);
             cell->radius = HEX_SIZE;
             cell->tint = LIGHTGRAY;
         }
@@ -200,7 +208,7 @@ static void UpdateEntity(Entity *entity)
     }
 }
 
-// Per-entity drawing, dispatched on kind
+// Per-entity drawing, dispatched on kind (called inside BeginMode3D)
 static void DrawEntity(const Entity *entity)
 {
     switch (entity->kind)
@@ -213,10 +221,17 @@ static void DrawEntity(const Entity *entity)
             if (entity->selected) fill = GOLD;
             if (entity->hovered) fill = entity->selected ? ORANGE : SKYBLUE;
 
-            DrawPoly(entity->position, 6, drawSize, 90.0f, fill);
-            DrawPolyLinesEx(entity->position, 6, drawSize, 90.0f, 2.0f, DARKGRAY);
+            // Hover and selection read as raised tiles
+            float height = HEX_TILE_HEIGHT;
+            if (entity->selected)
+                height = HEX_TILE_HEIGHT_SELECTED;
+            else if (entity->hovered)
+                height = HEX_TILE_HEIGHT_HOVER;
 
-            if (entity->hovered) DrawText(TextFormat("cell (q=%d, r=%d)", entity->q, entity->r), 24, screenHeight - 40, 20, DARKGRAY);
+            // A 6-slice cylinder is a hexagonal prism; raylib places the first
+            // vertex on +Z, which matches the pointy-top axial layout
+            DrawCylinder(entity->position, drawSize, drawSize, height, 6, fill);
+            DrawCylinderWires(entity->position, drawSize, drawSize, height, 6, DARKGRAY);
         }
         break;
         default: break;
@@ -234,7 +249,21 @@ static void UpdateDrawFrame(void)
     // must not see clicks; WantCaptureMouse lags one frame, which is fine
     uiWantsMouse = igGetIO_Nil()->WantCaptureMouse;
 
-    HexPixelToAxial(GetMousePosition(), &mouseHexQ, &mouseHexR);
+    // Pick the cell under the mouse: cast a ray through the cursor and
+    // intersect it with the board plane (y = 0)
+    mouseHexQ = HEX_CELL_OFFBOARD;
+    mouseHexR = HEX_CELL_OFFBOARD;
+    Ray mouseRay = GetScreenToWorldRay(GetMousePosition(), camera);
+    if (fabsf(mouseRay.direction.y) > 0.0001f)
+    {
+        float t = -mouseRay.position.y / mouseRay.direction.y;
+        if (t > 0.0f)
+        {
+            float hitX = mouseRay.position.x + mouseRay.direction.x * t;
+            float hitZ = mouseRay.position.z + mouseRay.direction.z * t;
+            HexWorldToAxial(hitX, hitZ, &mouseHexQ, &mouseHexR);
+        }
+    }
 
     for (int i = 0; i < entityCount; i++) UpdateEntity(&entities[i]);
     //----------------------------------------------------------------------------------
@@ -246,7 +275,22 @@ static void UpdateDrawFrame(void)
     BeginTextureMode(target);
     ClearBackground(RAYWHITE);
 
+    // 2.5D: the world is 3D, viewed through a tilted perspective camera
+    BeginMode3D(camera);
+
     for (int i = 0; i < entityCount; i++) DrawEntity(&entities[i]);
+
+    EndMode3D();
+
+    // 2D overlay on top of the 3D view
+    for (int i = 0; i < entityCount; i++)
+    {
+        if ((entities[i].kind == ENTITY_HEX_CELL) && entities[i].hovered)
+        {
+            DrawText(TextFormat("cell (q=%d, r=%d)", entities[i].q, entities[i].r), 24, screenHeight - 40, 20, DARKGRAY);
+            break;
+        }
+    }
 
     if ((frameCounter / 20) % 2) DrawText("hex merge time!", screenWidth / 2 - MeasureText("hex merge time!", 30) / 2, 28, 30, MAROON);
 
