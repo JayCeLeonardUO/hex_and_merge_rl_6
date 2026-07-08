@@ -61,8 +61,9 @@ typedef enum
 // Tag that marks an entity's behavior in the update/draw switches
 typedef enum EntityKind
 {
-    ENTITY_NONE = 0, // Free slot, skipped everywhere
-    ENTITY_HEX_CELL, // One clickable cell of the hex board
+    ENTITY_NONE = 0,   // Free slot, skipped everywhere
+    ENTITY_HEX_CELL,   // One clickable cell of the hex board
+    ENTITY_HEALTH_BAR, // Row of heart icons in the screen-space UI layer
 } EntityKind;
 
 // Fat struct: every possible member any entity could have, in one struct.
@@ -72,7 +73,8 @@ typedef struct Entity
 {
     EntityKind kind; // Behavior tag, ENTITY_NONE = free slot
 
-    // Spatial members (world space, board lies on the y=0 plane)
+    // Spatial members (world space, board lies on the y=0 plane;
+    // UI kinds read position.x/.y as screen pixels instead)
     Vector3 position; // World position (hex cell: base center on the board plane)
     Vector3 velocity; // World units per frame, for anything that moves
     float radius;     // World radius (hex cell: circumradius)
@@ -86,6 +88,8 @@ typedef struct Entity
     int value;     // Merge value, 0 means empty
     bool hovered;  // True while the mouse ray hits this entity (refreshed every frame)
     bool selected; // True when toggled by a click
+    int health;    // Current health shown by a health bar
+    int maxHealth; // Total hearts a health bar draws
 
     // Visual members
     Color tint;       // Base fill color
@@ -238,6 +242,28 @@ static void DrawEntity(const Entity *entity)
     }
 }
 
+// Per-entity UI drawing, dispatched on kind (screen space, called after EndMode3D)
+static void DrawEntityUI(const Entity *entity)
+{
+    switch (entity->kind)
+    {
+        case ENTITY_HEALTH_BAR:
+        {
+            float scale = 1.5f; // 32px pixel-art hearts drawn at 48px
+            float step = (float)heartTexture.width * scale + 4.0f;
+
+            for (int i = 0; i < entity->maxHealth; i++)
+            {
+                Vector2 pos = {entity->position.x + (float)i * step, entity->position.y};
+                Color tint = (i < entity->health) ? WHITE : Fade(DARKGRAY, 0.4f); // Lost hearts are dimmed
+                DrawTextureEx(heartTexture, pos, 0.0f, scale, tint);
+            }
+        }
+        break;
+        default: break;
+    }
+}
+
 // Update and draw frame
 static void UpdateDrawFrame(void)
 {
@@ -283,6 +309,8 @@ static void UpdateDrawFrame(void)
     EndMode3D();
 
     // 2D overlay on top of the 3D view
+    for (int i = 0; i < entityCount; i++) DrawEntityUI(&entities[i]);
+
     for (int i = 0; i < entityCount; i++)
     {
         if ((entities[i].kind == ENTITY_HEX_CELL) && entities[i].hovered)
@@ -324,6 +352,15 @@ static void UpdateDrawFrame(void)
     {
         for (int i = 0; i < entityCount; i++) entities[i].selected = false;
     }
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_HEALTH_BAR)
+        {
+            igSliderInt("health", &entities[i].health, 0, entities[i].maxHealth, "%d", 0);
+            break;
+        }
+    }
     igEnd();
 
     rlImGuiEnd();
@@ -352,12 +389,24 @@ int main(void)
 
     rlImGuiSetup(true); // Dear ImGui with the dark theme
 
+    // Load resources (desktop: resources/ sits next to the binary,
+    // web: emscripten preloads it into the .data bundle)
+    heartTexture = LoadTexture("resources/heart_icon_32x32.png");
+
     // Entity pool: one allocation for the whole game, entities live in a
     // packed array with swap-back removal
     entities = (Entity *)calloc(MAX_ENTITIES, sizeof(Entity));
     entityCount = 0;
 
     SpawnHexGrid();
+
+    Entity *healthBar = EntitySpawn(ENTITY_HEALTH_BAR);
+    if (healthBar != NULL)
+    {
+        healthBar->position = (Vector3){24.0f, 64.0f, 0.0f}; // Screen pixels for UI kinds
+        healthBar->health = 3;
+        healthBar->maxHealth = 5;
+    }
 
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
@@ -375,6 +424,7 @@ int main(void)
     // De-Initialization
     //--------------------------------------------------------------------------------------
     rlImGuiShutdown();
+    UnloadTexture(heartTexture);
     UnloadRenderTexture(target);
     free(entities);
 
