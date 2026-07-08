@@ -35,19 +35,24 @@
 
     <!-- Web Style -->
     <style>
-        body { 
-          margin: 0px; 
-          overflow: hidden; 
+        body {
+          margin: 0px;
+          overflow: hidden;
           background-color: black;
+          /* Center the canvas in the viewport */
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          height: 100vh;
         }
-        canvas.emscripten { 
-          border: 0px none; 
+        canvas.emscripten {
+          border: 0px none;
           background-color: black;
-          padding-left: 0;
-          padding-right: 0;
-          margin-left: auto;
-          margin-right: auto;
           display: block;
+          /* Scale the square 720x720 framebuffer to fill the window while
+             keeping aspect; emscripten maps mouse coords through CSS size */
+          width: min(100vw, 100vh);
+          height: min(100vw, 100vh);
         }
     </style>
     <script type='text/javascript' src="https://cdn.jsdelivr.net/gh/eligrey/FileSaver.js/dist/FileSaver.min.js"> </script>
