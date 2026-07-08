@@ -626,7 +626,14 @@ static void DrawImpactEffect(void)
 // Deal one card into the hand fan, cycling a small test palette
 static void SpawnCard(void)
 {
-    static const Color palette[4] = {GOLD, PINK, LIME, VIOLET};
+    // Plain brace initializers: raylib's GOLD/PINK/... macros are compound
+    // literals, which MSVC rejects in a static initializer
+    static const Color palette[4] = {
+        {255, 203, 0, 255},   // GOLD
+        {255, 109, 194, 255}, // PINK
+        {0, 158, 47, 255},    // LIME
+        {135, 60, 190, 255},  // VIOLET
+    };
     static int dealt = 0;
 
     Entity *card = EntitySpawn(ENTITY_CARD);
