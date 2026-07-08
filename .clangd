@@ -6,14 +6,5 @@ Diagnostics:
 
 ---
 
-# globals.h is a textual include into raylib_game.c (types are defined before
-# the include), so a standalone parse reports false unknown-type errors
-If:
-  PathMatch: .*/globals\.h
-Diagnostics:
-  Suppress: '*'
-
----
-
 If:
   PathExclude: [build/.*, _deps/.*]

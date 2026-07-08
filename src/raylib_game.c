@@ -10,6 +10,7 @@
  ********************************************************************************************/
 
 #include "raylib.h"
+#include "rlgl.h" // Required for: textured quad of the hover reticle
 
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include "cimgui.h"  // Dear ImGui C bindings
@@ -96,7 +97,49 @@ typedef struct Entity
     int frameCreated; // frameCounter value when this entity was spawned
 } Entity;
 
-#include "globals.h"
+// Hover reticle: a pixel-art frame that chases the hovered tile on a spring.
+// One persistent object, integrated with dt each frame (never reset by draw order)
+typedef struct HoverReticle
+{
+    Vector3 position; // World position on the board plane (y is recomputed every frame)
+    Vector3 velocity; // World units per second, integrated by the spring
+    float scale;      // Current half-size of the quad in world units
+    float spinAngle;  // Radians, integrated from angular velocity (not derived from clock time)
+    float bobPhase;   // Radians, integrated for the float bob
+    bool active;      // False while nothing is hovered; the next hover re-snaps in place
+} HoverReticle;
+
+//----------------------------------------------------------------------------------
+// Global Variables Definition (local to this module)
+//----------------------------------------------------------------------------------
+static const int screenWidth = 720;
+static const int screenHeight = 720;
+
+static RenderTexture2D target = {0}; // Render texture to render our game
+static int frameCounter = 0;
+
+static Texture2D heartTexture = {0};   // Heart icon for health bars (resources/heart_icon_32x32.png)
+static Texture2D reticleTexture = {0}; // Hover reticle frame (resources/highlight_slot_26x26.png)
+
+static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
+
+static Entity *entities = NULL;   // Entity pool, one calloc at startup, packed array
+static int entityCount = 0;       // Live entities in the pool
+static int mouseHexQ = 0;         // Axial column under the mouse this frame
+static int mouseHexR = 0;         // Axial row under the mouse this frame
+static bool uiWantsMouse = false; // True when ImGui is using the mouse; board ignores clicks
+
+// 2.5D camera: tilted orthographic view down at the board plane (y = 0);
+// no perspective foreshortening, so tiles read as a flat iso board
+static Camera3D camera = {
+    .position = {0.0f, 14.0f, 12.0f},
+    .target = {0.0f, 0.0f, 0.0f},
+    .up = {0.0f, 1.0f, 0.0f},
+    .fovy = 16.0f, // Orthographic: world-space height of the view, sized to fit the board
+    .projection = CAMERA_ORTHOGRAPHIC,
+};
+
+// TODO: Define global variables here, recommended to make them static
 
 //----------------------------------------------------------------------------------
 // Module Functions Definition
@@ -264,6 +307,100 @@ static void DrawEntityUI(const Entity *entity)
     }
 }
 
+// Draw the hover reticle chasing the hovered tile (called inside BeginMode3D).
+// Movement is an under-damped spring (overshoots and rebounds, not a lerp),
+// scale follows spring speed, spin follows 1/scale^2 like a skater pulling
+// their arms in. The quad lies flat on the board plane and spins around Y;
+// the 3D camera projection replaces the "iso squash" of a 2D layout.
+static void DrawHoverdHexEffect(void)
+{
+    const float stiffness = 90.0f;     // Spring pull toward the tile center (1/s^2)
+    const float damping = 6.0f;        // Well below critical (2*sqrtf(90) ~= 19): magnetic overshoot
+    const float scaleRest = 0.85f;     // Half-size at rest, frames one tile
+    const float scaleMax = 1.6f;       // Half-size cap while moving fast
+    const float scalePerSpeed = 0.12f; // Extra half-size per world-unit/s of spring speed
+    const float shrinkRate = 16.0f;    // Fast: snaps down onto the tile
+    const float growRate = 5.0f;       // Slow: swells out smoothly when it starts moving
+    const float spinFactor = 4.5f;     // Angular velocity = spinFactor/scale^2 (rad/s)
+    const float floatHeight = 0.25f;   // Ride height above the tile top
+    const float bobAmplitude = 0.06f;  // Slow sine bob around the ride height
+    const float bobSpeed = 3.0f;       // Bob phase speed (rad/s)
+
+    // Find the hovered tile; the reticle hides while there is none
+    const Entity *hoveredCell = NULL;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if ((entities[i].kind == ENTITY_HEX_CELL) && entities[i].hovered)
+        {
+            hoveredCell = &entities[i];
+            break;
+        }
+    }
+
+    if (hoveredCell == NULL)
+    {
+        reticle.active = false; // Next hover re-snaps in place instead of flying across the board
+        return;
+    }
+
+    float dt = GetFrameTime();
+    if (dt > 0.05f) dt = 0.05f; // Clamp frame hitches so the spring cannot explode
+
+    Vector3 target = hoveredCell->position;
+
+    if (!reticle.active)
+    {
+        // Fresh hover: appear big over the tile and let the shrink snap it down
+        reticle.position = target;
+        reticle.velocity = (Vector3){0};
+        reticle.scale = scaleMax;
+        reticle.active = true;
+    }
+
+    // Under-damped spring toward the tile center, on the board plane (XZ)
+    reticle.velocity.x += ((target.x - reticle.position.x)*stiffness - reticle.velocity.x*damping)*dt;
+    reticle.velocity.z += ((target.z - reticle.position.z)*stiffness - reticle.velocity.z*damping)*dt;
+    reticle.position.x += reticle.velocity.x*dt;
+    reticle.position.z += reticle.velocity.z*dt;
+
+    // Scale follows spring speed: big while moving fast, small at rest,
+    // shrinking much faster than it grows
+    float speed = sqrtf(reticle.velocity.x*reticle.velocity.x + reticle.velocity.z*reticle.velocity.z);
+    float scaleTarget = scaleRest + speed*scalePerSpeed;
+    if (scaleTarget > scaleMax) scaleTarget = scaleMax;
+    float scaleRate = (scaleTarget < reticle.scale)? shrinkRate : growRate;
+    reticle.scale += (scaleTarget - reticle.scale)*(1.0f - expf(-scaleRate*dt));
+
+    // Spin: drifts lazily while big, whips around fast once shrunk
+    reticle.spinAngle += (spinFactor/(reticle.scale*reticle.scale))*dt;
+    if (reticle.spinAngle > 2.0f*PI) reticle.spinAngle -= 2.0f*PI;
+
+    // Float above whatever height the tile is currently drawn at
+    reticle.bobPhase += bobSpeed*dt;
+    if (reticle.bobPhase > 2.0f*PI) reticle.bobPhase -= 2.0f*PI;
+    float tileTop = hoveredCell->selected? HEX_TILE_HEIGHT_SELECTED : HEX_TILE_HEIGHT_HOVER;
+    reticle.position.y = tileTop + floatHeight + sinf(reticle.bobPhase)*bobAmplitude;
+
+    // Textured quad lying flat on the board plane, spun around Y
+    rlPushMatrix();
+    rlTranslatef(reticle.position.x, reticle.position.y, reticle.position.z);
+    rlRotatef(reticle.spinAngle*RAD2DEG, 0.0f, 1.0f, 0.0f);
+
+    float s = reticle.scale;
+    rlSetTexture(reticleTexture.id);
+    rlBegin(RL_QUADS);
+    rlColor4ub(255, 255, 255, 255);
+    rlNormal3f(0.0f, 1.0f, 0.0f); // Counter-clockwise seen from above, so the face points up
+    rlTexCoord2f(0.0f, 0.0f); rlVertex3f(-s, 0.0f, -s);
+    rlTexCoord2f(0.0f, 1.0f); rlVertex3f(-s, 0.0f, s);
+    rlTexCoord2f(1.0f, 1.0f); rlVertex3f(s, 0.0f, s);
+    rlTexCoord2f(1.0f, 0.0f); rlVertex3f(s, 0.0f, -s);
+    rlEnd();
+    rlSetTexture(0);
+
+    rlPopMatrix();
+}
+
 // Update and draw frame
 static void UpdateDrawFrame(void)
 {
@@ -305,6 +442,8 @@ static void UpdateDrawFrame(void)
     BeginMode3D(camera);
 
     for (int i = 0; i < entityCount; i++) DrawEntity(&entities[i]);
+
+    DrawHoverdHexEffect(); // Last in 3D so its alpha blends over the tiles
 
     EndMode3D();
 
@@ -393,6 +532,9 @@ int main(void)
     // web: emscripten preloads it into the .data bundle)
     heartTexture = LoadTexture("resources/heart_icon_32x32.png");
 
+    reticleTexture = LoadTexture("resources/highlight_slot_26x26.png");
+    SetTextureFilter(reticleTexture, TEXTURE_FILTER_POINT); // Keep the pixel art crisp when scaled
+
     // Entity pool: one allocation for the whole game, entities live in a
     // packed array with swap-back removal
     entities = (Entity *)calloc(MAX_ENTITIES, sizeof(Entity));
@@ -425,6 +567,7 @@ int main(void)
     //--------------------------------------------------------------------------------------
     rlImGuiShutdown();
     UnloadTexture(heartTexture);
+    UnloadTexture(reticleTexture);
     UnloadRenderTexture(target);
     free(entities);
 
