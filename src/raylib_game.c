@@ -48,6 +48,16 @@
 
 #define HEX_CELL_OFFBOARD 999 // Axial coord that can never be on the board
 
+// Cards: blank rectangles fanned along the bottom edge until placed on the board
+#define CARD_WIDTH 84.0f
+#define CARD_HEIGHT 120.0f
+#define CARD_FAN_STEP 100.0f  // Horizontal distance between fan slots
+#define CARD_FAN_BOTTOM 96.0f // Fan center height above the bottom screen edge
+#define CARD_FAN_ARC 10.0f    // Extra drop per slot away from center, fakes a fanned hand
+
+#define SHAKE_DURATION 0.3f   // Screen shake length after a card placement
+#define IMPACT_DURATION 0.45f // Impact ring/dust lifetime at the placed tile
+
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
 //----------------------------------------------------------------------------------
@@ -65,7 +75,18 @@ typedef enum EntityKind
     ENTITY_NONE = 0,   // Free slot, skipped everywhere
     ENTITY_HEX_CELL,   // One clickable cell of the hex board
     ENTITY_HEALTH_BAR, // Row of heart icons in the screen-space UI layer
+    ENTITY_CARD,
+    NUM_ENTITY_KINDS
 } EntityKind;
+
+// Mode Of Card
+
+typedef enum CardMode
+{
+    NOT_A_CARD = 0,
+    CARD_HEX_FORM,
+    CARD_REC_FORM,
+} CardMode;
 
 // Fat struct: every possible member any entity could have, in one struct.
 // An entity is initialized by tagging it with its kind; the update/draw
@@ -94,7 +115,15 @@ typedef struct Entity
 
     // Visual members
     Color tint;       // Base fill color
+    float alpha;      // UI fade 0..1 (card: rectangle hides while ghosting on the board)
     int frameCreated; // frameCounter value when this entity was spawned
+
+    // Parrent Hex cell
+    int parent;
+
+    // Mode of Card
+    CardMode cardMode;
+
 } Entity;
 
 // Hover reticle: a pixel-art frame that chases the hovered tile on a spring.
@@ -109,6 +138,15 @@ typedef struct HoverReticle
     bool active;      // False while nothing is hovered; the next hover re-snaps in place
 } HoverReticle;
 
+// One-shot impact effect at the tile where a card just landed
+typedef struct ImpactFx
+{
+    Vector3 position; // Tile base center on the board plane
+    Color tint;       // Card color driving the ring and dust
+    float age;        // Seconds since the placement
+    bool active;      // False once the effect has played out
+} ImpactFx;
+
 //----------------------------------------------------------------------------------
 // Global Variables Definition (local to this module)
 //----------------------------------------------------------------------------------
@@ -122,6 +160,9 @@ static Texture2D heartTexture = {0};   // Heart icon for health bars (resources/
 static Texture2D reticleTexture = {0}; // Hover reticle frame (resources/highlight_slot_26x26.png)
 
 static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
+
+static ImpactFx impact = {0};      // Impact ring/dust of the last card placement
+static float shakeTimeLeft = 0.0f; // Screen shake seconds remaining (kicked by a card placement)
 
 static Entity *entities = NULL;   // Entity pool, one calloc at startup, packed array
 static int entityCount = 0;       // Live entities in the pool
@@ -251,6 +292,100 @@ static void UpdateEntity(Entity *entity)
             }
         }
         break;
+        case ENTITY_CARD:
+        {
+            // In hand the card is a blank rectangle easing toward its fan slot;
+            // grabbed over the board it becomes the landing ghost (drawn in
+            // DrawEntity); released there it commits, anywhere else it springs home
+            float dt = GetFrameTime();
+            if (dt > 0.05f) dt = 0.05f; // Clamp frame hitches so the springs cannot explode
+
+            int myIndex = (int)(entity - entities);
+
+            // Fan layout: slot order = pool order among cards, centered on the bottom edge
+            int slot = 0;
+            int handCount = 0;
+            for (int i = 0; i < entityCount; i++)
+            {
+                if (entities[i].kind != ENTITY_CARD) continue;
+                if (i < myIndex) slot++;
+                handCount++;
+            }
+            float fan = (float)slot - (float)(handCount - 1) / 2.0f;
+            Vector2 slotPos = {
+                (float)screenWidth / 2.0f + fan * CARD_FAN_STEP,
+                (float)screenHeight - CARD_FAN_BOTTOM + fabsf(fan) * CARD_FAN_ARC, // Outer cards sit lower
+            };
+
+            // The board cell under the mouse, if any (NULL while off-board)
+            Entity *targetCell = NULL;
+            for (int i = 0; i < entityCount; i++)
+            {
+                if ((entities[i].kind == ENTITY_HEX_CELL) && (entities[i].q == mouseHexQ) && (entities[i].r == mouseHexR))
+                {
+                    targetCell = &entities[i];
+                    break;
+                }
+            }
+
+            Vector2 mouse = GetMousePosition();
+
+            if (entity->selected)
+            {
+                // Grabbed: hex form while hovering the board, rectangle form elsewhere
+                entity->cardMode = ((targetCell != NULL) && !uiWantsMouse) ? CARD_HEX_FORM : CARD_REC_FORM;
+
+                if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                {
+                    entity->selected = false;
+                    bool valid = ((entity->cardMode == CARD_HEX_FORM) && (targetCell->value == 0));
+                    if (valid)
+                    {
+                        // The ghost commits: the tile takes the card's value and color
+                        targetCell->value = entity->value;
+                        targetCell->tint = entity->tint;
+
+                        shakeTimeLeft = SHAKE_DURATION;
+                        impact = (ImpactFx){.position = targetCell->position, .tint = entity->tint, .age = 0.0f, .active = true};
+
+                        LOG("INFO: CARD: placed value %d at (q=%d, r=%d)\n", entity->value, targetCell->q, targetCell->r);
+                        EntityDespawn(myIndex);
+                        return; // This slot now holds a different entity
+                    }
+                    entity->cardMode = CARD_REC_FORM; // Springs home to its fan slot below
+                }
+            }
+            else
+            {
+                entity->cardMode = CARD_REC_FORM;
+                Rectangle rect = {entity->position.x - CARD_WIDTH / 2.0f, entity->position.y - CARD_HEIGHT / 2.0f, CARD_WIDTH, CARD_HEIGHT};
+                entity->hovered = (!uiWantsMouse && CheckCollisionPointRec(mouse, rect));
+                if (entity->hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) entity->selected = true;
+            }
+
+            // Ease toward the fan slot rather than sitting rigidly; the same
+            // under-damped spring makes released cards bounce back home
+            Vector2 springTarget = slotPos;
+            float stiffness = 260.0f; // Under-damped with damping 18 (critical ~32)
+            float damping = 18.0f;
+            if (entity->hovered && !entity->selected) springTarget.y -= 14.0f; // Hovered card lifts out of the fan
+            if (entity->selected && (entity->cardMode == CARD_REC_FORM))
+            {
+                springTarget = mouse; // Dragged off-board: ride tight on the cursor
+                stiffness = 900.0f;
+                damping = 55.0f;
+            }
+            entity->velocity.x += ((springTarget.x - entity->position.x) * stiffness - entity->velocity.x * damping) * dt;
+            entity->velocity.y += ((springTarget.y - entity->position.y) * stiffness - entity->velocity.y * damping) * dt;
+            entity->position.x += entity->velocity.x * dt;
+            entity->position.y += entity->velocity.y * dt;
+
+            // Rectangle hides while ghosting on the board, fades back in when released
+            float alphaTarget = (entity->selected && (entity->cardMode == CARD_HEX_FORM)) ? 0.0f : 1.0f;
+            float fadeRate = (alphaTarget < entity->alpha) ? 18.0f : 8.0f; // Hide fast, reappear soft
+            entity->alpha += (alphaTarget - entity->alpha) * (1.0f - expf(-fadeRate * dt));
+        }
+        break;
         default: break;
     }
 }
@@ -281,6 +416,33 @@ static void DrawEntity(const Entity *entity)
             DrawCylinderWires(entity->position, drawSize, drawSize, height, 6, DARKGRAY);
         }
         break;
+        case ENTITY_CARD:
+        {
+            // Grabbed over the board: the rectangle is hidden (see DrawEntityUI)
+            // and the card shows as the ghost of where it would land, riding the
+            // reticle's sprung position rather than the raw cursor
+            if (!entity->selected || (entity->cardMode != CARD_HEX_FORM)) break;
+
+            const Entity *cell = NULL;
+            for (int i = 0; i < entityCount; i++)
+            {
+                if ((entities[i].kind == ENTITY_HEX_CELL) && (entities[i].q == mouseHexQ) && (entities[i].r == mouseHexR))
+                {
+                    cell = &entities[i];
+                    break;
+                }
+            }
+            if (cell == NULL) break;
+
+            Color ghost = (cell->value == 0) ? entity->tint : RED; // Red = invalid target
+
+            // Transparent hex fill + outline in the card's color at the hovered tile
+            float size = HEX_SIZE * 0.92f;
+            DrawCylinder(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.35f));
+            DrawCylinderWires(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.85f));
+        }
+        break;
+
         default: break;
     }
 }
@@ -301,6 +463,23 @@ static void DrawEntityUI(const Entity *entity)
                 Color tint = (i < entity->health) ? WHITE : Fade(DARKGRAY, 0.4f); // Lost hearts are dimmed
                 DrawTextureEx(heartTexture, pos, 0.0f, scale, tint);
             }
+        }
+        break;
+        case ENTITY_CARD:
+        {
+            if (entity->alpha < 0.01f) break; // Hidden while ghosting on the board
+
+            // Blank card at its slot: colored border behind a plain body, art comes
+            // later; tilt follows the eased position so cards straighten as they slide
+            float rotation = (entity->position.x - (float)screenWidth / 2.0f) * 0.02f;
+            Vector2 center = {entity->position.x, entity->position.y};
+
+            Rectangle border = {center.x, center.y, CARD_WIDTH + 6.0f, CARD_HEIGHT + 6.0f};
+            Rectangle body = {center.x, center.y, CARD_WIDTH, CARD_HEIGHT};
+            DrawRectanglePro(border, (Vector2){border.width / 2.0f, border.height / 2.0f}, rotation, Fade(entity->tint, entity->alpha));
+            DrawRectanglePro(body, (Vector2){body.width / 2.0f, body.height / 2.0f}, rotation, Fade(entity->hovered ? WHITE : RAYWHITE, entity->alpha));
+
+            DrawText(TextFormat("%d", entity->value), (int)center.x - 5, (int)center.y - 10, 20, Fade(DARKGRAY, entity->alpha));
         }
         break;
         default: break;
@@ -358,47 +537,107 @@ static void DrawHoverdHexEffect(void)
     }
 
     // Under-damped spring toward the tile center, on the board plane (XZ)
-    reticle.velocity.x += ((target.x - reticle.position.x)*stiffness - reticle.velocity.x*damping)*dt;
-    reticle.velocity.z += ((target.z - reticle.position.z)*stiffness - reticle.velocity.z*damping)*dt;
-    reticle.position.x += reticle.velocity.x*dt;
-    reticle.position.z += reticle.velocity.z*dt;
+    reticle.velocity.x += ((target.x - reticle.position.x) * stiffness - reticle.velocity.x * damping) * dt;
+    reticle.velocity.z += ((target.z - reticle.position.z) * stiffness - reticle.velocity.z * damping) * dt;
+    reticle.position.x += reticle.velocity.x * dt;
+    reticle.position.z += reticle.velocity.z * dt;
 
     // Scale follows spring speed: big while moving fast, small at rest,
     // shrinking much faster than it grows
-    float speed = sqrtf(reticle.velocity.x*reticle.velocity.x + reticle.velocity.z*reticle.velocity.z);
-    float scaleTarget = scaleRest + speed*scalePerSpeed;
+    float speed = sqrtf(reticle.velocity.x * reticle.velocity.x + reticle.velocity.z * reticle.velocity.z);
+    float scaleTarget = scaleRest + speed * scalePerSpeed;
     if (scaleTarget > scaleMax) scaleTarget = scaleMax;
-    float scaleRate = (scaleTarget < reticle.scale)? shrinkRate : growRate;
-    reticle.scale += (scaleTarget - reticle.scale)*(1.0f - expf(-scaleRate*dt));
+    float scaleRate = (scaleTarget < reticle.scale) ? shrinkRate : growRate;
+    reticle.scale += (scaleTarget - reticle.scale) * (1.0f - expf(-scaleRate * dt));
 
     // Spin: drifts lazily while big, whips around fast once shrunk
-    reticle.spinAngle += (spinFactor/(reticle.scale*reticle.scale))*dt;
-    if (reticle.spinAngle > 2.0f*PI) reticle.spinAngle -= 2.0f*PI;
+    reticle.spinAngle += (spinFactor / (reticle.scale * reticle.scale)) * dt;
+    if (reticle.spinAngle > 2.0f * PI) reticle.spinAngle -= 2.0f * PI;
 
     // Float above whatever height the tile is currently drawn at
-    reticle.bobPhase += bobSpeed*dt;
-    if (reticle.bobPhase > 2.0f*PI) reticle.bobPhase -= 2.0f*PI;
-    float tileTop = hoveredCell->selected? HEX_TILE_HEIGHT_SELECTED : HEX_TILE_HEIGHT_HOVER;
-    reticle.position.y = tileTop + floatHeight + sinf(reticle.bobPhase)*bobAmplitude;
+    reticle.bobPhase += bobSpeed * dt;
+    if (reticle.bobPhase > 2.0f * PI) reticle.bobPhase -= 2.0f * PI;
+    float tileTop = hoveredCell->selected ? HEX_TILE_HEIGHT_SELECTED : HEX_TILE_HEIGHT_HOVER;
+    reticle.position.y = tileTop + floatHeight + sinf(reticle.bobPhase) * bobAmplitude;
 
     // Textured quad lying flat on the board plane, spun around Y
     rlPushMatrix();
     rlTranslatef(reticle.position.x, reticle.position.y, reticle.position.z);
-    rlRotatef(reticle.spinAngle*RAD2DEG, 0.0f, 1.0f, 0.0f);
+    rlRotatef(reticle.spinAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
 
     float s = reticle.scale;
     rlSetTexture(reticleTexture.id);
     rlBegin(RL_QUADS);
     rlColor4ub(255, 255, 255, 255);
     rlNormal3f(0.0f, 1.0f, 0.0f); // Counter-clockwise seen from above, so the face points up
-    rlTexCoord2f(0.0f, 0.0f); rlVertex3f(-s, 0.0f, -s);
-    rlTexCoord2f(0.0f, 1.0f); rlVertex3f(-s, 0.0f, s);
-    rlTexCoord2f(1.0f, 1.0f); rlVertex3f(s, 0.0f, s);
-    rlTexCoord2f(1.0f, 0.0f); rlVertex3f(s, 0.0f, -s);
+    rlTexCoord2f(0.0f, 0.0f);
+    rlVertex3f(-s, 0.0f, -s);
+    rlTexCoord2f(0.0f, 1.0f);
+    rlVertex3f(-s, 0.0f, s);
+    rlTexCoord2f(1.0f, 1.0f);
+    rlVertex3f(s, 0.0f, s);
+    rlTexCoord2f(1.0f, 0.0f);
+    rlVertex3f(s, 0.0f, -s);
     rlEnd();
     rlSetTexture(0);
 
     rlPopMatrix();
+}
+
+// Draw the impact ring/dust where a card just landed (called inside BeginMode3D)
+static void DrawImpactEffect(void)
+{
+    if (!impact.active) return;
+
+    float dt = GetFrameTime();
+    if (dt > 0.05f) dt = 0.05f;
+    impact.age += dt;
+    if (impact.age >= IMPACT_DURATION)
+    {
+        impact.active = false;
+        return;
+    }
+
+    float t = impact.age / IMPACT_DURATION;      // 0 -> 1 over the effect
+    float ease = 1.0f - (1.0f - t) * (1.0f - t); // Ease-out: bursts fast, settles soft
+    float fade = 1.0f - t;
+
+    // Expanding hex rings hugging the board plane
+    float ringRadius = HEX_SIZE * (0.7f + 1.2f * ease);
+    DrawCylinderWires(impact.position, ringRadius, ringRadius, 0.05f, 6, Fade(impact.tint, fade));
+    DrawCylinderWires(impact.position, ringRadius * 0.8f, ringRadius * 0.8f, 0.05f, 6, Fade(WHITE, fade * 0.7f));
+
+    // Dust: six chips thrown outward on a small hop, shrinking as they fade
+    for (int i = 0; i < 6; i++)
+    {
+        float angle = ((float)i + 0.5f) * (2.0f * PI / 6.0f);
+        float dist = HEX_SIZE * (0.4f + 1.0f * ease);
+        float hop = 0.6f * ease * (1.0f - ease) * 4.0f; // Parabola: up then back down
+        Vector3 dust = {
+            impact.position.x + cosf(angle) * dist,
+            impact.position.y + 0.1f + hop,
+            impact.position.z + sinf(angle) * dist,
+        };
+        float dustSize = 0.12f * fade;
+        DrawCube(dust, dustSize, dustSize, dustSize, Fade(impact.tint, fade));
+    }
+}
+
+// Deal one card into the hand fan, cycling a small test palette
+static void SpawnCard(void)
+{
+    static const Color palette[4] = {GOLD, PINK, LIME, VIOLET};
+    static int dealt = 0;
+
+    Entity *card = EntitySpawn(ENTITY_CARD);
+    if (card == NULL) return;
+
+    card->value = (dealt % 4) + 1;
+    card->tint = palette[dealt % 4];
+    card->cardMode = CARD_REC_FORM;
+    // Starts below the screen edge and springs up into its fan slot
+    card->position = (Vector3){(float)screenWidth / 2.0f, (float)screenHeight + CARD_HEIGHT, 0.0f};
+    dealt++;
 }
 
 // Update and draw frame
@@ -444,6 +683,7 @@ static void UpdateDrawFrame(void)
     for (int i = 0; i < entityCount; i++) DrawEntity(&entities[i]);
 
     DrawHoverdHexEffect(); // Last in 3D so its alpha blends over the tiles
+    DrawImpactEffect();
 
     EndMode3D();
 
@@ -469,9 +709,24 @@ static void UpdateDrawFrame(void)
     BeginDrawing();
     ClearBackground(RAYWHITE);
 
-    // Draw render texture to screen, scaled if required
+    // Screen shake: eased offset + slight roll, kicked by a card placement
+    float shakeAmp = 0.0f;
+    if (shakeTimeLeft > 0.0f)
+    {
+        shakeTimeLeft -= GetFrameTime();
+        if (shakeTimeLeft < 0.0f) shakeTimeLeft = 0.0f;
+        float shakeT = shakeTimeLeft / SHAKE_DURATION;
+        shakeAmp = shakeT * shakeT; // Eased decay over the shake duration
+    }
+    float wobble = (float)frameCounter;
+    Vector2 shakeOffset = {sinf(wobble * 1.9f) * 9.0f * shakeAmp, cosf(wobble * 2.3f) * 9.0f * shakeAmp};
+    float shakeRoll = sinf(wobble * 1.4f) * 1.5f * shakeAmp;
+
+    // Draw render texture to screen, scaled if required (drawn about its
+    // center so the shake roll pivots on the middle of the view)
     DrawTexturePro(target.texture, (Rectangle){0, 0, (float)target.texture.width, -(float)target.texture.height},
-                   (Rectangle){0, 0, (float)target.texture.width, (float)target.texture.height}, (Vector2){0, 0}, 0.0f, WHITE);
+                   (Rectangle){(float)screenWidth / 2.0f + shakeOffset.x, (float)screenHeight / 2.0f + shakeOffset.y, (float)target.texture.width, (float)target.texture.height},
+                   (Vector2){(float)target.texture.width / 2.0f, (float)target.texture.height / 2.0f}, shakeRoll, WHITE);
 
     // ImGui UI, drawn on top of the scaled game texture
     rlImGuiBegin();
@@ -491,6 +746,8 @@ static void UpdateDrawFrame(void)
     {
         for (int i = 0; i < entityCount; i++) entities[i].selected = false;
     }
+
+    if (igButton("deal card", (ImVec2_c){0, 0})) SpawnCard();
 
     for (int i = 0; i < entityCount; i++)
     {
@@ -549,6 +806,8 @@ int main(void)
         healthBar->health = 3;
         healthBar->maxHealth = 5;
     }
+
+    for (int i = 0; i < 4; i++) SpawnCard(); // Starting hand
 
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
