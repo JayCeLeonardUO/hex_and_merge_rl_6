@@ -10,7 +10,8 @@
  ********************************************************************************************/
 
 #include "raylib.h"
-#include "rlgl.h" // Required for: textured quad of the hover reticle
+#include "raymath.h" // Required for: MatrixLookAt() (camera-perpendicular billboard)
+#include "rlgl.h"    // Required for: textured quad of the hover reticle
 
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include "cimgui.h"  // Dear ImGui C bindings
@@ -59,6 +60,11 @@
 #define IMPACT_DURATION 0.45f // Impact ring/dust lifetime at the placed tile
 #define IMPACT_LIGHT_FRAMES 8 // Frames in the light-burst sheet (baked from itch light_007.mov)
 
+// Player: a mage sprite dragged from tile to tile
+#define PLAYER_FRAMES 8   // Idle frames in the player sheet (top row of the mage sheet)
+#define PLAYER_FRAME_W 64 // Source frame size in pixels
+#define PLAYER_FRAME_H 32
+
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
 //----------------------------------------------------------------------------------
@@ -77,6 +83,7 @@ typedef enum EntityKind
     ENTITY_HEX_CELL,   // One clickable cell of the hex board
     ENTITY_HEALTH_BAR, // Row of heart icons in the screen-space UI layer
     ENTITY_CARD,
+    ENTITY_PLAYER,
     NUM_ENTITY_KINDS
 } EntityKind;
 
@@ -161,6 +168,8 @@ static Texture2D heartTexture = {0};       // Heart icon for health bars (resour
 static Texture2D reticleTexture = {0};     // Hover reticle frame (resources/highlight_slot_26x26.png)
 static Texture2D impactLightTexture = {0}; // Light-burst sheet, 8 frames in a row, white on alpha
                                            // (resources/impact_light_8x256.png)
+static Texture2D playerTexture = {0};      // Player idle sheet, 8 frames of 64x32 in a row
+                                           // (resources/player_mage_8x64x32.png)
 
 static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
 
@@ -175,6 +184,9 @@ static Entity *entities = NULL;   // Entity pool, one calloc at startup, packed 
 static int entityCount = 0;       // Live entities in the pool
 static int mouseHexQ = 0;         // Axial column under the mouse this frame
 static int mouseHexR = 0;         // Axial row under the mouse this frame
+static float mouseBoardX = 0.0f;  // Board-plane point under the mouse this frame
+static float mouseBoardZ = 0.0f;
+static bool mouseOnPlane = false; // False when the mouse ray misses the board plane
 static bool uiWantsMouse = false; // True when ImGui is using the mouse; board ignores clicks
 
 // 2.5D camera: tilted orthographic view down at the board plane (y = 0);
@@ -484,15 +496,17 @@ static void UpdateDrawFrame(void)
     // intersect it with the board plane (y = 0)
     mouseHexQ = HEX_CELL_OFFBOARD;
     mouseHexR = HEX_CELL_OFFBOARD;
+    mouseOnPlane = false;
     Ray mouseRay = GetScreenToWorldRay(GetMousePosition(), camera);
     if (fabsf(mouseRay.direction.y) > 0.0001f)
     {
         float t = -mouseRay.position.y / mouseRay.direction.y;
         if (t > 0.0f)
         {
-            float hitX = mouseRay.position.x + mouseRay.direction.x * t;
-            float hitZ = mouseRay.position.z + mouseRay.direction.z * t;
-            HexWorldToAxial(hitX, hitZ, &mouseHexQ, &mouseHexR);
+            mouseBoardX = mouseRay.position.x + mouseRay.direction.x * t;
+            mouseBoardZ = mouseRay.position.z + mouseRay.direction.z * t;
+            mouseOnPlane = true;
+            HexWorldToAxial(mouseBoardX, mouseBoardZ, &mouseHexQ, &mouseHexR);
         }
     }
 
@@ -501,8 +515,23 @@ static void UpdateDrawFrame(void)
     Vector2 mouse = GetMousePosition();
 
     //
+    // find the player -- later steps need his tile to behave around him
+    //
+
+    Entity *player = NULL;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_PLAYER)
+        {
+            player = &entities[i];
+            break;
+        }
+    }
+
+    //
     // hex cell hover + click selection; remember the hovered cell for the
-    // card, reticle, and debug steps below
+    // card, player, reticle, and debug steps below. Clicking the player's own
+    // tile grabs him instead of toggling the tile
     //
 
     Entity *hoveredCell = NULL;
@@ -514,11 +543,22 @@ static void UpdateDrawFrame(void)
         cell->hovered = ((cell->q == mouseHexQ) && (cell->r == mouseHexR) && !uiWantsMouse);
         if (cell->hovered) hoveredCell = cell;
 
-        if (cell->hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        bool cellIsPlayers = ((player != NULL) && (player->q == cell->q) && (player->r == cell->r));
+        if (cell->hovered && !cellIsPlayers && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
         {
             cell->selected = !cell->selected;
             LOG("INFO: HEX: clicked cell (q=%d, r=%d) selected=%d\n", cell->q, cell->r, cell->selected);
         }
+    }
+
+    //
+    // player grab -- a press on the player's tile picks him up
+    //
+
+    if ((player != NULL) && (hoveredCell != NULL) && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
+        && (player->q == hoveredCell->q) && (player->r == hoveredCell->r))
+    {
+        player->selected = true;
     }
 
     //
@@ -637,6 +677,55 @@ static void UpdateDrawFrame(void)
 
     UpdateHoverReticle(hoveredCell);
     UpdateImpactEffect();
+
+    //
+    // player drag/drop -- dragged he stands on the reticle (runs after the
+    // reticle step so he matches its sprung position exactly); released he
+    // takes the hovered cell, or springs back home if dropped off-board
+    //
+
+    if (player != NULL)
+    {
+        if (player->selected && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+        {
+            player->selected = false;
+            if (hoveredCell != NULL)
+            {
+                player->q = hoveredCell->q;
+                player->r = hoveredCell->r;
+                LOG("INFO: PLAYER: placed at (q=%d, r=%d)\n", player->q, player->r);
+            }
+        }
+
+        if (player->selected && reticle.active)
+        {
+            // Ride the reticle: it already springs tile to tile, the player
+            // just stands on it (velocity zeroed so the drop doesn't fling him)
+            player->position.x = reticle.position.x;
+            player->position.z = reticle.position.z;
+            player->velocity = (Vector3){0};
+        }
+        else
+        {
+            // Off the reticle (idle, or dragged off-board): spring on the board
+            // plane toward home or the cursor (under-damped, critical ~41)
+            Vector3 home = HexAxialToWorld(player->q, player->r);
+            float targetX = home.x;
+            float targetZ = home.z;
+            if (player->selected && mouseOnPlane)
+            {
+                targetX = mouseBoardX;
+                targetZ = mouseBoardZ;
+            }
+
+            float stiffness = 420.0f;
+            float damping = 24.0f;
+            player->velocity.x += ((targetX - player->position.x) * stiffness - player->velocity.x * damping) * dt;
+            player->velocity.z += ((targetZ - player->position.z) * stiffness - player->velocity.z * damping) * dt;
+            player->position.x += player->velocity.x * dt;
+            player->position.z += player->velocity.z * dt;
+        }
+    }
     //----------------------------------------------------------------------------------
 
     // Draw
@@ -697,6 +786,32 @@ static void UpdateDrawFrame(void)
             DrawCylinderWires(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.85f));
             break; // Only one card can be grabbed
         }
+    }
+
+    //
+    // player -- billboarded mage sprite standing on his tile, idle animation
+    // from the sheet's top row; stands on the reticle while dragged
+    //
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *p = &entities[i];
+        if (p->kind != ENTITY_PLAYER) continue;
+
+        int frame = (frameCounter / 8) % PLAYER_FRAMES; // ~7.5 fps idle at 60 fps
+        Rectangle src = {(float)(frame * PLAYER_FRAME_W), 0.0f, (float)PLAYER_FRAME_W, (float)PLAYER_FRAME_H};
+
+        float spriteH = 1.4f; // World height of the billboard
+        float spriteW = spriteH * ((float)PLAYER_FRAME_W / (float)PLAYER_FRAME_H); // Frames are 2:1, square pixels
+        float ground = (p->selected && reticle.active) ? reticle.position.y : HEX_TILE_HEIGHT;
+        Vector3 pos = {p->position.x, ground + spriteH / 2.0f, p->position.z};
+
+        // Perpendicular to the camera: use the view-space up axis instead of
+        // world Y, so the tilted camera does not foreshorten the sprite
+        Matrix matView = MatrixLookAt(camera.position, camera.target, camera.up);
+        Vector3 camUp = {matView.m1, matView.m5, matView.m9};
+        DrawBillboardPro(camera, playerTexture, src, pos, camUp, (Vector2){spriteW, spriteH},
+                         (Vector2){spriteW / 2.0f, spriteH / 2.0f}, 0.0f, WHITE);
     }
 
     DrawHoverReticle(); // Last in 3D so its alpha blends over the tiles
@@ -853,6 +968,9 @@ int main(void)
     impactLightTexture = LoadTexture("resources/impact_light_8x256.png");
     SetTextureFilter(impactLightTexture, TEXTURE_FILTER_BILINEAR); // Smooth glow, not pixel art
 
+    playerTexture = LoadTexture("resources/player_mage_8x64x32.png");
+    SetTextureFilter(playerTexture, TEXTURE_FILTER_POINT); // Keep the pixel art crisp when scaled
+
     // Entity pool: one allocation for the whole game, entities live in a
     // packed array with swap-back removal
     entities = (Entity *)calloc(MAX_ENTITIES, sizeof(Entity));
@@ -869,6 +987,14 @@ int main(void)
     }
 
     for (int i = 0; i < 4; i++) SpawnCard(); // Starting hand
+
+    Entity *playerSpawn = EntitySpawn(ENTITY_PLAYER);
+    if (playerSpawn != NULL)
+    {
+        playerSpawn->q = 0; // Starts on the center tile
+        playerSpawn->r = 0;
+        playerSpawn->position = HexAxialToWorld(0, 0);
+    }
 
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
@@ -889,6 +1015,7 @@ int main(void)
     UnloadTexture(heartTexture);
     UnloadTexture(reticleTexture);
     UnloadTexture(impactLightTexture);
+    UnloadTexture(playerTexture);
     UnloadRenderTexture(target);
     free(entities);
 
