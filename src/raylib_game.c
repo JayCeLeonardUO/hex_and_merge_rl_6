@@ -57,6 +57,7 @@
 
 #define SHAKE_DURATION 0.3f   // Screen shake length after a card placement
 #define IMPACT_DURATION 0.45f // Impact ring/dust lifetime at the placed tile
+#define IMPACT_LIGHT_FRAMES 8 // Frames in the light-burst sheet (baked from itch light_007.mov)
 
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
@@ -156,13 +157,19 @@ static const int screenHeight = 720;
 static RenderTexture2D target = {0}; // Render texture to render our game
 static int frameCounter = 0;
 
-static Texture2D heartTexture = {0};   // Heart icon for health bars (resources/heart_icon_32x32.png)
-static Texture2D reticleTexture = {0}; // Hover reticle frame (resources/highlight_slot_26x26.png)
+static Texture2D heartTexture = {0};       // Heart icon for health bars (resources/heart_icon_32x32.png)
+static Texture2D reticleTexture = {0};     // Hover reticle frame (resources/highlight_slot_26x26.png)
+static Texture2D impactLightTexture = {0}; // Light-burst sheet, 8 frames in a row, white on alpha
+                                           // (resources/impact_light_8x256.png)
 
 static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
 
 static ImpactFx impact = {0};      // Impact ring/dust of the last card placement
 static float shakeTimeLeft = 0.0f; // Screen shake seconds remaining (kicked by a card placement)
+
+// Impact light-burst tweakers, exposed in the hex debug ImGui window
+static float impactLightSize = 1.7f;   // Half-size of the burst quad, in hex sizes
+static float impactLightHeight = 0.3f; // Quad height above the tile base
 
 static Entity *entities = NULL;   // Entity pool, one calloc at startup, packed array
 static int entityCount = 0;       // Live entities in the pool
@@ -276,222 +283,11 @@ static void SpawnHexGrid(void)
     }
 }
 
-// Per-entity behavior, dispatched on kind
-static void UpdateEntity(Entity *entity)
-{
-    switch (entity->kind)
-    {
-        case ENTITY_HEX_CELL:
-        {
-            entity->hovered = ((entity->q == mouseHexQ) && (entity->r == mouseHexR) && !uiWantsMouse);
-
-            if (entity->hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-            {
-                entity->selected = !entity->selected;
-                LOG("INFO: HEX: clicked cell (q=%d, r=%d) selected=%d\n", entity->q, entity->r, entity->selected);
-            }
-        }
-        break;
-        case ENTITY_CARD:
-        {
-            // In hand the card is a blank rectangle easing toward its fan slot;
-            // grabbed over the board it becomes the landing ghost (drawn in
-            // DrawEntity); released there it commits, anywhere else it springs home
-            float dt = GetFrameTime();
-            if (dt > 0.05f) dt = 0.05f; // Clamp frame hitches so the springs cannot explode
-
-            int myIndex = (int)(entity - entities);
-
-            // Fan layout: slot order = pool order among cards, centered on the bottom edge
-            int slot = 0;
-            int handCount = 0;
-            for (int i = 0; i < entityCount; i++)
-            {
-                if (entities[i].kind != ENTITY_CARD) continue;
-                if (i < myIndex) slot++;
-                handCount++;
-            }
-            float fan = (float)slot - (float)(handCount - 1) / 2.0f;
-            Vector2 slotPos = {
-                (float)screenWidth / 2.0f + fan * CARD_FAN_STEP,
-                (float)screenHeight - CARD_FAN_BOTTOM + fabsf(fan) * CARD_FAN_ARC, // Outer cards sit lower
-            };
-
-            // The board cell under the mouse, if any (NULL while off-board)
-            Entity *targetCell = NULL;
-            for (int i = 0; i < entityCount; i++)
-            {
-                if ((entities[i].kind == ENTITY_HEX_CELL) && (entities[i].q == mouseHexQ) && (entities[i].r == mouseHexR))
-                {
-                    targetCell = &entities[i];
-                    break;
-                }
-            }
-
-            Vector2 mouse = GetMousePosition();
-
-            if (entity->selected)
-            {
-                // Grabbed: hex form while hovering the board, rectangle form elsewhere
-                entity->cardMode = ((targetCell != NULL) && !uiWantsMouse) ? CARD_HEX_FORM : CARD_REC_FORM;
-
-                if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
-                {
-                    entity->selected = false;
-                    bool valid = ((entity->cardMode == CARD_HEX_FORM) && (targetCell->value == 0));
-                    if (valid)
-                    {
-                        // The ghost commits: the tile takes the card's value and color
-                        targetCell->value = entity->value;
-                        targetCell->tint = entity->tint;
-
-                        shakeTimeLeft = SHAKE_DURATION;
-                        impact = (ImpactFx){.position = targetCell->position, .tint = entity->tint, .age = 0.0f, .active = true};
-
-                        LOG("INFO: CARD: placed value %d at (q=%d, r=%d)\n", entity->value, targetCell->q, targetCell->r);
-                        EntityDespawn(myIndex);
-                        return; // This slot now holds a different entity
-                    }
-                    entity->cardMode = CARD_REC_FORM; // Springs home to its fan slot below
-                }
-            }
-            else
-            {
-                entity->cardMode = CARD_REC_FORM;
-                Rectangle rect = {entity->position.x - CARD_WIDTH / 2.0f, entity->position.y - CARD_HEIGHT / 2.0f, CARD_WIDTH, CARD_HEIGHT};
-                entity->hovered = (!uiWantsMouse && CheckCollisionPointRec(mouse, rect));
-                if (entity->hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) entity->selected = true;
-            }
-
-            // Ease toward the fan slot rather than sitting rigidly; the same
-            // under-damped spring makes released cards bounce back home
-            Vector2 springTarget = slotPos;
-            float stiffness = 260.0f; // Under-damped with damping 18 (critical ~32)
-            float damping = 18.0f;
-            if (entity->hovered && !entity->selected) springTarget.y -= 14.0f; // Hovered card lifts out of the fan
-            if (entity->selected && (entity->cardMode == CARD_REC_FORM))
-            {
-                springTarget = mouse; // Dragged off-board: ride tight on the cursor
-                stiffness = 900.0f;
-                damping = 55.0f;
-            }
-            entity->velocity.x += ((springTarget.x - entity->position.x) * stiffness - entity->velocity.x * damping) * dt;
-            entity->velocity.y += ((springTarget.y - entity->position.y) * stiffness - entity->velocity.y * damping) * dt;
-            entity->position.x += entity->velocity.x * dt;
-            entity->position.y += entity->velocity.y * dt;
-
-            // Rectangle hides while ghosting on the board, fades back in when released
-            float alphaTarget = (entity->selected && (entity->cardMode == CARD_HEX_FORM)) ? 0.0f : 1.0f;
-            float fadeRate = (alphaTarget < entity->alpha) ? 18.0f : 8.0f; // Hide fast, reappear soft
-            entity->alpha += (alphaTarget - entity->alpha) * (1.0f - expf(-fadeRate * dt));
-        }
-        break;
-        default: break;
-    }
-}
-
-// Per-entity drawing, dispatched on kind (called inside BeginMode3D)
-static void DrawEntity(const Entity *entity)
-{
-    switch (entity->kind)
-    {
-        case ENTITY_HEX_CELL:
-        {
-            float drawSize = entity->radius * 0.92f; // Small gap between neighbour cells
-
-            Color fill = entity->tint;
-            if (entity->selected) fill = GOLD;
-            if (entity->hovered) fill = entity->selected ? ORANGE : SKYBLUE;
-
-            // Hover and selection read as raised tiles
-            float height = HEX_TILE_HEIGHT;
-            if (entity->selected)
-                height = HEX_TILE_HEIGHT_SELECTED;
-            else if (entity->hovered)
-                height = HEX_TILE_HEIGHT_HOVER;
-
-            // A 6-slice cylinder is a hexagonal prism; raylib places the first
-            // vertex on +Z, which matches the pointy-top axial layout
-            DrawCylinder(entity->position, drawSize, drawSize, height, 6, fill);
-            DrawCylinderWires(entity->position, drawSize, drawSize, height, 6, DARKGRAY);
-        }
-        break;
-        case ENTITY_CARD:
-        {
-            // Grabbed over the board: the rectangle is hidden (see DrawEntityUI)
-            // and the card shows as the ghost of where it would land, riding the
-            // reticle's sprung position rather than the raw cursor
-            if (!entity->selected || (entity->cardMode != CARD_HEX_FORM)) break;
-
-            const Entity *cell = NULL;
-            for (int i = 0; i < entityCount; i++)
-            {
-                if ((entities[i].kind == ENTITY_HEX_CELL) && (entities[i].q == mouseHexQ) && (entities[i].r == mouseHexR))
-                {
-                    cell = &entities[i];
-                    break;
-                }
-            }
-            if (cell == NULL) break;
-
-            Color ghost = (cell->value == 0) ? entity->tint : RED; // Red = invalid target
-
-            // Transparent hex fill + outline in the card's color at the hovered tile
-            float size = HEX_SIZE * 0.92f;
-            DrawCylinder(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.35f));
-            DrawCylinderWires(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.85f));
-        }
-        break;
-
-        default: break;
-    }
-}
-
-// Per-entity UI drawing, dispatched on kind (screen space, called after EndMode3D)
-static void DrawEntityUI(const Entity *entity)
-{
-    switch (entity->kind)
-    {
-        case ENTITY_HEALTH_BAR:
-        {
-            float scale = 1.5f; // 32px pixel-art hearts drawn at 48px
-            float step = (float)heartTexture.width * scale + 4.0f;
-
-            for (int i = 0; i < entity->maxHealth; i++)
-            {
-                Vector2 pos = {entity->position.x + (float)i * step, entity->position.y};
-                Color tint = (i < entity->health) ? WHITE : Fade(DARKGRAY, 0.4f); // Lost hearts are dimmed
-                DrawTextureEx(heartTexture, pos, 0.0f, scale, tint);
-            }
-        }
-        break;
-        case ENTITY_CARD:
-        {
-            if (entity->alpha < 0.01f) break; // Hidden while ghosting on the board
-
-            // Blank card at its slot: colored border behind a plain body, art comes
-            // later; tilt follows the eased position so cards straighten as they slide
-            float rotation = (entity->position.x - (float)screenWidth / 2.0f) * 0.02f;
-            Vector2 center = {entity->position.x, entity->position.y};
-
-            Rectangle border = {center.x, center.y, CARD_WIDTH + 6.0f, CARD_HEIGHT + 6.0f};
-            Rectangle body = {center.x, center.y, CARD_WIDTH, CARD_HEIGHT};
-            DrawRectanglePro(border, (Vector2){border.width / 2.0f, border.height / 2.0f}, rotation, Fade(entity->tint, entity->alpha));
-            DrawRectanglePro(body, (Vector2){body.width / 2.0f, body.height / 2.0f}, rotation, Fade(entity->hovered ? WHITE : RAYWHITE, entity->alpha));
-
-            DrawText(TextFormat("%d", entity->value), (int)center.x - 5, (int)center.y - 10, 20, Fade(DARKGRAY, entity->alpha));
-        }
-        break;
-        default: break;
-    }
-}
-
-// Draw the hover reticle chasing the hovered tile (called inside BeginMode3D).
-// Movement is an under-damped spring (overshoots and rebounds, not a lerp),
-// scale follows spring speed, spin follows 1/scale^2 like a skater pulling
-// their arms in. The quad lies flat on the board plane and spins around Y;
-// the 3D camera projection replaces the "iso squash" of a 2D layout.
-static void DrawHoverdHexEffect(void)
+// Reticle step: integrate the hover reticle's spring/scale/spin toward the
+// hovered tile (NULL hides it; the next hover re-snaps in place). Movement is
+// an under-damped spring (overshoots and rebounds, not a lerp), scale follows
+// spring speed, spin follows 1/scale^2 like a skater pulling their arms in.
+static void UpdateHoverReticle(const Entity *hoveredCell)
 {
     const float stiffness = 90.0f;     // Spring pull toward the tile center (1/s^2)
     const float damping = 6.0f;        // Well below critical (2*sqrtf(90) ~= 19): magnetic overshoot
@@ -504,17 +300,6 @@ static void DrawHoverdHexEffect(void)
     const float floatHeight = 0.25f;   // Ride height above the tile top
     const float bobAmplitude = 0.06f;  // Slow sine bob around the ride height
     const float bobSpeed = 3.0f;       // Bob phase speed (rad/s)
-
-    // Find the hovered tile; the reticle hides while there is none
-    const Entity *hoveredCell = NULL;
-    for (int i = 0; i < entityCount; i++)
-    {
-        if ((entities[i].kind == ENTITY_HEX_CELL) && entities[i].hovered)
-        {
-            hoveredCell = &entities[i];
-            break;
-        }
-    }
 
     if (hoveredCell == NULL)
     {
@@ -559,8 +344,14 @@ static void DrawHoverdHexEffect(void)
     if (reticle.bobPhase > 2.0f * PI) reticle.bobPhase -= 2.0f * PI;
     float tileTop = hoveredCell->selected ? HEX_TILE_HEIGHT_SELECTED : HEX_TILE_HEIGHT_HOVER;
     reticle.position.y = tileTop + floatHeight + sinf(reticle.bobPhase) * bobAmplitude;
+}
 
-    // Textured quad lying flat on the board plane, spun around Y
+// Reticle draw: a textured quad spinning flat on the board plane; in true 3D
+// the camera projection replaces the "iso squash" of a 2D layout
+static void DrawHoverReticle(void)
+{
+    if (!reticle.active) return;
+
     rlPushMatrix();
     rlTranslatef(reticle.position.x, reticle.position.y, reticle.position.z);
     rlRotatef(reticle.spinAngle * RAD2DEG, 0.0f, 1.0f, 0.0f);
@@ -584,19 +375,22 @@ static void DrawHoverdHexEffect(void)
     rlPopMatrix();
 }
 
-// Draw the impact ring/dust where a card just landed (called inside BeginMode3D)
-static void DrawImpactEffect(void)
+// Impact step: age out the ring/dust of the last card placement
+static void UpdateImpactEffect(void)
 {
     if (!impact.active) return;
 
     float dt = GetFrameTime();
     if (dt > 0.05f) dt = 0.05f;
     impact.age += dt;
-    if (impact.age >= IMPACT_DURATION)
-    {
-        impact.active = false;
-        return;
-    }
+    if (impact.age >= IMPACT_DURATION) impact.active = false;
+}
+
+// Impact draw: expanding hex rings + dust chips where a card just landed
+// (called inside BeginMode3D)
+static void DrawImpactEffect(void)
+{
+    if (!impact.active) return;
 
     float t = impact.age / IMPACT_DURATION;      // 0 -> 1 over the effect
     float ease = 1.0f - (1.0f - t) * (1.0f - t); // Ease-out: bursts fast, settles soft
@@ -606,6 +400,33 @@ static void DrawImpactEffect(void)
     float ringRadius = HEX_SIZE * (0.7f + 1.2f * ease);
     DrawCylinderWires(impact.position, ringRadius, ringRadius, 0.05f, 6, Fade(impact.tint, fade));
     DrawCylinderWires(impact.position, ringRadius * 0.8f, ringRadius * 0.8f, 0.05f, 6, Fade(WHITE, fade * 0.7f));
+
+    // Light burst: one frame of the sheet (baked from the itch light_007.mov),
+    // played flat on the board over the effect's lifetime, tinted by the placed
+    // card's color. Plain alpha blend: additive glow saturates to invisible
+    // against this near-white scene
+    int frame = (int)(t * (float)IMPACT_LIGHT_FRAMES);
+    if (frame >= IMPACT_LIGHT_FRAMES) frame = IMPACT_LIGHT_FRAMES - 1;
+    float u0 = (float)frame / (float)IMPACT_LIGHT_FRAMES;
+    float u1 = (float)(frame + 1) / (float)IMPACT_LIGHT_FRAMES;
+
+    float half = HEX_SIZE * impactLightSize;              // Burst spills over the tile's neighbours
+    float lightY = impact.position.y + impactLightHeight; // Clears the resting tile top
+
+    rlSetTexture(impactLightTexture.id);
+    rlBegin(RL_QUADS);
+    rlColor4ub(impact.tint.r, impact.tint.g, impact.tint.b, 255);
+    rlNormal3f(0.0f, 1.0f, 0.0f); // Counter-clockwise seen from above, so the face points up
+    rlTexCoord2f(u0, 0.0f);
+    rlVertex3f(impact.position.x - half, lightY, impact.position.z - half);
+    rlTexCoord2f(u0, 1.0f);
+    rlVertex3f(impact.position.x - half, lightY, impact.position.z + half);
+    rlTexCoord2f(u1, 1.0f);
+    rlVertex3f(impact.position.x + half, lightY, impact.position.z + half);
+    rlTexCoord2f(u1, 0.0f);
+    rlVertex3f(impact.position.x + half, lightY, impact.position.z - half);
+    rlEnd();
+    rlSetTexture(0);
 
     // Dust: six chips thrown outward on a small hop, shrinking as they fade
     for (int i = 0; i < 6; i++)
@@ -647,7 +468,8 @@ static void SpawnCard(void)
     dealt++;
 }
 
-// Update and draw frame
+// Update and draw frame: a flat sequence of system steps, each its own pass
+// over the entity list
 static void UpdateDrawFrame(void)
 {
     // Update
@@ -674,7 +496,147 @@ static void UpdateDrawFrame(void)
         }
     }
 
-    for (int i = 0; i < entityCount; i++) UpdateEntity(&entities[i]);
+    float dt = GetFrameTime();
+    if (dt > 0.05f) dt = 0.05f; // Clamp frame hitches so the springs cannot explode
+    Vector2 mouse = GetMousePosition();
+
+    //
+    // hex cell hover + click selection; remember the hovered cell for the
+    // card, reticle, and debug steps below
+    //
+
+    Entity *hoveredCell = NULL;
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *cell = &entities[i];
+        if (cell->kind != ENTITY_HEX_CELL) continue;
+
+        cell->hovered = ((cell->q == mouseHexQ) && (cell->r == mouseHexR) && !uiWantsMouse);
+        if (cell->hovered) hoveredCell = cell;
+
+        if (cell->hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            cell->selected = !cell->selected;
+            LOG("INFO: HEX: clicked cell (q=%d, r=%d) selected=%d\n", cell->q, cell->r, cell->selected);
+        }
+    }
+
+    //
+    // card grab -- a press picks up the card under the cursor
+    //
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiWantsMouse)
+    {
+        for (int i = 0; i < entityCount; i++)
+        {
+            Entity *card = &entities[i];
+            if (card->kind != ENTITY_CARD) continue;
+
+            Rectangle rect = {card->position.x - CARD_WIDTH / 2.0f, card->position.y - CARD_HEIGHT / 2.0f, CARD_WIDTH, CARD_HEIGHT};
+            if (CheckCollisionPointRec(mouse, rect))
+            {
+                card->selected = true;
+                break; // Only one card can be grabbed
+            }
+        }
+    }
+
+    //
+    // card mode -- a grabbed card ghosts over the board, is a rectangle elsewhere
+    //
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *card = &entities[i];
+        if (card->kind != ENTITY_CARD) continue;
+        card->cardMode = (card->selected && (hoveredCell != NULL)) ? CARD_HEX_FORM : CARD_REC_FORM;
+    }
+
+    //
+    // card drop -- release commits the grabbed card onto an empty tile with a
+    // screen shake + impact; anywhere else it springs home
+    //
+
+    if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+    {
+        for (int i = 0; i < entityCount; i++)
+        {
+            Entity *card = &entities[i];
+            if ((card->kind != ENTITY_CARD) || !card->selected) continue;
+
+            card->selected = false;
+            if ((hoveredCell != NULL) && (hoveredCell->value == 0))
+            {
+                // The ghost commits: the tile takes the card's value and color
+                hoveredCell->value = card->value;
+                hoveredCell->tint = card->tint;
+
+                shakeTimeLeft = SHAKE_DURATION;
+                impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
+
+                LOG("INFO: CARD: placed value %d at (q=%d, r=%d)\n", card->value, hoveredCell->q, hoveredCell->r);
+                EntityDespawn(i);
+            }
+            break; // Only one card can be grabbed
+        }
+    }
+
+    //
+    // card motion -- hover lift, springs toward fan slots in pool order (or the
+    // cursor while dragged), rectangle fade while ghosting
+    //
+
+    int handCount = 0;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_CARD) handCount++;
+    }
+
+    int slot = 0;
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *card = &entities[i];
+        if (card->kind != ENTITY_CARD) continue;
+
+        // Fan slot centered on the bottom edge, outer cards sit lower
+        float fanIndex = (float)slot - (float)(handCount - 1) / 2.0f;
+        slot++;
+        Vector2 springTarget = {
+            (float)screenWidth / 2.0f + fanIndex * CARD_FAN_STEP,
+            (float)screenHeight - CARD_FAN_BOTTOM + fabsf(fanIndex) * CARD_FAN_ARC,
+        };
+
+        Rectangle rect = {card->position.x - CARD_WIDTH / 2.0f, card->position.y - CARD_HEIGHT / 2.0f, CARD_WIDTH, CARD_HEIGHT};
+        card->hovered = (!uiWantsMouse && CheckCollisionPointRec(mouse, rect));
+        if (card->hovered && !card->selected) springTarget.y -= 14.0f; // Hovered card lifts out of the fan
+
+        // Ease toward the slot rather than sitting rigidly; the same
+        // under-damped spring makes released cards bounce back home
+        float stiffness = 260.0f; // Under-damped with damping 18 (critical ~32)
+        float damping = 18.0f;
+        if (card->selected && (card->cardMode == CARD_REC_FORM))
+        {
+            springTarget = mouse; // Dragged off-board: ride tight on the cursor
+            stiffness = 900.0f;
+            damping = 55.0f;
+        }
+        card->velocity.x += ((springTarget.x - card->position.x) * stiffness - card->velocity.x * damping) * dt;
+        card->velocity.y += ((springTarget.y - card->position.y) * stiffness - card->velocity.y * damping) * dt;
+        card->position.x += card->velocity.x * dt;
+        card->position.y += card->velocity.y * dt;
+
+        // Rectangle hides while ghosting on the board, fades back in when released
+        float alphaTarget = (card->selected && (card->cardMode == CARD_HEX_FORM)) ? 0.0f : 1.0f;
+        float fadeRate = (alphaTarget < card->alpha) ? 18.0f : 8.0f; // Hide fast, reappear soft
+        card->alpha += (alphaTarget - card->alpha) * (1.0f - expf(-fadeRate * dt));
+    }
+
+    //
+    // effect state -- reticle chases the hovered tile, impact ages out
+    //
+
+    UpdateHoverReticle(hoveredCell);
+    UpdateImpactEffect();
     //----------------------------------------------------------------------------------
 
     // Draw
@@ -684,27 +646,107 @@ static void UpdateDrawFrame(void)
     BeginTextureMode(target);
     ClearBackground(RAYWHITE);
 
-    // 2.5D: the world is 3D, viewed through a tilted perspective camera
+    // 2.5D: the world is 3D, viewed through a tilted orthographic camera
     BeginMode3D(camera);
 
-    for (int i = 0; i < entityCount; i++) DrawEntity(&entities[i]);
+    //
+    // board tiles -- raised prisms, fill shows hover/selection
+    //
 
-    DrawHoverdHexEffect(); // Last in 3D so its alpha blends over the tiles
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *cell = &entities[i];
+        if (cell->kind != ENTITY_HEX_CELL) continue;
+
+        float drawSize = cell->radius * 0.92f; // Small gap between neighbour cells
+
+        Color fill = cell->tint;
+        if (cell->selected) fill = GOLD;
+        if (cell->hovered) fill = cell->selected ? ORANGE : SKYBLUE;
+
+        // Hover and selection read as raised tiles
+        float height = HEX_TILE_HEIGHT;
+        if (cell->selected)
+            height = HEX_TILE_HEIGHT_SELECTED;
+        else if (cell->hovered)
+            height = HEX_TILE_HEIGHT_HOVER;
+
+        // A 6-slice cylinder is a hexagonal prism; raylib places the first
+        // vertex on +Z, which matches the pointy-top axial layout
+        DrawCylinder(cell->position, drawSize, drawSize, height, 6, fill);
+        DrawCylinderWires(cell->position, drawSize, drawSize, height, 6, DARKGRAY);
+    }
+
+    //
+    // landing ghost -- the grabbed card projected onto the hovered tile, riding
+    // the reticle's sprung position rather than the raw cursor
+    //
+
+    if (hoveredCell != NULL)
+    {
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *card = &entities[i];
+            if ((card->kind != ENTITY_CARD) || !card->selected || (card->cardMode != CARD_HEX_FORM)) continue;
+
+            Color ghost = (hoveredCell->value == 0) ? card->tint : RED; // Red = invalid target
+
+            // Transparent hex fill + outline in the card's color
+            float size = HEX_SIZE * 0.92f;
+            DrawCylinder(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.35f));
+            DrawCylinderWires(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.85f));
+            break; // Only one card can be grabbed
+        }
+    }
+
+    DrawHoverReticle(); // Last in 3D so its alpha blends over the tiles
     DrawImpactEffect();
 
     EndMode3D();
 
-    // 2D overlay on top of the 3D view
-    for (int i = 0; i < entityCount; i++) DrawEntityUI(&entities[i]);
+    //
+    // card rectangles -- blank cards fanned along the bottom edge
+    //
 
     for (int i = 0; i < entityCount; i++)
     {
-        if ((entities[i].kind == ENTITY_HEX_CELL) && entities[i].hovered)
+        const Entity *card = &entities[i];
+        if ((card->kind != ENTITY_CARD) || (card->alpha < 0.01f)) continue;
+
+        // Colored border behind a plain body, art comes later; tilt follows
+        // the eased position so cards straighten as they slide
+        float rotation = (card->position.x - (float)screenWidth / 2.0f) * 0.02f;
+        Vector2 center = {card->position.x, card->position.y};
+
+        Rectangle border = {center.x, center.y, CARD_WIDTH + 6.0f, CARD_HEIGHT + 6.0f};
+        Rectangle body = {center.x, center.y, CARD_WIDTH, CARD_HEIGHT};
+        DrawRectanglePro(border, (Vector2){border.width / 2.0f, border.height / 2.0f}, rotation, Fade(card->tint, card->alpha));
+        DrawRectanglePro(body, (Vector2){body.width / 2.0f, body.height / 2.0f}, rotation, Fade(card->hovered ? WHITE : RAYWHITE, card->alpha));
+
+        DrawText(TextFormat("%d", card->value), (int)center.x - 5, (int)center.y - 10, 20, Fade(DARKGRAY, card->alpha));
+    }
+
+    //
+    // health bars -- rows of heart icons
+    //
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *bar = &entities[i];
+        if (bar->kind != ENTITY_HEALTH_BAR) continue;
+
+        float scale = 1.5f; // 32px pixel-art hearts drawn at 48px
+        float step = (float)heartTexture.width * scale + 4.0f;
+
+        for (int h = 0; h < bar->maxHealth; h++)
         {
-            DrawText(TextFormat("cell (q=%d, r=%d)", entities[i].q, entities[i].r), 24, screenHeight - 40, 20, DARKGRAY);
-            break;
+            Vector2 pos = {bar->position.x + (float)h * step, bar->position.y};
+            Color tint = (h < bar->health) ? WHITE : Fade(DARKGRAY, 0.4f); // Lost hearts are dimmed
+            DrawTextureEx(heartTexture, pos, 0.0f, scale, tint);
         }
     }
+
+    if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, DARKGRAY);
 
     if ((frameCounter / 20) % 2) DrawText("hex merge time!", screenWidth / 2 - MeasureText("hex merge time!", 30) / 2, 28, 30, MAROON);
 
@@ -756,6 +798,15 @@ static void UpdateDrawFrame(void)
 
     if (igButton("deal card", (ImVec2_c){0, 0})) SpawnCard();
 
+    // Impact burst tweakers; the button replays the effect at the board center
+    igSliderFloat("impact size", &impactLightSize, 0.5f, 4.0f, "%.2f", 0);
+    igSliderFloat("impact height", &impactLightHeight, 0.0f, 2.0f, "%.2f", 0);
+    if (igButton("test impact", (ImVec2_c){0, 0}))
+    {
+        impact = (ImpactFx){.position = HexAxialToWorld(0, 0), .tint = (Color){255, 203, 0, 255}, .age = 0.0f, .active = true};
+        shakeTimeLeft = SHAKE_DURATION;
+    }
+
     for (int i = 0; i < entityCount; i++)
     {
         if (entities[i].kind == ENTITY_HEALTH_BAR)
@@ -799,6 +850,9 @@ int main(void)
     reticleTexture = LoadTexture("resources/highlight_slot_26x26.png");
     SetTextureFilter(reticleTexture, TEXTURE_FILTER_POINT); // Keep the pixel art crisp when scaled
 
+    impactLightTexture = LoadTexture("resources/impact_light_8x256.png");
+    SetTextureFilter(impactLightTexture, TEXTURE_FILTER_BILINEAR); // Smooth glow, not pixel art
+
     // Entity pool: one allocation for the whole game, entities live in a
     // packed array with swap-back removal
     entities = (Entity *)calloc(MAX_ENTITIES, sizeof(Entity));
@@ -834,6 +888,7 @@ int main(void)
     rlImGuiShutdown();
     UnloadTexture(heartTexture);
     UnloadTexture(reticleTexture);
+    UnloadTexture(impactLightTexture);
     UnloadRenderTexture(target);
     free(entities);
 
