@@ -65,6 +65,12 @@
 #define PLAYER_FRAME_W 64 // Source frame size in pixels
 #define PLAYER_FRAME_H 32
 
+// Card models: pairs of <name>_card.glb / <name>_hex.glb exported from the
+// sandbox prototype (sandbox/export_glb.py) into resources/models
+#define MAX_CARD_MODELS 8
+#define CARD_MODEL_H 2.6f // The exported card is 2.6 world units tall
+#define HEX_MODEL_R 1.05f // The exported hex form's outer radius
+
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
 //----------------------------------------------------------------------------------
@@ -103,6 +109,15 @@ typedef enum CardMode
     CARD_REC_FORM,
 } CardMode;
 
+// Material Effect
+typedef enum MaterialEffect
+{
+    EFFECT_NONE = 0,
+    GEM,
+    INVERSE_GEM,
+    NUM_EFFECTS,
+} MaterialEffect;
+
 // Fat struct: every possible member any entity could have, in one struct.
 // An entity is initialized by tagging it with its kind; the update/draw
 // switches on kind decide which members mean anything for it.
@@ -135,6 +150,13 @@ typedef struct Entity
 
     // Parrent Hex cell
     int parent;
+
+    // Which card/hex model this entity wears (index into the model arrays);
+    // cards get it at spawn, cells copy it from the card placed on them
+    int modelIndex;
+
+    // Card hover press tilt, eased toward the cursor (-1..1 per axis)
+    Vector2 pressTilt;
 
     // Mode of Card
     CardMode cardMode;
@@ -192,6 +214,8 @@ static Texture2D impactLightTexture = {0}; // Light-burst sheet, 8 frames in a r
                                            // (resources/impact_light_8x256.png)
 static Texture2D playerTexture = {0};      // Player idle sheet, 8 frames of 64x32 in a row
                                            // (resources/player_mage_8x64x32.png)
+static Texture2D tileArtTexture = {0};     // Cloud art on the tile tops, hex-shaped with alpha
+                                           // (resources/tile_clouds_256.png)
 static Texture2D leverTrackTexture = {0};  // Turn lever track (resources/lever_track_128x16.png)
 static Texture2D leverFillTexture = {0};   // Turn lever pull fill (resources/lever_fill_120x8.png)
 static Texture2D leverKnobTexture = {0};   // Turn lever grab point (resources/lever_knob_16x18.png)
@@ -205,9 +229,286 @@ static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in 
 static ImpactFx impact = {0};      // Impact ring/dust of the last card placement
 static float shakeTimeLeft = 0.0f; // Screen shake seconds remaining (kicked by a card placement)
 
+// Card/hex models loaded from resources/models; 0 loaded = the card draw
+// falls back to the old flat rectangles and cylinder ghost
+static Model cardModels[MAX_CARD_MODELS] = {0};
+static Model hexModels[MAX_CARD_MODELS] = {0};
+static int cardModelCount = 0;
+
+// Foil shine for the card models: a diagonal iridescent band swept across the
+// face, drawn as an additive second pass. The fragment shader lives here as a
+// string; the mask is each mesh texture's own alpha.
+#if defined(PLATFORM_WEB)
+static const char *shineFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec2 fragTexCoord;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform float time;\n"
+    "uniform float phase;\n"
+    "void main()\n"
+    "{\n"
+    "    vec4 tex = texture2D(texture0, fragTexCoord);\n"
+    "    float mask = step(0.01, tex.a);\n"
+    "    float sweep = fract(time*0.22 + phase);\n"
+    "    float d = fragTexCoord.x*0.6 + fragTexCoord.y*0.4 - (sweep*2.2 - 0.6);\n"
+    "    float band = smoothstep(0.16, 0.0, abs(d));\n"
+    "    vec3 rainbow = 0.5 + 0.5*cos(6.2831*(d*2.0 + vec3(0.0, 0.33, 0.67)));\n"
+    "    gl_FragColor = vec4(mix(vec3(1.0), rainbow, 0.6), band*0.4*mask);\n"
+    "}\n";
+#else
+static const char *shineFS =
+    "#version 330\n"
+    "in vec2 fragTexCoord;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform float time;\n"
+    "uniform float phase;\n"
+    "out vec4 finalColor;\n"
+    "void main()\n"
+    "{\n"
+    "    vec4 tex = texture(texture0, fragTexCoord);\n"
+    "    float mask = step(0.01, tex.a);\n"
+    "    float sweep = fract(time*0.22 + phase);\n"
+    "    float d = fragTexCoord.x*0.6 + fragTexCoord.y*0.4 - (sweep*2.2 - 0.6);\n"
+    "    float band = smoothstep(0.16, 0.0, abs(d));\n"
+    "    vec3 rainbow = 0.5 + 0.5*cos(6.2831*(d*2.0 + vec3(0.0, 0.33, 0.67)));\n"
+    "    finalColor = vec4(mix(vec3(1.0), rainbow, 0.6), band*0.4*mask);\n"
+    "}\n";
+#endif
+static Shader shineShader = {0};
+static int shineTimeLoc = -1;
+static int shinePhaseLoc = -1;
+
+// Aurora background: procedural curtains drawn as a fullscreen quad behind
+// the board. Three noise-driven layers, each a wavy baseline feathering
+// upward, modulated by vertical rays; green at the base, violet up high.
+#if defined(PLATFORM_WEB)
+static const char *auroraFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec2 fragTexCoord;\n"
+    "uniform float time;\n"
+    "uniform float intensity;\n"
+    "float hash(float n) { return fract(sin(n)*43758.5453); }\n"
+    "float noise(vec2 p)\n"
+    "{\n"
+    "    vec2 i = floor(p);\n"
+    "    vec2 f = fract(p);\n"
+    "    f = f*f*(3.0 - 2.0*f);\n"
+    "    float a = hash(i.x + i.y*57.0);\n"
+    "    float b = hash(i.x + 1.0 + i.y*57.0);\n"
+    "    float c = hash(i.x + (i.y + 1.0)*57.0);\n"
+    "    float d = hash(i.x + 1.0 + (i.y + 1.0)*57.0);\n"
+    "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "    vec2 uv = vec2(fragTexCoord.x, 1.0 - fragTexCoord.y);\n"
+    "    vec3 col = vec3(0.0);\n"
+    "    for (int i = 0; i < 3; i++)\n"
+    "    {\n"
+    "        float fi = float(i);\n"
+    "        float wave = noise(vec2(uv.x*3.0 + fi*7.3 + time*(0.05 + fi*0.03), time*0.1 + fi*3.1));\n"
+    "        float base = 0.35 + 0.18*fi + (wave - 0.5)*0.35;\n"
+    "        float d = uv.y - base;\n"
+    "        float curtain = exp(-max(d, 0.0)*(7.0 - fi*1.5))*exp(-max(-d, 0.0)*30.0);\n"
+    "        float rays = 0.55 + 0.45*noise(vec2(uv.x*26.0 + fi*13.0, time*(0.35 + 0.1*fi)));\n"
+    "        vec3 tint = mix(vec3(0.10, 0.95, 0.45), vec3(0.45, 0.25, 0.95), clamp(d*2.2 + fi*0.2, 0.0, 1.0));\n"
+    "        col += tint*curtain*rays;\n"
+    "    }\n"
+    "    gl_FragColor = vec4(col*intensity, 1.0);\n"
+    "}\n";
+#else
+static const char *auroraFS =
+    "#version 330\n"
+    "in vec2 fragTexCoord;\n"
+    "uniform float time;\n"
+    "uniform float intensity;\n"
+    "out vec4 finalColor;\n"
+    "float hash(float n) { return fract(sin(n)*43758.5453); }\n"
+    "float noise(vec2 p)\n"
+    "{\n"
+    "    vec2 i = floor(p);\n"
+    "    vec2 f = fract(p);\n"
+    "    f = f*f*(3.0 - 2.0*f);\n"
+    "    float a = hash(i.x + i.y*57.0);\n"
+    "    float b = hash(i.x + 1.0 + i.y*57.0);\n"
+    "    float c = hash(i.x + (i.y + 1.0)*57.0);\n"
+    "    float d = hash(i.x + 1.0 + (i.y + 1.0)*57.0);\n"
+    "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "    vec2 uv = vec2(fragTexCoord.x, 1.0 - fragTexCoord.y);\n"
+    "    vec3 col = vec3(0.0);\n"
+    "    for (int i = 0; i < 3; i++)\n"
+    "    {\n"
+    "        float fi = float(i);\n"
+    "        float wave = noise(vec2(uv.x*3.0 + fi*7.3 + time*(0.05 + fi*0.03), time*0.1 + fi*3.1));\n"
+    "        float base = 0.35 + 0.18*fi + (wave - 0.5)*0.35;\n"
+    "        float d = uv.y - base;\n"
+    "        float curtain = exp(-max(d, 0.0)*(7.0 - fi*1.5))*exp(-max(-d, 0.0)*30.0);\n"
+    "        float rays = 0.55 + 0.45*noise(vec2(uv.x*26.0 + fi*13.0, time*(0.35 + 0.1*fi)));\n"
+    "        vec3 tint = mix(vec3(0.10, 0.95, 0.45), vec3(0.45, 0.25, 0.95), clamp(d*2.2 + fi*0.2, 0.0, 1.0));\n"
+    "        col += tint*curtain*rays;\n"
+    "    }\n"
+    "    finalColor = vec4(col*intensity, 1.0);\n"
+    "}\n";
+#endif
+static Shader auroraShader = {0};
+static int auroraTimeLoc = -1;
+static int auroraIntensityLoc = -1;
+static float auroraIntensity = 0.9f; // Sky brightness, debug tweakable
+static Texture2D whiteTexture = {0}; // 1x1 white, the canvas for fullscreen shader quads
+
+// Gem materials: any mesh drawn with gemMaterial or inverseGemMaterial renders
+// as screen-space refractive crystal -- the shader bends the view ray against
+// the mesh normals and samples the scene texture (the aurora sky), with
+// chromatic dispersion and a fresnel rim. The inverse variant transmits the
+// negative. Same FS for both; invertColors is baked per shader at load.
+#if defined(PLATFORM_WEB)
+static const char *gemVS =
+    "#version 100\n"
+    "attribute vec3 vertexPosition;\n"
+    "attribute vec3 vertexNormal;\n"
+    "uniform mat4 mvp;\n"
+    "uniform mat4 matModel;\n"
+    "uniform mat4 matNormal;\n"
+    "varying vec3 fragPosition;\n"
+    "varying vec3 fragNormal;\n"
+    "void main()\n"
+    "{\n"
+    "    fragPosition = vec3(matModel*vec4(vertexPosition, 1.0));\n"
+    "    fragNormal = normalize(vec3(matNormal*vec4(vertexNormal, 0.0)));\n"
+    "    gl_Position = mvp*vec4(vertexPosition, 1.0);\n"
+    "}\n";
+static const char *gemFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec3 fragPosition;\n"
+    "varying vec3 fragNormal;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec3 viewPos;\n"
+    "uniform vec3 camRight;\n"
+    "uniform vec3 camUp;\n"
+    "uniform vec2 resolution;\n"
+    "uniform float ior;\n"
+    "uniform float strength;\n"
+    "uniform float chromatic;\n"
+    "uniform int invertColors;\n"
+    "vec3 refrSample(vec2 baseUV, vec3 I, vec3 N, float eta)\n"
+    "{\n"
+    "    vec3 R = refract(I, N, eta);\n"
+    "    vec2 off = vec2(dot(R, camRight), dot(R, camUp))*strength;\n"
+    "    return texture2D(texture0, clamp(baseUV + off, vec2(0.002), vec2(0.998))).rgb;\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "    vec3 N = normalize(fragNormal);\n"
+    "    vec3 I = normalize(fragPosition - viewPos);\n"
+    "    if (dot(N, I) > 0.0) N = -N;\n"
+    "    vec2 baseUV = gl_FragCoord.xy/resolution;\n"
+    "    float eta = 1.0/ior;\n"
+    "    vec3 col;\n"
+    "    col.r = refrSample(baseUV, I, N, eta*(1.0 - chromatic)).r;\n"
+    "    col.g = refrSample(baseUV, I, N, eta).g;\n"
+    "    col.b = refrSample(baseUV, I, N, eta*(1.0 + chromatic)).b;\n"
+    "    if (invertColors == 1) col = vec3(1.0) - col;\n"
+    "    float fres = pow(1.0 - max(dot(-I, N), 0.0), 4.0);\n"
+    "    col += vec3(0.85, 0.9, 1.0)*fres*0.5;\n"
+    "    gl_FragColor = vec4(col, 1.0);\n"
+    "}\n";
+#else
+static const char *gemVS =
+    "#version 330\n"
+    "in vec3 vertexPosition;\n"
+    "in vec3 vertexNormal;\n"
+    "uniform mat4 mvp;\n"
+    "uniform mat4 matModel;\n"
+    "uniform mat4 matNormal;\n"
+    "out vec3 fragPosition;\n"
+    "out vec3 fragNormal;\n"
+    "void main()\n"
+    "{\n"
+    "    fragPosition = vec3(matModel*vec4(vertexPosition, 1.0));\n"
+    "    fragNormal = normalize(vec3(matNormal*vec4(vertexNormal, 0.0)));\n"
+    "    gl_Position = mvp*vec4(vertexPosition, 1.0);\n"
+    "}\n";
+static const char *gemFS =
+    "#version 330\n"
+    "in vec3 fragPosition;\n"
+    "in vec3 fragNormal;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec3 viewPos;\n"
+    "uniform vec3 camRight;\n"
+    "uniform vec3 camUp;\n"
+    "uniform vec2 resolution;\n"
+    "uniform float ior;\n"
+    "uniform float strength;\n"
+    "uniform float chromatic;\n"
+    "uniform int invertColors;\n"
+    "out vec4 finalColor;\n"
+    "vec3 refrSample(vec2 baseUV, vec3 I, vec3 N, float eta)\n"
+    "{\n"
+    "    vec3 R = refract(I, N, eta);\n"
+    "    vec2 off = vec2(dot(R, camRight), dot(R, camUp))*strength;\n"
+    "    return texture(texture0, clamp(baseUV + off, vec2(0.002), vec2(0.998))).rgb;\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "    vec3 N = normalize(fragNormal);\n"
+    "    vec3 I = normalize(fragPosition - viewPos);\n"
+    "    if (dot(N, I) > 0.0) N = -N;\n"
+    "    vec2 baseUV = gl_FragCoord.xy/resolution;\n"
+    "    float eta = 1.0/ior;\n"
+    "    vec3 col;\n"
+    "    col.r = refrSample(baseUV, I, N, eta*(1.0 - chromatic)).r;\n"
+    "    col.g = refrSample(baseUV, I, N, eta).g;\n"
+    "    col.b = refrSample(baseUV, I, N, eta*(1.0 + chromatic)).b;\n"
+    "    if (invertColors == 1) col = vec3(1.0) - col;\n"
+    "    float fres = pow(1.0 - max(dot(-I, N), 0.0), 4.0);\n"
+    "    col += vec3(0.85, 0.9, 1.0)*fres*0.5;\n"
+    "    finalColor = vec4(col, 1.0);\n"
+    "}\n";
+#endif
+
+// Cached uniform locations for one gem shader instance
+typedef struct GemShaderLocs
+{
+    int viewPos;
+    int camRight;
+    int camUp;
+    int resolution;
+    int ior;
+    int strength;
+    int chromatic;
+} GemShaderLocs;
+
+static Shader gemShader = {0};        // invertColors = 0
+static Shader inverseGemShader = {0}; // invertColors = 1
+static GemShaderLocs gemLocs = {0};
+static GemShaderLocs inverseGemLocs = {0};
+static Material gemMaterial = {0};         // Draw any mesh with this = crystal
+static Material inverseGemMaterial = {0};  // ... = crystal transmitting the negative
+static Mesh hexPrismMesh = {0};            // 6-slice cylinder: the tile prism, with normals
+static RenderTexture2D sceneTexture = {0}; // What the gem materials refract (the aurora sky)
+
+// Gem optics tweakers, exposed in the hex debug ImGui window
+static float gemIor = 1.45f;
+static float gemStrength = 0.35f;
+static float gemChromatic = 0.05f;
+
+static float tileArtScale = 1.0f; // Tile-top art size, relative to the tile (debug tweakable)
+
 // Impact light-burst tweakers, exposed in the hex debug ImGui window
 static float impactLightSize = 1.7f;   // Half-size of the burst quad, in hex sizes
 static float impactLightHeight = 0.3f; // Quad height above the tile base
+static float impactAnimSpeed = 1.0f;   // Playback speed of the impact animation
+
+// Card model tweakers, exposed in the hex debug ImGui window
+static float cardModelScale = 0.8f;    // Hand card model scale
+static float hexModelScale = 0.95f;    // Hex form scale, relative to a tile
+static float cardPressTiltDeg = 17.0f; // Max hover press tilt on hand cards
 
 // Size tweakers, exposed in the hex debug ImGui window
 static float playerSpriteSize = 1.4f; // Player billboard height in world units
@@ -278,6 +579,107 @@ static Vector3 HexAxialToWorld(int q, int r)
     return world;
 }
 
+// Convert a screen point to the world position where hand cards stand: along
+// the pick ray, on the plane through the camera target. The 2D card passes
+// keep working in screen pixels; only the drawing lifts them into the world.
+static Vector3 ScreenToHandPlane(Vector2 screenPos)
+{
+    Ray ray = GetScreenToWorldRay(screenPos, camera);
+    float t = Vector3Distance(camera.position, camera.target);
+    return Vector3Add(ray.position, Vector3Scale(ray.direction, t));
+}
+
+// Resolve one gem shader's uniform locations (called once at load)
+static GemShaderLocs GetGemShaderLocs(Shader shader)
+{
+    GemShaderLocs locs = {
+        .viewPos = GetShaderLocation(shader, "viewPos"),
+        .camRight = GetShaderLocation(shader, "camRight"),
+        .camUp = GetShaderLocation(shader, "camUp"),
+        .resolution = GetShaderLocation(shader, "resolution"),
+        .ior = GetShaderLocation(shader, "ior"),
+        .strength = GetShaderLocation(shader, "strength"),
+        .chromatic = GetShaderLocation(shader, "chromatic"),
+    };
+    return locs;
+}
+
+// Push this frame's camera basis + optics into one gem shader
+static void UpdateGemShader(Shader shader, const GemShaderLocs *locs)
+{
+    Vector3 forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, camera.up));
+    Vector3 up = Vector3CrossProduct(right, forward);
+    float resolution[2] = {(float)screenWidth, (float)screenHeight};
+
+    SetShaderValue(shader, locs->viewPos, &camera.position, SHADER_UNIFORM_VEC3);
+    SetShaderValue(shader, locs->camRight, &right, SHADER_UNIFORM_VEC3);
+    SetShaderValue(shader, locs->camUp, &up, SHADER_UNIFORM_VEC3);
+    SetShaderValue(shader, locs->resolution, resolution, SHADER_UNIFORM_VEC2);
+    SetShaderValue(shader, locs->ior, &gemIor, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(shader, locs->strength, &gemStrength, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(shader, locs->chromatic, &gemChromatic, SHADER_UNIFORM_FLOAT);
+}
+
+// CRPG camera controls (Baldur's Gate style): WASD pans along the board
+// plane, right-drag orbits the target, mouse wheel zooms (orthographic
+// camera, so fovy is the zoom)
+static void UpdateGameCamera(void)
+{
+    float dt = GetFrameTime();
+
+    // tweakables
+    const float panSpeed = 10.0f;   // world units / second
+    const float orbitSens = 0.005f; // radians / pixel of mouse drag
+
+    // WASD pan: slide camera + target together across the ground plane
+    Vector3 forward = Vector3Subtract(camera.target, camera.position);
+    forward.y = 0.0f;
+    forward = Vector3Normalize(forward);
+    Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, (Vector3){0.0f, 1.0f, 0.0f}));
+
+    Vector3 move = {0};
+    if (IsKeyDown(KEY_W)) move = Vector3Add(move, forward);
+    if (IsKeyDown(KEY_S)) move = Vector3Subtract(move, forward);
+    if (IsKeyDown(KEY_D)) move = Vector3Add(move, right);
+    if (IsKeyDown(KEY_A)) move = Vector3Subtract(move, right);
+    if (Vector3Length(move) > 0.0f)
+    {
+        move = Vector3Scale(Vector3Normalize(move), panSpeed * dt);
+        camera.position = Vector3Add(camera.position, move);
+        camera.target = Vector3Add(camera.target, move);
+    }
+
+    // Right-drag orbit: rotate around the target (yaw + clamped pitch)
+    if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && !uiWantsMouse)
+    {
+        Vector2 d = GetMouseDelta();
+        Vector3 offset = Vector3Subtract(camera.position, camera.target);
+        float radius = Vector3Length(offset);
+
+        float yaw = atan2f(offset.x, offset.z) - d.x * orbitSens;
+        float pitch = asinf(offset.y / radius) - d.y * orbitSens;
+
+        // clamp pitch: stay above the board, below straight-down (no pole flip)
+        if (pitch < 0.25f) pitch = 0.25f;
+        if (pitch > 1.45f) pitch = 1.45f;
+
+        offset.x = radius * cosf(pitch) * sinf(yaw);
+        offset.y = radius * sinf(pitch);
+        offset.z = radius * cosf(pitch) * cosf(yaw);
+        camera.position = Vector3Add(camera.target, offset);
+    }
+
+    // Wheel zoom: fovy is the visible world height on this ortho camera
+    float wheel = GetMouseWheelMove();
+    if ((wheel != 0.0f) && !uiWantsMouse)
+    {
+        camera.fovy *= 1.0f - wheel * 0.08f;
+        if (camera.fovy < 6.0f) camera.fovy = 6.0f;
+        if (camera.fovy > 30.0f) camera.fovy = 30.0f;
+    }
+}
+
 // Convert a point on the board plane to axial coordinates, rounded to the nearest cell
 static void HexWorldToAxial(float x, float z, int *q, int *r)
 {
@@ -315,15 +717,15 @@ static void HexWorldToAxial(float x, float z, int *q, int *r)
 // logic lives here. Update + draw in one step (screen space, itch pixel art)
 static void TurnLever(void)
 {
-    const float cx = 664.0f;                    // Track center x, screen px
-    const float top = 212.0f;                   // Track top y
-    float trackLen = 128.0f * leverScale;       // Track art is 128px long at 1x (debug tweakable)
-    float trackWidth = 16.0f * leverScale;      // Track art is 16px wide
-    float knobHalfW = 12.0f * leverScale;       // Grab point: 16x18 coin art at 1.5x the track scale
+    const float cx = 664.0f;               // Track center x, screen px
+    const float top = 212.0f;              // Track top y
+    float trackLen = 128.0f * leverScale;  // Track art is 128px long at 1x (debug tweakable)
+    float trackWidth = 16.0f * leverScale; // Track art is 16px wide
+    float knobHalfW = 12.0f * leverScale;  // Grab point: 16x18 coin art at 1.5x the track scale
     float knobHalfH = 13.5f * leverScale;
     float travelTop = top + 10.0f * leverScale; // Knob travel range, inset from the track ends
     float travelLen = trackLen - 20.0f * leverScale;
-    const float triggerPull = 0.95f;            // Pull fraction that commits the turn
+    const float triggerPull = 0.95f; // Pull fraction that commits the turn
 
     float dt = GetFrameTime();
     if (dt > 0.05f) dt = 0.05f;
@@ -387,7 +789,7 @@ static void TurnLever(void)
                    (Rectangle){cx, knobY, knobHalfW * 2.0f, knobHalfH * 2.0f}, (Vector2){knobHalfW, knobHalfH}, 0.0f, WHITE);
 
     const char *turnText = TextFormat("turn %d", gameTurn);
-    DrawText(turnText, (int)cx - MeasureText(turnText, 20) / 2, (int)(top + trackLen) + 12, 20, DARKGRAY);
+    DrawText(turnText, (int)cx - MeasureText(turnText, 20) / 2, (int)(top + trackLen) + 12, 20, LIGHTGRAY);
 }
 
 // Spawn one ENTITY_HEX_CELL per cell of the hexagonal board
@@ -417,17 +819,17 @@ static void SpawnHexGrid(void)
 // spring speed, spin follows 1/scale^2 like a skater pulling their arms in.
 static void UpdateHoverReticle(const Entity *hoveredCell)
 {
-    const float stiffness = 90.0f;     // Spring pull toward the tile center (1/s^2)
-    const float damping = 6.0f;        // Well below critical (2*sqrtf(90) ~= 19): magnetic overshoot
-    float scaleRest = reticleScale;         // Half-size at rest, frames one tile (debug tweakable)
-    float scaleMax = reticleScale + 0.75f;  // Half-size cap while moving fast
-    const float scalePerSpeed = 0.12f; // Extra half-size per world-unit/s of spring speed
-    const float shrinkRate = 16.0f;    // Fast: snaps down onto the tile
-    const float growRate = 5.0f;       // Slow: swells out smoothly when it starts moving
-    const float spinFactor = 4.5f;     // Angular velocity = spinFactor/scale^2 (rad/s)
-    const float floatHeight = 0.25f;   // Ride height above the tile top
-    const float bobAmplitude = 0.06f;  // Slow sine bob around the ride height
-    const float bobSpeed = 3.0f;       // Bob phase speed (rad/s)
+    const float stiffness = 90.0f;         // Spring pull toward the tile center (1/s^2)
+    const float damping = 6.0f;            // Well below critical (2*sqrtf(90) ~= 19): magnetic overshoot
+    float scaleRest = reticleScale;        // Half-size at rest, frames one tile (debug tweakable)
+    float scaleMax = reticleScale + 0.75f; // Half-size cap while moving fast
+    const float scalePerSpeed = 0.12f;     // Extra half-size per world-unit/s of spring speed
+    const float shrinkRate = 16.0f;        // Fast: snaps down onto the tile
+    const float growRate = 5.0f;           // Slow: swells out smoothly when it starts moving
+    const float spinFactor = 4.5f;         // Angular velocity = spinFactor/scale^2 (rad/s)
+    const float floatHeight = 0.25f;       // Ride height above the tile top
+    const float bobAmplitude = 0.06f;      // Slow sine bob around the ride height
+    const float bobSpeed = 3.0f;           // Bob phase speed (rad/s)
 
     if (hoveredCell == NULL)
     {
@@ -510,7 +912,7 @@ static void UpdateImpactEffect(void)
 
     float dt = GetFrameTime();
     if (dt > 0.05f) dt = 0.05f;
-    impact.age += dt;
+    impact.age += dt * impactAnimSpeed;
     if (impact.age >= IMPACT_DURATION) impact.active = false;
 }
 
@@ -591,6 +993,7 @@ static void SpawnCard(void)
     card->value = (dealt % 4) + 1;
     card->tint = palette[dealt % 4];
     card->cardMode = CARD_REC_FORM;
+    card->modelIndex = (cardModelCount > 0) ? (dealt % cardModelCount) : 0;
     // Starts below the screen edge and springs up into its fan slot
     card->position = (Vector3){(float)screenWidth / 2.0f, (float)screenHeight + CARD_HEIGHT, 0.0f};
     dealt++;
@@ -607,6 +1010,12 @@ static void UpdateDrawFrame(void)
     // When ImGui wants the mouse (hovering/dragging a UI window), the board
     // must not see clicks; WantCaptureMouse lags one frame, which is fine
     uiWantsMouse = igGetIO_Nil()->WantCaptureMouse;
+
+    //
+    // camera -- WASD pan, right-drag orbit, wheel zoom
+    //
+
+    UpdateGameCamera();
 
     // Pick the cell under the mouse: cast a ray through the cursor and
     // intersect it with the board plane (y = 0)
@@ -688,7 +1097,7 @@ static void UpdateDrawFrame(void)
             if (card->kind != ENTITY_CARD) continue;
 
             Rectangle rect = {card->position.x - CARD_WIDTH * cardScale / 2.0f, card->position.y - CARD_HEIGHT * cardScale / 2.0f,
-                          CARD_WIDTH * cardScale, CARD_HEIGHT * cardScale};
+                              CARD_WIDTH * cardScale, CARD_HEIGHT * cardScale};
             if (CheckCollisionPointRec(mouse, rect))
             {
                 card->selected = true;
@@ -723,11 +1132,12 @@ static void UpdateDrawFrame(void)
             card->selected = false;
             if ((hoveredCell != NULL) && (hoveredCell->value == 0))
             {
-                // The ghost commits: the tile takes the card's value and color
+                // The ghost commits: the tile takes the card's value, color,
+                // and hex model
                 hoveredCell->value = card->value;
                 hoveredCell->tint = card->tint;
+                hoveredCell->modelIndex = card->modelIndex;
 
-                shakeTimeLeft = SHAKE_DURATION;
                 impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
 
                 LOG("INFO: CARD: placed value %d at (q=%d, r=%d)\n", card->value, hoveredCell->q, hoveredCell->r);
@@ -786,6 +1196,17 @@ static void UpdateDrawFrame(void)
         float alphaTarget = (card->selected && (card->cardMode == CARD_HEX_FORM)) ? 0.0f : 1.0f;
         float fadeRate = (alphaTarget < card->alpha) ? 18.0f : 8.0f; // Hide fast, reappear soft
         card->alpha += (alphaTarget - card->alpha) * (1.0f - expf(-fadeRate * dt));
+
+        // Press tilt: the hovered spot of the card model sinks under the
+        // cursor (Balatro-style), eased both ways
+        Vector2 tiltTarget = {0};
+        if (card->hovered && !card->selected)
+        {
+            tiltTarget.x = (mouse.x - card->position.x) / (CARD_WIDTH * cardScale / 2.0f);
+            tiltTarget.y = (mouse.y - card->position.y) / (CARD_HEIGHT * cardScale / 2.0f);
+        }
+        card->pressTilt.x += (tiltTarget.x - card->pressTilt.x) * 0.12f;
+        card->pressTilt.y += (tiltTarget.y - card->pressTilt.y) * 0.12f;
     }
 
     //
@@ -849,8 +1270,34 @@ static void UpdateDrawFrame(void)
     //----------------------------------------------------------------------------------
     // Render game screen to a texture,
     // it could be useful for scaling or further shader postprocessing
+    //
+    // aurora sky -- rendered into the scene texture: it is both the visible
+    // background and what the gem materials refract
+    //
+
+    BeginTextureMode(sceneTexture);
+    float auroraTime = (float)GetTime();
+    SetShaderValue(auroraShader, auroraTimeLoc, &auroraTime, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(auroraShader, auroraIntensityLoc, &auroraIntensity, SHADER_UNIFORM_FLOAT);
+    BeginShaderMode(auroraShader);
+    DrawTexturePro(whiteTexture, (Rectangle){0, 0, 1, 1},
+                   (Rectangle){0, 0, (float)screenWidth, (float)screenHeight},
+                   (Vector2){0, 0}, 0.0f, WHITE);
+    EndShaderMode();
+    EndTextureMode();
+
+    // This frame's camera basis + optics for both gem shaders
+    UpdateGemShader(gemShader, &gemLocs);
+    UpdateGemShader(inverseGemShader, &inverseGemLocs);
+
     BeginTextureMode(target);
-    ClearBackground(RAYWHITE);
+    ClearBackground(BLACK);
+
+    // The sky as the visible background
+    DrawTexturePro(sceneTexture.texture,
+                   (Rectangle){0, 0, (float)screenWidth, -(float)screenHeight},
+                   (Rectangle){0, 0, (float)screenWidth, (float)screenHeight},
+                   (Vector2){0, 0}, 0.0f, WHITE);
 
     // 2.5D: the world is 3D, viewed through a tilted orthographic camera
     BeginMode3D(camera);
@@ -866,10 +1313,6 @@ static void UpdateDrawFrame(void)
 
         float drawSize = cell->radius * 0.92f; // Small gap between neighbour cells
 
-        Color fill = cell->tint;
-        if (cell->selected) fill = GOLD;
-        if (cell->hovered) fill = cell->selected ? ORANGE : SKYBLUE;
-
         // Hover and selection read as raised tiles
         float height = HEX_TILE_HEIGHT;
         if (cell->selected)
@@ -877,10 +1320,59 @@ static void UpdateDrawFrame(void)
         else if (cell->hovered)
             height = HEX_TILE_HEIGHT_HOVER;
 
-        // A 6-slice cylinder is a hexagonal prism; raylib places the first
-        // vertex on +Z, which matches the pointy-top axial layout
-        DrawCylinder(cell->position, drawSize, drawSize, height, 6, fill);
+        // Every tile is an inverse gem: the prism mesh drawn with the inverse
+        // gem material refracts the aurora sky as its negative. GenMeshCylinder
+        // already places a wall vertex on -Z, so it matches DrawCylinder's
+        // pointy-top layout with no extra rotation.
+        Matrix tileTransform = MatrixMultiply(
+            MatrixScale(drawSize, height, drawSize),
+            MatrixTranslate(cell->position.x, cell->position.y, cell->position.z));
+        DrawMesh(hexPrismMesh, inverseGemMaterial, tileTransform);
+
+        // Tile art on the prism top: a plain textured quad, deliberately NOT
+        // drawn with the gem material -- the art obscures the effect and the
+        // effect leaves the art alone. The art hex is flat-top, the board is
+        // pointy-top, hence the 90-degree yaw; art vertex-to-vertex = 2R.
+        float artHalf = drawSize * tileArtScale;
+        rlPushMatrix();
+        rlTranslatef(cell->position.x, height + 0.005f, cell->position.z);
+        rlRotatef(90.0f, 0.0f, 1.0f, 0.0f);
+        rlSetTexture(tileArtTexture.id);
+        rlBegin(RL_QUADS);
+        rlColor4ub(255, 255, 255, 255);
+        rlNormal3f(0.0f, 1.0f, 0.0f);
+        rlTexCoord2f(0.0f, 0.0f);
+        rlVertex3f(-artHalf, 0.0f, -artHalf);
+        rlTexCoord2f(0.0f, 1.0f);
+        rlVertex3f(-artHalf, 0.0f, artHalf);
+        rlTexCoord2f(1.0f, 1.0f);
+        rlVertex3f(artHalf, 0.0f, artHalf);
+        rlTexCoord2f(1.0f, 0.0f);
+        rlVertex3f(artHalf, 0.0f, -artHalf);
+        rlEnd();
+        rlSetTexture(0);
+        rlPopMatrix();
+
+        // Hover/selection/placed color reads as a translucent wash over the gem
+        if (cell->selected)
+            DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(GOLD, 0.45f));
+        else if (cell->hovered)
+            DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(SKYBLUE, 0.35f));
+        else if (cell->value > 0)
+            DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(cell->tint, 0.30f));
         DrawCylinderWires(cell->position, drawSize, drawSize, height, 6, DARKGRAY);
+
+        // Placed card: the cell wears its hex-form model on the prism top
+        if ((cell->value > 0) && (cardModelCount > 0))
+        {
+            rlDisableBackfaceCulling();
+            rlPushMatrix();
+            rlTranslatef(cell->position.x, height + 0.01f, cell->position.z);
+            DrawModel(hexModels[cell->modelIndex % cardModelCount], (Vector3){0},
+                      hexModelScale * HEX_SIZE / HEX_MODEL_R, WHITE);
+            rlPopMatrix();
+            rlEnableBackfaceCulling();
+        }
     }
 
     //
@@ -895,12 +1387,26 @@ static void UpdateDrawFrame(void)
             const Entity *card = &entities[i];
             if ((card->kind != ENTITY_CARD) || !card->selected || (card->cardMode != CARD_HEX_FORM)) continue;
 
-            Color ghost = (hoveredCell->value == 0) ? card->tint : RED; // Red = invalid target
-
-            // Transparent hex fill + outline in the card's color
-            float size = HEX_SIZE * 0.92f;
-            DrawCylinder(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.35f));
-            DrawCylinderWires(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.85f));
+            if (cardModelCount > 0)
+            {
+                // Translucent hex-form model, red-tinted over an invalid target
+                Color ghost = (hoveredCell->value == 0) ? Fade(WHITE, 0.55f) : Fade(RED, 0.55f);
+                rlDisableBackfaceCulling();
+                rlPushMatrix();
+                rlTranslatef(reticle.position.x, reticle.position.y, reticle.position.z);
+                DrawModel(hexModels[card->modelIndex % cardModelCount], (Vector3){0},
+                          hexModelScale * HEX_SIZE / HEX_MODEL_R, ghost);
+                rlPopMatrix();
+                rlEnableBackfaceCulling();
+            }
+            else
+            {
+                // Fallback: transparent hex fill + outline in the card's color
+                Color ghost = (hoveredCell->value == 0) ? card->tint : RED; // Red = invalid target
+                float size = HEX_SIZE * 0.92f;
+                DrawCylinder(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.35f));
+                DrawCylinderWires(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.85f));
+            }
             break; // Only one card can be grabbed
         }
     }
@@ -931,16 +1437,94 @@ static void UpdateDrawFrame(void)
                          (Vector2){spriteW / 2.0f, spriteH / 2.0f}, 0.0f, WHITE);
     }
 
-    DrawHoverReticle(); // Last in 3D so its alpha blends over the tiles
+    DrawHoverReticle(); // Drawn late in 3D so its alpha blends over the tiles
     DrawImpactEffect();
+
+    //
+    // hand cards -- glb card models standing at the fan positions (converted
+    // from the screen-space springs), facing the camera like the player
+    // sprite, with hover press tilt and an additive foil-shine pass. Drawn
+    // last with depth testing off so the hand always sits on top of the board
+    //
+
+    if (cardModelCount > 0)
+    {
+        // Face the camera from any orbit: yaw around Y toward the camera,
+        // then pitch back by its elevation
+        Vector3 camOffset = Vector3Subtract(camera.position, camera.target);
+        float yawDeg = RAD2DEG * atan2f(camOffset.x, camOffset.z);
+        float elevDeg = RAD2DEG * atan2f(camOffset.y, sqrtf(camOffset.x * camOffset.x + camOffset.z * camOffset.z));
+        float shineTime = (float)GetTime();
+        rlDrawRenderBatchActive(); // Flush pending 3D quads before changing state
+        rlDisableDepthTest();
+        rlDisableBackfaceCulling();
+        for (int i = 0; i < entityCount; i++)
+        {
+            Entity *card = &entities[i];
+            if (card->kind != ENTITY_CARD) continue;
+            if (card->selected && (card->cardMode == CARD_HEX_FORM)) continue; // Ghosting on the board
+            if (card->alpha < 0.01f) continue;
+
+            Vector3 pos = ScreenToHandPlane((Vector2){card->position.x, card->position.y});
+            Model model = cardModels[card->modelIndex % cardModelCount];
+            float scale = cardModelScale * cardScale;
+
+            rlPushMatrix();
+            rlTranslatef(pos.x, pos.y, pos.z);
+            rlRotatef(yawDeg, 0.0f, 1.0f, 0.0f);   // Turn toward the camera's yaw
+            rlRotatef(-elevDeg, 1.0f, 0.0f, 0.0f); // Then face it dead on
+            rlRotatef(card->pressTilt.y * cardPressTiltDeg, 1.0f, 0.0f, 0.0f);
+            rlRotatef(card->pressTilt.x * cardPressTiltDeg, 0.0f, 1.0f, 0.0f);
+
+            // With depth testing off the model's mesh order is the paint
+            // order; the exporter adds layers back-to-front, so this holds
+            DrawModel(model, (Vector3){0}, scale, Fade(WHITE, card->alpha));
+
+            // Foil shine: the same model again through the shine shader
+            float phase = (float)i * 0.19f;
+            SetShaderValue(shineShader, shineTimeLoc, &shineTime, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(shineShader, shinePhaseLoc, &phase, SHADER_UNIFORM_FLOAT);
+            Shader saved[MAX_CARD_MODELS * 2] = {0};
+            for (int m = 0; m < model.materialCount && m < (int)(sizeof(saved) / sizeof(saved[0])); m++)
+            {
+                saved[m] = model.materials[m].shader;
+                model.materials[m].shader = shineShader;
+            }
+            BeginBlendMode(BLEND_ADDITIVE);
+            DrawModel(model, (Vector3){0}, scale, WHITE);
+            EndBlendMode();
+            for (int m = 0; m < model.materialCount && m < (int)(sizeof(saved) / sizeof(saved[0])); m++)
+            {
+                model.materials[m].shader = saved[m];
+            }
+
+            rlPopMatrix();
+        }
+        rlEnableBackfaceCulling();
+        rlEnableDepthTest();
+    }
 
     EndMode3D();
 
     //
-    // card rectangles -- blank cards fanned along the bottom edge
+    // card rectangles -- fallback when no glb models are loaded; with models
+    // the hand is drawn in the 3D pass and only the value overlays here
     //
 
-    for (int i = 0; i < entityCount; i++)
+    for (int i = 0; i < entityCount && cardModelCount > 0; i++)
+    {
+        const Entity *card = &entities[i];
+        if ((card->kind != ENTITY_CARD) || (card->alpha < 0.01f)) continue;
+        if (card->selected && (card->cardMode == CARD_HEX_FORM)) continue;
+
+        const char *valueText = TextFormat("%d", card->value);
+        int vx = (int)card->position.x - MeasureText(valueText, 24) / 2;
+        int vy = (int)(card->position.y + CARD_HEIGHT * cardScale * 0.18f);
+        DrawText(valueText, vx + 2, vy + 2, 24, Fade(BLACK, card->alpha));
+        DrawText(valueText, vx, vy, 24, Fade(card->tint, card->alpha));
+    }
+
+    for (int i = 0; i < entityCount && cardModelCount == 0; i++)
     {
         const Entity *card = &entities[i];
         if ((card->kind != ENTITY_CARD) || (card->alpha < 0.01f)) continue;
@@ -984,7 +1568,7 @@ static void UpdateDrawFrame(void)
 
     TurnLever();
 
-    if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, DARKGRAY);
+    if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, LIGHTGRAY);
 
     if ((frameCounter / 20) % 2) DrawText("hex merge time!", screenWidth / 2 - MeasureText("hex merge time!", 30) / 2, 28, 30, MAROON);
 
@@ -994,7 +1578,7 @@ static void UpdateDrawFrame(void)
 
     // Render to screen (main framebuffer)
     BeginDrawing();
-    ClearBackground(RAYWHITE);
+    ClearBackground(BLACK);
 
     // Screen shake: eased offset + slight roll, kicked by a card placement
     float shakeAmp = 0.0f;
@@ -1039,16 +1623,36 @@ static void UpdateDrawFrame(void)
     // Impact burst tweakers; the button replays the effect at the board center
     igSliderFloat("impact size", &impactLightSize, 0.5f, 4.0f, "%.2f", 0);
     igSliderFloat("impact height", &impactLightHeight, 0.0f, 2.0f, "%.2f", 0);
+    igSliderFloat("impact anim speed", &impactAnimSpeed, 0.1f, 3.0f, "%.2f", 0);
 
     // Size tweakers for the visual elements
     igSliderFloat("player size", &playerSpriteSize, 0.5f, 3.0f, "%.2f", 0);
     igSliderFloat("card size", &cardScale, 0.5f, 1.5f, "%.2f", 0);
     igSliderFloat("reticle size", &reticleScale, 0.4f, 1.6f, "%.2f", 0);
     igSliderFloat("lever scale", &leverScale, 1.0f, 4.0f, "%.2f", 0);
+    igSliderFloat("aurora", &auroraIntensity, 0.0f, 2.0f, "%.2f", 0);
+
+    // Gem tile optics
+    igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
+    igSliderFloat("gem strength", &gemStrength, 0.0f, 1.0f, "%.2f", 0);
+    igSliderFloat("gem dispersion", &gemChromatic, 0.0f, 0.15f, "%.3f", 0);
+    igSliderFloat("tile art size", &tileArtScale, 0.3f, 1.4f, "%.2f", 0);
+
+    if (igButton("reset camera", (ImVec2_c){0, 0}))
+    {
+        camera.position = (Vector3){0.0f, 14.0f, 12.0f};
+        camera.target = (Vector3){0.0f, 0.0f, 0.0f};
+        camera.fovy = 16.0f;
+    }
+
+    // Card model tweakers
+    igText("card models: %d", cardModelCount);
+    igSliderFloat("card model scale", &cardModelScale, 0.3f, 2.0f, "%.2f", 0);
+    igSliderFloat("hex model scale", &hexModelScale, 0.5f, 1.5f, "%.2f", 0);
+    igSliderFloat("press tilt", &cardPressTiltDeg, 0.0f, 45.0f, "%.0f", 0);
     if (igButton("test impact", (ImVec2_c){0, 0}))
     {
         impact = (ImpactFx){.position = HexAxialToWorld(0, 0), .tint = (Color){255, 203, 0, 255}, .age = 0.0f, .active = true};
-        shakeTimeLeft = SHAKE_DURATION;
     }
 
     for (int i = 0; i < entityCount; i++)
@@ -1099,6 +1703,68 @@ int main(void)
 
     playerTexture = LoadTexture("resources/player_mage_8x64x32.png");
     SetTextureFilter(playerTexture, TEXTURE_FILTER_POINT); // Keep the pixel art crisp when scaled
+
+    tileArtTexture = LoadTexture("resources/tile_clouds_256.png");
+    SetTextureFilter(tileArtTexture, TEXTURE_FILTER_BILINEAR); // Smooth vector art, not pixel art
+
+    // Card models: every *_card.glb in resources/models with its *_hex.glb twin
+    FilePathList modelFiles = LoadDirectoryFiles("resources/models");
+    for (unsigned int i = 0; (i < modelFiles.count) && (cardModelCount < MAX_CARD_MODELS); i++)
+    {
+        const char *path = modelFiles.paths[i];
+        int suffix = TextFindIndex(path, "_card.glb");
+        if (suffix < 0) continue;
+
+        char hexPath[512] = {0};
+        TextCopy(hexPath, path);
+        TextCopy(hexPath + suffix, "_hex.glb");
+        if (!FileExists(hexPath))
+        {
+            LOG("WARNING: MODEL: %s has no matching _hex.glb\n", path);
+            continue;
+        }
+
+        cardModels[cardModelCount] = LoadModel(path);
+        hexModels[cardModelCount] = LoadModel(hexPath);
+        cardModelCount++;
+        LOG("INFO: MODEL: loaded card/hex pair %s\n", path);
+    }
+    UnloadDirectoryFiles(modelFiles);
+
+    // Foil shine shader, from the FS string in the globals
+    shineShader = LoadShaderFromMemory(NULL, shineFS);
+    shineTimeLoc = GetShaderLocation(shineShader, "time");
+    shinePhaseLoc = GetShaderLocation(shineShader, "phase");
+
+    // Aurora background shader + the 1x1 white canvas it draws on
+    auroraShader = LoadShaderFromMemory(NULL, auroraFS);
+    auroraTimeLoc = GetShaderLocation(auroraShader, "time");
+    auroraIntensityLoc = GetShaderLocation(auroraShader, "intensity");
+    Image whiteImage = GenImageColor(1, 1, WHITE);
+    whiteTexture = LoadTextureFromImage(whiteImage);
+    UnloadImage(whiteImage);
+
+    // Gem materials: two shader instances of the same source, one with the
+    // color inversion baked on; both refract the aurora scene texture
+    gemShader = LoadShaderFromMemory(gemVS, gemFS);
+    inverseGemShader = LoadShaderFromMemory(gemVS, gemFS);
+    gemLocs = GetGemShaderLocs(gemShader);
+    inverseGemLocs = GetGemShaderLocs(inverseGemShader);
+    int invertOff = 0;
+    int invertOn = 1;
+    SetShaderValue(gemShader, GetShaderLocation(gemShader, "invertColors"), &invertOff, SHADER_UNIFORM_INT);
+    SetShaderValue(inverseGemShader, GetShaderLocation(inverseGemShader, "invertColors"), &invertOn, SHADER_UNIFORM_INT);
+
+    sceneTexture = LoadRenderTexture(screenWidth, screenHeight);
+
+    gemMaterial = LoadMaterialDefault();
+    gemMaterial.shader = gemShader;
+    gemMaterial.maps[MATERIAL_MAP_ALBEDO].texture = sceneTexture.texture;
+    inverseGemMaterial = LoadMaterialDefault();
+    inverseGemMaterial.shader = inverseGemShader;
+    inverseGemMaterial.maps[MATERIAL_MAP_ALBEDO].texture = sceneTexture.texture;
+
+    hexPrismMesh = GenMeshCylinder(1.0f, 1.0f, 6); // Unit hex prism, scaled per tile
 
     leverTrackTexture = LoadTexture("resources/lever_track_128x16.png");
     leverFillTexture = LoadTexture("resources/lever_fill_120x8.png");
@@ -1152,9 +1818,22 @@ int main(void)
     UnloadTexture(reticleTexture);
     UnloadTexture(impactLightTexture);
     UnloadTexture(playerTexture);
+    UnloadTexture(tileArtTexture);
     UnloadTexture(leverTrackTexture);
     UnloadTexture(leverFillTexture);
     UnloadTexture(leverKnobTexture);
+    for (int i = 0; i < cardModelCount; i++)
+    {
+        UnloadModel(cardModels[i]);
+        UnloadModel(hexModels[i]);
+    }
+    UnloadShader(shineShader);
+    UnloadShader(auroraShader);
+    UnloadShader(gemShader);
+    UnloadShader(inverseGemShader);
+    UnloadMesh(hexPrismMesh);
+    UnloadRenderTexture(sceneTexture);
+    UnloadTexture(whiteTexture);
     UnloadRenderTexture(target);
     free(entities);
 
