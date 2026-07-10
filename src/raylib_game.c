@@ -84,11 +84,18 @@ typedef enum EntityKind
     ENTITY_HEALTH_BAR, // Row of heart icons in the screen-space UI layer
     ENTITY_CARD,
     ENTITY_PLAYER,
+    ENTITY_ENEMY,
     NUM_ENTITY_KINDS
 } EntityKind;
 
-// Mode Of Card
+typedef enum
+{
+    CARD_NONE = 0,
+    CARD_FIREBALL,
+    NUM_CARD_KINDS
+} CardKind;
 
+// Mode Of Card
 typedef enum CardMode
 {
     NOT_A_CARD = 0,
@@ -132,6 +139,13 @@ typedef struct Entity
     // Mode of Card
     CardMode cardMode;
 
+    // Kind of Card: tags the logic of the card
+    CardKind cardKind;
+
+    // Entitiy Texture
+
+    // Entitiy Model
+
 } Entity;
 
 // Hover reticle: a pixel-art frame that chases the hovered tile on a spring.
@@ -145,6 +159,14 @@ typedef struct HoverReticle
     float bobPhase;   // Radians, integrated for the float bob
     bool active;      // False while nothing is hovered; the next hover re-snaps in place
 } HoverReticle;
+
+// Turn lever: slide-to-commit widget on the right edge; a full pull ends the turn
+typedef struct TurnLeverState
+{
+    float pull;     // 0..1 knob position along the track (0 = resting at the top)
+    float velocity; // Pull units per second, integrated for the spring back
+    bool dragging;  // True while the knob is grabbed
+} TurnLeverState;
 
 // One-shot impact effect at the tile where a card just landed
 typedef struct ImpactFx
@@ -170,6 +192,13 @@ static Texture2D impactLightTexture = {0}; // Light-burst sheet, 8 frames in a r
                                            // (resources/impact_light_8x256.png)
 static Texture2D playerTexture = {0};      // Player idle sheet, 8 frames of 64x32 in a row
                                            // (resources/player_mage_8x64x32.png)
+static Texture2D leverTrackTexture = {0};  // Turn lever track (resources/lever_track_128x16.png)
+static Texture2D leverFillTexture = {0};   // Turn lever pull fill (resources/lever_fill_120x8.png)
+static Texture2D leverKnobTexture = {0};   // Turn lever grab point (resources/lever_knob_16x18.png)
+
+static TurnLeverState turnLever = {0};
+static bool leverWantsMouse = false; // True when the lever owns the mouse; board ignores it
+                                     // (set during the lever step, so it lags one frame like ImGui)
 
 static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
 
@@ -180,14 +209,22 @@ static float shakeTimeLeft = 0.0f; // Screen shake seconds remaining (kicked by 
 static float impactLightSize = 1.7f;   // Half-size of the burst quad, in hex sizes
 static float impactLightHeight = 0.3f; // Quad height above the tile base
 
-static Entity *entities = NULL;   // Entity pool, one calloc at startup, packed array
-static int entityCount = 0;       // Live entities in the pool
-static int mouseHexQ = 0;         // Axial column under the mouse this frame
-static int mouseHexR = 0;         // Axial row under the mouse this frame
-static float mouseBoardX = 0.0f;  // Board-plane point under the mouse this frame
+// Size tweakers, exposed in the hex debug ImGui window
+static float playerSpriteSize = 1.4f; // Player billboard height in world units
+static float cardScale = 1.0f;        // Card rectangle scale (fan spacing follows)
+static float reticleScale = 0.85f;    // Reticle half-size at rest, frames one tile
+static float leverScale = 2.0f;       // Turn lever art scale (track is 128px long at 1x)
+
+static Entity *entities = NULL;  // Entity pool, one calloc at startup, packed array
+static int entityCount = 0;      // Live entities in the pool
+static int mouseHexQ = 0;        // Axial column under the mouse this frame
+static int mouseHexR = 0;        // Axial row under the mouse this frame
+static float mouseBoardX = 0.0f; // Board-plane point under the mouse this frame
 static float mouseBoardZ = 0.0f;
 static bool mouseOnPlane = false; // False when the mouse ray misses the board plane
 static bool uiWantsMouse = false; // True when ImGui is using the mouse; board ignores clicks
+
+static int gameTurn = 0;
 
 // 2.5D camera: tilted orthographic view down at the board plane (y = 0);
 // no perspective foreshortening, so tiles read as a flat iso board
@@ -198,8 +235,6 @@ static Camera3D camera = {
     .fovy = 16.0f, // Orthographic: world-space height of the view, sized to fit the board
     .projection = CAMERA_ORTHOGRAPHIC,
 };
-
-// TODO: Define global variables here, recommended to make them static
 
 //----------------------------------------------------------------------------------
 // Module Functions Definition
@@ -274,6 +309,87 @@ static void HexWorldToAxial(float x, float z, int *q, int *r)
     *r = (int)rz;
 }
 
+// Turn lever step: a slide-and-drag knob on a vertical track at the right
+// edge. Pulling it all the way down commits the turn -- screen shake, turn
+// counter increments -- and the knob springs back to the top. The turn change
+// logic lives here. Update + draw in one step (screen space, itch pixel art)
+static void TurnLever(void)
+{
+    const float cx = 664.0f;                    // Track center x, screen px
+    const float top = 212.0f;                   // Track top y
+    float trackLen = 128.0f * leverScale;       // Track art is 128px long at 1x (debug tweakable)
+    float trackWidth = 16.0f * leverScale;      // Track art is 16px wide
+    float knobHalfW = 12.0f * leverScale;       // Grab point: 16x18 coin art at 1.5x the track scale
+    float knobHalfH = 13.5f * leverScale;
+    float travelTop = top + 10.0f * leverScale; // Knob travel range, inset from the track ends
+    float travelLen = trackLen - 20.0f * leverScale;
+    const float triggerPull = 0.95f;            // Pull fraction that commits the turn
+
+    float dt = GetFrameTime();
+    if (dt > 0.05f) dt = 0.05f;
+
+    Vector2 mouse = GetMousePosition();
+    float knobY = travelTop + turnLever.pull * travelLen;
+
+    // Bounds of the lever: the knob owns the mouse while hovered or held
+    Rectangle knobRect = {cx - knobHalfW, knobY - knobHalfH, knobHalfW * 2.0f, knobHalfH * 2.0f};
+    bool overKnob = CheckCollisionPointRec(mouse, knobRect);
+    leverWantsMouse = (overKnob || turnLever.dragging);
+
+    // Standard slide and drag: grab on press, knob sticks to the cursor
+    if (overKnob && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) turnLever.dragging = true;
+    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) turnLever.dragging = false;
+
+    if (turnLever.dragging)
+    {
+        float pullTarget = (mouse.y - travelTop) / travelLen;
+        if (pullTarget < 0.0f) pullTarget = 0.0f;
+        if (pullTarget > 1.0f) pullTarget = 1.0f;
+        turnLever.pull = pullTarget;
+        turnLever.velocity = 0.0f; // Spring starts from rest when the knob is released
+
+        // Pulled all the way: the turn changes here
+        if (turnLever.pull >= triggerPull)
+        {
+            gameTurn++;
+            shakeTimeLeft = SHAKE_DURATION;
+            turnLever.dragging = false; // Kick the knob loose; it springs back up
+            LOG("INFO: TURN: lever pulled, turn is now %d\n", gameTurn);
+        }
+    }
+    else if (turnLever.pull > 0.0f)
+    {
+        // Under-damped spring back to the top (critical ~36): clunks home
+        const float stiffness = 320.0f;
+        const float damping = 16.0f;
+        turnLever.velocity += (-turnLever.pull * stiffness - turnLever.velocity * damping) * dt;
+        turnLever.pull += turnLever.velocity * dt;
+        if (turnLever.pull < 0.0f)
+        {
+            turnLever.pull = 0.0f;
+            turnLever.velocity = 0.0f;
+        }
+    }
+
+    knobY = travelTop + turnLever.pull * travelLen;
+
+    // Draw: track and fill are horizontal art rotated 90 degrees to stand
+    // vertical (origin at the left-center makes them hang down from `top`)
+    DrawTexturePro(leverTrackTexture, (Rectangle){0, 0, 128, 16},
+                   (Rectangle){cx, top, trackLen, trackWidth}, (Vector2){0, trackWidth / 2.0f}, 90.0f, WHITE);
+    if (turnLever.pull > 0.02f)
+    {
+        DrawTexturePro(leverFillTexture, (Rectangle){0, 0, 120.0f * turnLever.pull, 8},
+                       (Rectangle){cx, top + 4.0f * leverScale, (trackLen - 8.0f * leverScale) * turnLever.pull, trackWidth / 2.0f},
+                       (Vector2){0, trackWidth / 4.0f}, 90.0f, WHITE);
+    }
+    DrawTexturePro(leverKnobTexture, (Rectangle){0, 0, 16, 18},
+                   (Rectangle){cx, knobY, knobHalfW * 2.0f, knobHalfH * 2.0f}, (Vector2){knobHalfW, knobHalfH}, 0.0f, WHITE);
+
+    const char *turnText = TextFormat("turn %d", gameTurn);
+    DrawText(turnText, (int)cx - MeasureText(turnText, 20) / 2, (int)(top + trackLen) + 12, 20, DARKGRAY);
+}
+
 // Spawn one ENTITY_HEX_CELL per cell of the hexagonal board
 static void SpawnHexGrid(void)
 {
@@ -303,8 +419,8 @@ static void UpdateHoverReticle(const Entity *hoveredCell)
 {
     const float stiffness = 90.0f;     // Spring pull toward the tile center (1/s^2)
     const float damping = 6.0f;        // Well below critical (2*sqrtf(90) ~= 19): magnetic overshoot
-    const float scaleRest = 0.85f;     // Half-size at rest, frames one tile
-    const float scaleMax = 1.6f;       // Half-size cap while moving fast
+    float scaleRest = reticleScale;         // Half-size at rest, frames one tile (debug tweakable)
+    float scaleMax = reticleScale + 0.75f;  // Half-size cap while moving fast
     const float scalePerSpeed = 0.12f; // Extra half-size per world-unit/s of spring speed
     const float shrinkRate = 16.0f;    // Fast: snaps down onto the tile
     const float growRate = 5.0f;       // Slow: swells out smoothly when it starts moving
@@ -540,7 +656,7 @@ static void UpdateDrawFrame(void)
         Entity *cell = &entities[i];
         if (cell->kind != ENTITY_HEX_CELL) continue;
 
-        cell->hovered = ((cell->q == mouseHexQ) && (cell->r == mouseHexR) && !uiWantsMouse);
+        cell->hovered = ((cell->q == mouseHexQ) && (cell->r == mouseHexR) && !uiWantsMouse && !leverWantsMouse);
         if (cell->hovered) hoveredCell = cell;
 
         bool cellIsPlayers = ((player != NULL) && (player->q == cell->q) && (player->r == cell->r));
@@ -555,8 +671,7 @@ static void UpdateDrawFrame(void)
     // player grab -- a press on the player's tile picks him up
     //
 
-    if ((player != NULL) && (hoveredCell != NULL) && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
-        && (player->q == hoveredCell->q) && (player->r == hoveredCell->r))
+    if ((player != NULL) && (hoveredCell != NULL) && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && (player->q == hoveredCell->q) && (player->r == hoveredCell->r))
     {
         player->selected = true;
     }
@@ -572,7 +687,8 @@ static void UpdateDrawFrame(void)
             Entity *card = &entities[i];
             if (card->kind != ENTITY_CARD) continue;
 
-            Rectangle rect = {card->position.x - CARD_WIDTH / 2.0f, card->position.y - CARD_HEIGHT / 2.0f, CARD_WIDTH, CARD_HEIGHT};
+            Rectangle rect = {card->position.x - CARD_WIDTH * cardScale / 2.0f, card->position.y - CARD_HEIGHT * cardScale / 2.0f,
+                          CARD_WIDTH * cardScale, CARD_HEIGHT * cardScale};
             if (CheckCollisionPointRec(mouse, rect))
             {
                 card->selected = true;
@@ -642,11 +758,12 @@ static void UpdateDrawFrame(void)
         float fanIndex = (float)slot - (float)(handCount - 1) / 2.0f;
         slot++;
         Vector2 springTarget = {
-            (float)screenWidth / 2.0f + fanIndex * CARD_FAN_STEP,
+            (float)screenWidth / 2.0f + fanIndex * CARD_FAN_STEP * cardScale,
             (float)screenHeight - CARD_FAN_BOTTOM + fabsf(fanIndex) * CARD_FAN_ARC,
         };
 
-        Rectangle rect = {card->position.x - CARD_WIDTH / 2.0f, card->position.y - CARD_HEIGHT / 2.0f, CARD_WIDTH, CARD_HEIGHT};
+        Rectangle rect = {card->position.x - CARD_WIDTH * cardScale / 2.0f, card->position.y - CARD_HEIGHT * cardScale / 2.0f,
+                          CARD_WIDTH * cardScale, CARD_HEIGHT * cardScale};
         card->hovered = (!uiWantsMouse && CheckCollisionPointRec(mouse, rect));
         if (card->hovered && !card->selected) springTarget.y -= 14.0f; // Hovered card lifts out of the fan
 
@@ -801,7 +918,7 @@ static void UpdateDrawFrame(void)
         int frame = (frameCounter / 8) % PLAYER_FRAMES; // ~7.5 fps idle at 60 fps
         Rectangle src = {(float)(frame * PLAYER_FRAME_W), 0.0f, (float)PLAYER_FRAME_W, (float)PLAYER_FRAME_H};
 
-        float spriteH = 1.4f; // World height of the billboard
+        float spriteH = playerSpriteSize;                                          // World height of the billboard
         float spriteW = spriteH * ((float)PLAYER_FRAME_W / (float)PLAYER_FRAME_H); // Frames are 2:1, square pixels
         float ground = (p->selected && reticle.active) ? reticle.position.y : HEX_TILE_HEIGHT;
         Vector3 pos = {p->position.x, ground + spriteH / 2.0f, p->position.z};
@@ -833,8 +950,8 @@ static void UpdateDrawFrame(void)
         float rotation = (card->position.x - (float)screenWidth / 2.0f) * 0.02f;
         Vector2 center = {card->position.x, card->position.y};
 
-        Rectangle border = {center.x, center.y, CARD_WIDTH + 6.0f, CARD_HEIGHT + 6.0f};
-        Rectangle body = {center.x, center.y, CARD_WIDTH, CARD_HEIGHT};
+        Rectangle border = {center.x, center.y, CARD_WIDTH * cardScale + 6.0f, CARD_HEIGHT * cardScale + 6.0f};
+        Rectangle body = {center.x, center.y, CARD_WIDTH * cardScale, CARD_HEIGHT * cardScale};
         DrawRectanglePro(border, (Vector2){border.width / 2.0f, border.height / 2.0f}, rotation, Fade(card->tint, card->alpha));
         DrawRectanglePro(body, (Vector2){body.width / 2.0f, body.height / 2.0f}, rotation, Fade(card->hovered ? WHITE : RAYWHITE, card->alpha));
 
@@ -860,6 +977,12 @@ static void UpdateDrawFrame(void)
             DrawTextureEx(heartTexture, pos, 0.0f, scale, tint);
         }
     }
+
+    //
+    // turn lever -- slide-to-commit widget, owns the turn change
+    //
+
+    TurnLever();
 
     if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, DARKGRAY);
 
@@ -916,6 +1039,12 @@ static void UpdateDrawFrame(void)
     // Impact burst tweakers; the button replays the effect at the board center
     igSliderFloat("impact size", &impactLightSize, 0.5f, 4.0f, "%.2f", 0);
     igSliderFloat("impact height", &impactLightHeight, 0.0f, 2.0f, "%.2f", 0);
+
+    // Size tweakers for the visual elements
+    igSliderFloat("player size", &playerSpriteSize, 0.5f, 3.0f, "%.2f", 0);
+    igSliderFloat("card size", &cardScale, 0.5f, 1.5f, "%.2f", 0);
+    igSliderFloat("reticle size", &reticleScale, 0.4f, 1.6f, "%.2f", 0);
+    igSliderFloat("lever scale", &leverScale, 1.0f, 4.0f, "%.2f", 0);
     if (igButton("test impact", (ImVec2_c){0, 0}))
     {
         impact = (ImpactFx){.position = HexAxialToWorld(0, 0), .tint = (Color){255, 203, 0, 255}, .age = 0.0f, .active = true};
@@ -971,6 +1100,13 @@ int main(void)
     playerTexture = LoadTexture("resources/player_mage_8x64x32.png");
     SetTextureFilter(playerTexture, TEXTURE_FILTER_POINT); // Keep the pixel art crisp when scaled
 
+    leverTrackTexture = LoadTexture("resources/lever_track_128x16.png");
+    leverFillTexture = LoadTexture("resources/lever_fill_120x8.png");
+    leverKnobTexture = LoadTexture("resources/lever_knob_16x18.png");
+    SetTextureFilter(leverTrackTexture, TEXTURE_FILTER_POINT);
+    SetTextureFilter(leverFillTexture, TEXTURE_FILTER_POINT);
+    SetTextureFilter(leverKnobTexture, TEXTURE_FILTER_POINT);
+
     // Entity pool: one allocation for the whole game, entities live in a
     // packed array with swap-back removal
     entities = (Entity *)calloc(MAX_ENTITIES, sizeof(Entity));
@@ -1016,6 +1152,9 @@ int main(void)
     UnloadTexture(reticleTexture);
     UnloadTexture(impactLightTexture);
     UnloadTexture(playerTexture);
+    UnloadTexture(leverTrackTexture);
+    UnloadTexture(leverFillTexture);
+    UnloadTexture(leverKnobTexture);
     UnloadRenderTexture(target);
     free(entities);
 
