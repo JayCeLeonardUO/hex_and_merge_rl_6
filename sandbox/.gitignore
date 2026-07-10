@@ -2,3 +2,4 @@
 export/
 *_shot.png
 card_proto_shot.png
+__pycache__/
