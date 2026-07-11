@@ -23,5 +23,10 @@
     "center_gem_scale": 1.2,
     "lever_gem_milkiness": 0.35,
     "water_wave_amp": 0.35,
-    "water_wave_scale": 1.4
+    "water_wave_scale": 1.4,
+    "enemy_size": 0.55,
+    "enemy_spike_len": 0.35,
+    "enemy_spike_density": 0.45,
+    "enemy_rim": 0.8,
+    "enemy_line_width": 2.0
 }

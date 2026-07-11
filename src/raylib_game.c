@@ -536,6 +536,171 @@ static float waterWaveAmp = 0.35f;   // Wave steepness; 0 = flat mirror
 static float waterWaveScale = 1.4f;  // Ripple frequency
 #define WATER_LEVEL (-0.05f)
 
+// Enemy: the architect demo's icosphere, spiked and breathing entirely in the
+// vertex shader (stable per-vertex hash picks the spikes, lengths pulse on
+// time, the body scales on a breath sine, spin is a yaw uniform). Drawn twice
+// with this VS: a near-black fill whose pastel vertex colors bleed in as a
+// fresnel rim, then a glPolygonMode(GL_LINE) pass where those same vertex
+// colors paint the mesh-defining lines pastel-to-pastel along every edge.
+#if defined(PLATFORM_WEB)
+static const char *enemyVS =
+    "#version 100\n"
+    "attribute vec3 vertexPosition;\n"
+    "attribute vec3 vertexNormal;\n"
+    "attribute vec4 vertexColor;\n"
+    "uniform mat4 mvp;\n"
+    "uniform mat4 matModel;\n"
+    "uniform float time;\n"
+    "uniform float yaw;\n"
+    "uniform float spikeLen;\n"
+    "uniform float spikeDensity;\n"
+    "uniform float pulseSpeed;\n"
+    "uniform float breatheAmp;\n"
+    "uniform float breatheSpeed;\n"
+    "uniform float inflate;\n"
+    "varying vec4 fragColor;\n"
+    "varying vec3 fragNormal;\n"
+    "varying vec3 fragWorldPos;\n"
+    "float hash(vec3 p) { return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719)))*43758.5453); }\n"
+    "void main()\n"
+    "{\n"
+    "    float h = hash(vertexPosition);\n"
+    "    float mask = smoothstep(1.0 - spikeDensity, 1.0, h);\n"
+    "    float wob = 0.7 + 0.3*sin(time*pulseSpeed + h*6.2831);\n"
+    "    float breath = 1.0 + breatheAmp*sin(time*breatheSpeed);\n"
+    "    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob + inflate))*breath;\n"
+    "    float c = cos(yaw); float s = sin(yaw);\n"
+    "    mat3 rot = mat3(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c);\n"
+    "    p = rot*p;\n"
+    "    fragColor = vertexColor;\n"
+    "    fragNormal = rot*vertexNormal;\n"
+    "    fragWorldPos = vec3(matModel*vec4(p, 1.0));\n"
+    "    gl_Position = mvp*vec4(p, 1.0);\n"
+    "}\n";
+static const char *enemyFillFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec4 fragColor;\n"
+    "varying vec3 fragNormal;\n"
+    "varying vec3 fragWorldPos;\n"
+    "uniform vec3 viewPos;\n"
+    "uniform float rim;\n"
+    "void main()\n"
+    "{\n"
+    "    vec3 V = normalize(viewPos - fragWorldPos);\n"
+    "    float fres = pow(1.0 - clamp(dot(V, normalize(fragNormal)), 0.0, 1.0), 2.5);\n"
+    "    vec3 col = mix(vec3(0.05, 0.05, 0.09), fragColor.rgb, fres*rim);\n"
+    "    gl_FragColor = vec4(col, 1.0);\n"
+    "}\n";
+static const char *enemyWireFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec4 fragColor;\n"
+    "varying vec3 fragNormal;\n"
+    "varying vec3 fragWorldPos;\n"
+    "void main() { gl_FragColor = vec4(fragColor.rgb, 1.0); }\n";
+#else
+static const char *enemyVS =
+    "#version 330\n"
+    "in vec3 vertexPosition;\n"
+    "in vec3 vertexNormal;\n"
+    "in vec4 vertexColor;\n"
+    "uniform mat4 mvp;\n"
+    "uniform mat4 matModel;\n"
+    "uniform float time;\n"
+    "uniform float yaw;\n"
+    "uniform float spikeLen;\n"
+    "uniform float spikeDensity;\n"
+    "uniform float pulseSpeed;\n"
+    "uniform float breatheAmp;\n"
+    "uniform float breatheSpeed;\n"
+    "uniform float inflate;\n"
+    "out vec4 fragColor;\n"
+    "out vec3 fragNormal;\n"
+    "out vec3 fragWorldPos;\n"
+    "float hash(vec3 p) { return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719)))*43758.5453); }\n"
+    "void main()\n"
+    "{\n"
+    "    float h = hash(vertexPosition);\n"
+    "    float mask = smoothstep(1.0 - spikeDensity, 1.0, h);\n"
+    "    float wob = 0.7 + 0.3*sin(time*pulseSpeed + h*6.2831);\n"
+    "    float breath = 1.0 + breatheAmp*sin(time*breatheSpeed);\n"
+    "    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob + inflate))*breath;\n"
+    "    float c = cos(yaw); float s = sin(yaw);\n"
+    "    mat3 rot = mat3(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c);\n"
+    "    p = rot*p;\n"
+    "    fragColor = vertexColor;\n"
+    "    fragNormal = rot*vertexNormal;\n"
+    "    fragWorldPos = vec3(matModel*vec4(p, 1.0));\n"
+    "    gl_Position = mvp*vec4(p, 1.0);\n"
+    "}\n";
+static const char *enemyFillFS =
+    "#version 330\n"
+    "in vec4 fragColor;\n"
+    "in vec3 fragNormal;\n"
+    "in vec3 fragWorldPos;\n"
+    "uniform vec3 viewPos;\n"
+    "uniform float rim;\n"
+    "out vec4 finalColor;\n"
+    "void main()\n"
+    "{\n"
+    "    vec3 V = normalize(viewPos - fragWorldPos);\n"
+    "    float fres = pow(1.0 - clamp(dot(V, normalize(fragNormal)), 0.0, 1.0), 2.5);\n"
+    "    vec3 col = mix(vec3(0.05, 0.05, 0.09), fragColor.rgb, fres*rim);\n"
+    "    finalColor = vec4(col, 1.0);\n"
+    "}\n";
+static const char *enemyWireFS =
+    "#version 330\n"
+    "in vec4 fragColor;\n"
+    "in vec3 fragNormal;\n"
+    "in vec3 fragWorldPos;\n"
+    "out vec4 finalColor;\n"
+    "void main() { finalColor = vec4(fragColor.rgb, 1.0); }\n";
+#endif
+
+typedef struct EnemyShaderLocs
+{
+    int time;
+    int yaw;
+    int spikeLen;
+    int spikeDensity;
+    int pulseSpeed;
+    int breatheAmp;
+    int breatheSpeed;
+    int inflate;
+    int viewPos;
+    int rim;
+} EnemyShaderLocs;
+
+static Shader enemyFillShader = {0};
+static Shader enemyWireShader = {0};
+static EnemyShaderLocs enemyFillLocs = {0};
+static EnemyShaderLocs enemyWireLocs = {0};
+static Model enemyModel = {0};
+static bool enemyModelLoaded = false;
+static float enemySize = 0.55f;         // Body radius, world units
+static float enemySpikeLen = 0.35f;     // Spike reach past the body
+static float enemySpikeDensity = 0.45f; // Fraction of vertices that spike
+static float enemyRim = 0.8f;           // Pastel fresnel bleed on the fill
+static float enemyLineWidth = 2.0f;     // Wireframe line width, px
+
+static EnemyShaderLocs GetEnemyShaderLocs(Shader shader)
+{
+    EnemyShaderLocs locs = {
+        .time = GetShaderLocation(shader, "time"),
+        .yaw = GetShaderLocation(shader, "yaw"),
+        .spikeLen = GetShaderLocation(shader, "spikeLen"),
+        .spikeDensity = GetShaderLocation(shader, "spikeDensity"),
+        .pulseSpeed = GetShaderLocation(shader, "pulseSpeed"),
+        .breatheAmp = GetShaderLocation(shader, "breatheAmp"),
+        .breatheSpeed = GetShaderLocation(shader, "breatheSpeed"),
+        .inflate = GetShaderLocation(shader, "inflate"),
+        .viewPos = GetShaderLocation(shader, "viewPos"),
+        .rim = GetShaderLocation(shader, "rim"),
+    };
+    return locs;
+}
+
 // Gem materials: any mesh drawn with gemMaterial or inverseGemMaterial renders
 // as screen-space refractive crystal -- the shader bends the view ray against
 // the mesh normals and samples the scene texture (the aurora sky), with
@@ -816,6 +981,11 @@ static const Tweak tweaks[] = {
     {"aurora_intensity", &auroraIntensity},
     {"water_wave_amp", &waterWaveAmp},
     {"water_wave_scale", &waterWaveScale},
+    {"enemy_size", &enemySize},
+    {"enemy_spike_len", &enemySpikeLen},
+    {"enemy_spike_density", &enemySpikeDensity},
+    {"enemy_rim", &enemyRim},
+    {"enemy_line_width", &enemyLineWidth},
     {"gem_ior", &gemIor},
     {"gem_strength", &gemStrength},
     {"gem_chromatic", &gemChromatic},
@@ -1965,6 +2135,59 @@ static void UpdateDrawFrame(void)
     }
 
     //
+    // enemy -- the architect demo's spiky icosphere hovering over its tile:
+    // VS spikes + breath, dark fill with pastel fresnel rim, then a wireframe
+    // pass whose pastel vertex colors paint the mesh lines (skipped on web,
+    // GLES has no wireframe polygon mode)
+    //
+
+    if (enemyModelLoaded)
+    {
+        const float enemyPulseSpeed = 2.2f;
+        const float enemyBreatheAmp = 0.06f;
+        const float enemyBreatheSpeed = 1.6f;
+        float enemyYaw = airTime * 0.35f;
+        float enemyCamPos[3] = {camera.position.x, camera.position.y, camera.position.z};
+        Vector3 enemyPos = HexAxialToWorld(2, -2);
+        enemyPos.y = HEX_TILE_HEIGHT + enemySize + 0.5f + sinf(airTime * 1.3f) * 0.08f;
+
+        Shader enemyPasses[2] = {enemyFillShader, enemyWireShader};
+        const EnemyShaderLocs *enemyPassLocs[2] = {&enemyFillLocs, &enemyWireLocs};
+        float enemyInflates[2] = {0.0f, 0.012f};
+        int enemyPassCount = 2;
+#if defined(PLATFORM_WEB)
+        enemyPassCount = 1;
+#endif
+        for (int pass = 0; pass < enemyPassCount; pass++)
+        {
+            Shader sh = enemyPasses[pass];
+            const EnemyShaderLocs *el = enemyPassLocs[pass];
+            SetShaderValue(sh, el->time, &airTime, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(sh, el->yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(sh, el->spikeLen, &enemySpikeLen, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(sh, el->spikeDensity, &enemySpikeDensity, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(sh, el->pulseSpeed, &enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(sh, el->breatheAmp, &enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(sh, el->breatheSpeed, &enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(sh, el->inflate, &enemyInflates[pass], SHADER_UNIFORM_FLOAT);
+            SetShaderValue(sh, el->viewPos, enemyCamPos, SHADER_UNIFORM_VEC3);
+            SetShaderValue(sh, el->rim, &enemyRim, SHADER_UNIFORM_FLOAT);
+            enemyModel.materials[0].shader = sh;
+            if (pass == 1)
+            {
+                rlSetLineWidth(enemyLineWidth);
+                rlEnableWireMode();
+            }
+            DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+            if (pass == 1)
+            {
+                rlDisableWireMode();
+                rlSetLineWidth(1.0f);
+            }
+        }
+    }
+
+    //
     // player -- billboarded mage sprite standing on his tile, idle animation
     // from the sheet's top row; stands on the reticle while dragged
     //
@@ -2279,6 +2502,11 @@ static void UpdateDrawFrame(void)
     igSliderFloat("aurora", &auroraIntensity, 0.0f, 2.0f, "%.2f", 0);
     igSliderFloat("water wave amp", &waterWaveAmp, 0.0f, 1.2f, "%.2f", 0);
     igSliderFloat("water wave scale", &waterWaveScale, 0.3f, 4.0f, "%.2f", 0);
+    igSliderFloat("enemy size", &enemySize, 0.2f, 2.0f, "%.2f", 0);
+    igSliderFloat("enemy spikes", &enemySpikeLen, 0.0f, 1.2f, "%.2f", 0);
+    igSliderFloat("enemy spike density", &enemySpikeDensity, 0.05f, 1.0f, "%.2f", 0);
+    igSliderFloat("enemy rim", &enemyRim, 0.0f, 1.5f, "%.2f", 0);
+    igSliderFloat("enemy line width", &enemyLineWidth, 1.0f, 6.0f, "%.1f", 0);
 
     // Gem tile optics
     igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
@@ -2459,6 +2687,18 @@ int main(void)
         centerGemLoaded = true;
     }
 
+    // Enemy: spiky icosphere from the architect demo (pastel vertex colors
+    // baked into the glb), shaded by the enemy VS/FS pair in the globals
+    if (FileExists("resources/models/enemy_ico.glb"))
+    {
+        enemyModel = LoadModel("resources/models/enemy_ico.glb");
+        enemyFillShader = LoadShaderFromMemory(enemyVS, enemyFillFS);
+        enemyWireShader = LoadShaderFromMemory(enemyVS, enemyWireFS);
+        enemyFillLocs = GetEnemyShaderLocs(enemyFillShader);
+        enemyWireLocs = GetEnemyShaderLocs(enemyWireShader);
+        enemyModelLoaded = (enemyModel.meshCount > 0);
+    }
+
     for (int i = 0; i < MAX_AIR_SHARDS; i++) airShards[i] = SpawnAirParticle(false);
     for (int i = 0; i < MAX_AIR_TRIS; i++) airTris[i] = SpawnAirParticle(true);
 
@@ -2535,6 +2775,12 @@ int main(void)
     UnloadShader(shineShader);
     UnloadShader(auroraShader);
     UnloadShader(waterShader);
+    if (enemyModelLoaded)
+    {
+        UnloadModel(enemyModel);
+        UnloadShader(enemyFillShader);
+        UnloadShader(enemyWireShader);
+    }
     UnloadShader(gemShader);
     UnloadShader(inverseGemShader);
     UnloadMesh(hexPrismMesh);

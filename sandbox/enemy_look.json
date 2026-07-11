@@ -1,0 +1,13 @@
+{
+    "size": 0.3363,
+    "spike_len": 0.6513,
+    "spike_density": 0.525,
+    "pulse_speed": 2.2,
+    "breathe_amp": 0.06,
+    "breathe_speed": 1.6,
+    "spin": 18.0,
+    "line_width": 2.0,
+    "rim": 0.8,
+    "subdiv": 3.0,
+    "seed": 7.0
+}
