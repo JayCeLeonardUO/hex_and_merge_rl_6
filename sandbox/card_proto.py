@@ -65,6 +65,36 @@ void main()
 }
 """
 
+# Level-3 polychrome, Balatro style: the whole card face becomes a flowing
+# candy-rainbow film, bent by slow sine swirls, with a gloss diagonal riding
+# it. Same silhouette mask trick as the shine (template alpha + open window)
+POLY_FS = """
+#version 330
+in vec2 fragTexCoord;
+uniform sampler2D texture0;
+uniform float time;
+uniform float phase;
+out vec4 finalColor;
+
+void main()
+{
+    vec4 tex = texture(texture0, fragTexCoord);
+    float mask = step(0.01, tex.a);
+    vec2 uv = fragTexCoord;
+    float inWindow = step(4.0/39.0, uv.x)*step(uv.x, 35.0/39.0)
+                   * step(11.0/66.0, uv.y)*step(uv.y, 62.0/66.0);
+    mask = max(mask, inWindow);
+
+    float w = sin(uv.y*7.0 + time*1.1 + phase*6.2831)*0.10
+            + sin((uv.x + uv.y)*5.0 - time*0.7)*0.07;
+    float hue = fract(uv.x*0.8 + uv.y*0.6 + w + time*0.12 + phase);
+    vec3 rainbow = 0.5 + 0.5*cos(6.2831*(hue + vec3(0.0, 0.33, 0.67)));
+    float gloss = smoothstep(0.30, 0.0, abs(fract(uv.x*0.55 - uv.y*0.45 + time*0.15) - 0.5) - 0.10);
+    vec3 col = rainbow*(0.75 + 0.35*gloss);
+    finalColor = vec4(col, mask*0.55);
+}
+"""
+
 # Background: slow-moving radial gradient + vignette so cards sit in a scene
 BG_FS = """
 #version 330
@@ -507,7 +537,7 @@ def main():
     load_art_source(art_files[file_idx])
 
     # Panel state: raygui works on ffi pointers that persist across frames
-    panel = rl.Rectangle(652, 36, 236, 560)
+    panel = rl.Rectangle(652, 36, 236, 584)
     thr_ptr = ffi.new("float *", seg_threshold)
     fthr_ptr = ffi.new("float *", frame_threshold)
     z0_ptr = ffi.new("float *", ART_Z0)
@@ -537,6 +567,20 @@ def main():
 
     shaders_on = True
     shine = rl.load_shader_from_memory(ffi.NULL, SHINE_FS)  # NULL = default vertex shader
+    poly = rl.load_shader_from_memory(ffi.NULL, POLY_FS)
+    poly_time = rl.get_shader_location(poly, "time")
+    poly_phase = rl.get_shader_location(poly, "phase")
+    card_level = 2  # 1 plain / 2 foil shine / 3 polychrome
+
+    # merge demo: a twin card of the same level parked beside the main one;
+    # drag it onto the main card and they merge 2048-style -- the level goes
+    # up and the finish upgrades (plain > foil > polychrome)
+    MERGE_HOME_X = -1.05
+    merge_x = MERGE_HOME_X
+    merge_grabbed = False
+    merge_visible = True
+    merge_punch = -10.0    # slam clock on the main card when a merge lands
+    card_fx_start = -10.0  # impact burst clock on the main card
     shine_time = rl.get_shader_location(shine, "time")
     shine_phase = rl.get_shader_location(shine, "phase")
     bg_shader = rl.load_shader_from_memory(ffi.NULL, BG_FS)
@@ -634,7 +678,8 @@ def main():
         # faces the camera); hex hover from the board-plane hit
         k_card = CARD_WORLD_H / h  # world units per RT pixel
         qw, qh = card_rt.texture.width * k_card, card_rt.texture.height * k_card
-        wy = CARD_Y + lifts[ci]
+        punch_k = max(0.0, 1.0 - (t - merge_punch) / 0.35)
+        wy = CARD_Y + lifts[ci] + math.sin(punch_k * math.pi) * 0.35
         sp = rl.get_world_to_screen(rl.Vector3(CARD_X, wy, CARD_Z), cam)
         hovered = (abs(mouse.x - sp.x) < qw * ppw / 2) and (abs(mouse.y - sp.y) < qh * ppw / 2) and not ui_mouse
         lifts[ci] += ((0.4 if hovered else 0.0) - lifts[ci]) * 0.2
@@ -642,6 +687,30 @@ def main():
         tilt_target = ((mouse.x - sp.x) / (qw * ppw / 2), (mouse.y - sp.y) / (qh * ppw / 2)) if hovered else (0.0, 0.0)
         tilts[ci][0] += (tilt_target[0] - tilts[ci][0]) * 0.12
         tilts[ci][1] += (tilt_target[1] - tilts[ci][1]) * 0.12
+
+        # the merge twin: grab it, slide it along the card plane, release on
+        # the main card to merge (only equal levels exist here, so it always
+        # counts); at level 3 there is nothing left to merge into
+        merge_visible = merge_visible and card_level < 3
+        msp = rl.get_world_to_screen(rl.Vector3(merge_x, CARD_Y, CARD_Z), cam)
+        merge_hovered = (merge_visible and not ui_mouse
+                         and abs(mouse.x - msp.x) < qw * ppw / 2
+                         and abs(mouse.y - msp.y) < qh * ppw / 2)
+        if merge_hovered and rl.is_mouse_button_pressed(rl.MouseButton.MOUSE_BUTTON_LEFT):
+            merge_grabbed = True
+        if merge_grabbed:
+            mray = rl.get_screen_to_world_ray(mouse, cam)
+            if abs(mray.direction.z) > 1e-4:
+                mtt = (CARD_Z - mray.position.z) / mray.direction.z
+                merge_x = mray.position.x + mray.direction.x * mtt
+        if merge_grabbed and not rl.is_mouse_button_down(rl.MouseButton.MOUSE_BUTTON_LEFT):
+            merge_grabbed = False
+            if abs(merge_x - CARD_X) < 0.55 and card_level < 3:
+                card_level += 1
+                merge_punch = t
+                card_fx_start = t
+                merge_visible = card_level < 3
+            merge_x = MERGE_HOME_X
 
         hex_target = (0.0, 0.0)
         hex_hovered = False
@@ -664,8 +733,8 @@ def main():
         rl.clear_background(rl.Color(0, 0, 0, 0))
         ccx, ccy = card_rt.texture.width / 2, card_rt.texture.height / 2
         draw_card(tex, ccx, ccy, scale, name, value, cost, color, icon_index, tilts[ci])
-        if shaders_on:
-            # Foil shine, baked into the card texture so it tilts along.
+        if shaders_on and card_level == 2:
+            # lvl 2 foil shine, baked into the card texture so it tilts along.
             # Rides the frame's parallax layer so the two stay glued.
             rl.begin_shader_mode(shine)
             set_shader_float(shine, shine_time, t)
@@ -676,6 +745,17 @@ def main():
                                 rl.Rectangle(ccx - w / 2 + fx, ccy - h / 2 + fy, w, h),
                                 rl.Vector2(0, 0), 0.0, rl.WHITE)
             rl.end_blend_mode()
+            rl.end_shader_mode()
+        elif shaders_on and card_level >= 3:
+            # lvl 3 polychrome: the whole face becomes the rainbow film
+            # (normal alpha blend so the art still reads through it)
+            rl.begin_shader_mode(poly)
+            set_shader_float(poly, poly_time, t)
+            set_shader_float(poly, poly_phase, phase)
+            fx, fy = tilts[ci][0] * PAR_FRAME * scale, tilts[ci][1] * PAR_FRAME * scale
+            rl.draw_texture_pro(tex["outline"], rl.Rectangle(0, 0, CARD_W, CARD_H),
+                                rl.Rectangle(ccx - w / 2 + fx, ccy - h / 2 + fy, w, h),
+                                rl.Vector2(0, 0), 0.0, rl.WHITE)
             rl.end_shader_mode()
         rl.end_texture_mode()
 
@@ -737,6 +817,30 @@ def main():
             draw_art_relief_3d([tex["impact_fx"]], fx_src, HEX_X, 0.9, HEX_Z,
                                fx_size, fx_size, -CAM_ELEV_DEG, (0.0, 0.0),
                                0.0, 0.0, 0.0, 0.0)
+
+        # the merge twin: same face texture and relief as the main card,
+        # parked at its home slot or riding the drag
+        if merge_visible:
+            mlift = 0.15 if (merge_hovered or merge_grabbed) else 0.0
+            draw_rt_quad_3d(card_rt, merge_x, CARD_Y + mlift, CARD_Z, qw, qh, -CAM_ELEV_DEG, (0.0, 0.0))
+            draw_art_relief_3d([art["back"], art["raised"]], icon_src, merge_x, CARD_Y + mlift, CARD_Z,
+                               WINDOW[2] * wpt * 0.94, WINDOW[3] * wpt * 0.94, -CAM_ELEV_DEG, (0.0, 0.0),
+                               0.0, -(WINDOW[1] + WINDOW[3] / 2 - CARD_H / 2) * wpt,
+                               ART_Z0, ART_Z_STEP)
+            draw_art_relief_3d([frame_raised_tex], rl.Rectangle(0, 0, CARD_W, CARD_H),
+                               merge_x, CARD_Y + mlift, CARD_Z, CARD_W * wpt, CARD_WORLD_H,
+                               -CAM_ELEV_DEG, (0.0, 0.0), 0.0, 0.0,
+                               ART_Z0 + ART_Z_STEP + 0.03, 0.0)
+
+        # merge impact: the burst plays flat on the main card as it slams
+        cfx_t = (t - card_fx_start) / FX_DUR
+        if 0.0 <= cfx_t < 1.0:
+            cfx_frame = min(int(cfx_t * FX_FRAMES), FX_FRAMES - 1)
+            cfx_src = rl.Rectangle(cfx_frame * 192, 0, 192, 192)
+            cfx_size = CARD_WORLD_H * 1.5
+            draw_art_relief_3d([tex["impact_fx"]], cfx_src, CARD_X, wy, CARD_Z,
+                               cfx_size, cfx_size, -CAM_ELEV_DEG, (0.0, 0.0),
+                               0.0, 0.0, 0.4, 0.0)
         rl.end_mode_3d()
 
         # Text overlay, projected from world space so it floats above the art
@@ -783,8 +887,19 @@ def main():
         rl.gui_label(rl.Rectangle(px, py + 212, 216, 16), "art source:")
         rl.gui_list_view_ex(rl.Rectangle(px, py + 230, 216, 252), name_arr, len(name_bufs), scroll_ptr, file_ptr, focus_ptr)
 
+        rl.gui_label(rl.Rectangle(px, py + 488, 216, 14),
+                     f"card level {card_level}:  " + ["", "plain", "foil", "polychrome"][card_level])
+        if rl.gui_button(rl.Rectangle(px, py + 504, 68, 20), "lvl 1"):
+            card_level = 1
+            merge_visible = True
+        if rl.gui_button(rl.Rectangle(px + 74, py + 504, 68, 20), "lvl 2"):
+            card_level = 2
+            merge_visible = True
+        if rl.gui_button(rl.Rectangle(px + 148, py + 504, 68, 20), "lvl 3"):
+            card_level = 3
+
         # Export the current composition (threshold, heights, art, color) to glb
-        if rl.gui_button(rl.Rectangle(px, py + 490, 216, 26), "export .glb"):
+        if rl.gui_button(rl.Rectangle(px, py + 528, 216, 26), "export .glb"):
             x0, y0 = int(icon_src.x), int(icon_src.y)
             cw_, ch_ = int(icon_src.width), int(icon_src.height)
             raised_full = cut_raised()

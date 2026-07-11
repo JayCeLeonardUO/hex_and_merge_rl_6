@@ -35,8 +35,27 @@ PACK_DIRS = [
     Path("/home/jpleona/Documents/itch/NopiA_2dfxPack_vol.1/footage"),
     Path("/home/jpleona/Documents/itch/NopiA_light_2dfxPack/footage"),
 ]
-FOLDERS = {p.name: p for pack in PACK_DIRS if pack.is_dir()
-           for p in sorted(pack.iterdir()) if p.is_dir()}
+def _collect_folders():
+    """Frame-sequence folders across all packs. Some entries (the explosions)
+    hold color-variant subfolders instead of frames -- those variants get
+    listed under their own names."""
+    out = {}
+    for pack in PACK_DIRS:
+        if not pack.is_dir():
+            continue
+        for p in sorted(pack.iterdir()):
+            if not p.is_dir():
+                continue
+            if any(p.glob("*.png")):
+                out[p.name] = p
+                continue
+            for sub in sorted(p.iterdir()):
+                if sub.is_dir() and any(sub.glob("*.png")):
+                    out[sub.name] = sub
+    return out
+
+
+FOLDERS = _collect_folders()
 FX_DIR = Path(__file__).parent / "assets" / "fx"
 CELL = 192
 SCREEN_W, SCREEN_H = 900, 620

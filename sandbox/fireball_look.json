@@ -1,0 +1,9 @@
+{
+    "flame_size": 0.9,
+    "impact_size": 2.6,
+    "impact_dur": 0.55,
+    "charge_needed": 2.0,
+    "fps": 14.0,
+    "flame": "fire_I",
+    "boom": "explosion_B_R"
+}

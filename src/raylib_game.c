@@ -96,9 +96,32 @@ typedef enum EntityKind
 typedef enum
 {
     CARD_NONE = 0,
-    CARD_FIREBALL,
+    CARD_LEYLINE,  // Conduit: its tile joins the leyline network
+    CARD_FIREBALL, // AOE spell (logic TBD)
+    CARD_HEX,      // Curse spell (logic TBD)
+    CARD_WARD,     // Protection spell (logic TBD)
     NUM_CARD_KINDS
 } CardKind;
+
+// Card levels come from 2048-style merging only: placing a card onto a
+// placed card of the SAME kind and level combines them into the next level
+typedef enum
+{
+    CARD_LVL_1 = 1,
+    CARD_LVL_2,
+    CARD_LVL_3,
+    NUM_CARD_LEVELS
+} CardLevel;
+
+// Hand label + deal tint per kind (index by CardKind)
+static const char *cardKindNames[NUM_CARD_KINDS] = {"", "ley", "fire", "hex", "ward"};
+static const Color cardKindTints[NUM_CARD_KINDS] = {
+    {255, 255, 255, 255}, // CARD_NONE
+    {140, 225, 255, 255}, // leyline: conduit cyan
+    {255, 130, 45, 255},  // fireball: fire orange
+    {185, 100, 235, 255}, // hex: curse violet
+    {255, 215, 120, 255}, // ward: warding gold
+};
 
 // Mode Of Card
 typedef enum CardMode
@@ -135,6 +158,8 @@ typedef struct Entity
     int q; // Axial column, 0 at board center, range [-GRID_RADIUS, GRID_RADIUS]
     int r; // Axial row, 0 at board center, |q + r| <= GRID_RADIUS
 
+    bool isLeyline; // Hex cell: a placed leyline card made this tile conduct
+
     // Gameplay members
     int value;     // Merge value, 0 means empty
     bool hovered;  // True while the mouse ray hits this entity (refreshed every frame)
@@ -162,6 +187,10 @@ typedef struct Entity
 
     // Kind of Card: tags the logic of the card
     CardKind cardKind;
+
+    // Card level, raised only by merging (see CardLevel). Cells remember the
+    // level of the card placed on them so merges can match against it
+    CardLevel cardLevel;
 
     // Enemy Shader params
 
@@ -733,6 +762,15 @@ static float enemyRim = 0.8f;           // Pastel fresnel bleed on the fill
 static float enemyLineWidth = 2.0f;     // Wire line width, screen px
 static float enemyOutline = 0.05f;      // L4D red hull thickness, 0 = off
 
+// Leyline tweakables + the layer the network renders on (see the leyline
+// helpers further down for the color/arc math)
+static RenderTexture2D leylineTexture = {0};
+static float leyHue = 0.52f;   // Film center on the color wheel, 0..1
+static float leyIrid = 0.35f;  // Hue spread along a beam, 0 = flat color
+static float leyInk = 2.0f;    // Pen outline width in screen px, 0 = off
+static float leyArc = 0.22f;   // Beam arc height
+static float leyWidth = 3.0f;  // Beam line width in px
+
 static EnemyShaderLocs GetEnemyShaderLocs(Shader shader)
 {
     EnemyShaderLocs locs = {
@@ -1038,6 +1076,11 @@ static const Tweak tweaks[] = {
     {"enemy_rim", &enemyRim},
     {"enemy_line_width", &enemyLineWidth},
     {"enemy_outline", &enemyOutline},
+    {"ley_hue", &leyHue},
+    {"ley_irid", &leyIrid},
+    {"ley_ink", &leyInk},
+    {"ley_arc", &leyArc},
+    {"ley_width", &leyWidth},
     {"gem_ior", &gemIor},
     {"gem_strength", &gemStrength},
     {"gem_chromatic", &gemChromatic},
@@ -1444,6 +1487,10 @@ static void HexWorldToAxial(float x, float z, int *q, int *r)
     *r = (int)rz;
 }
 
+static void AdvanceTurn(void)
+{
+}
+
 // Turn lever step: a slide-and-drag knob on a vertical track at the right
 // edge. Pulling it all the way down commits the turn -- screen shake, turn
 // counter increments -- and the knob springs back to the top. The turn change
@@ -1745,30 +1792,55 @@ static void SpawnEnemy(int q, int r)
 
 static void SpawnCard(void)
 {
-    // Plain brace initializers: raylib's GOLD/PINK/... macros are compound
-    // literals, which MSVC rejects in a static initializer
-    static const Color palette[4] = {
-        {255, 203, 0, 255},   // GOLD
-        {255, 109, 194, 255}, // PINK
-        {0, 158, 47, 255},    // LIME
-        {135, 60, 190, 255},  // VIOLET
-    };
-    static int dealt = 0;
-
     Entity *card = EntitySpawn(ENTITY_CARD);
     if (card == NULL) return;
 
-    card->value = (dealt % 4) + 1;
-    card->tint = palette[dealt % 4];
+    // Every deal is one of the four kinds at level 1; higher levels exist
+    // only through merging on the board
+    card->cardKind = (CardKind)GetRandomValue(CARD_LEYLINE, CARD_WARD);
+    card->cardLevel = CARD_LVL_1;
+    card->value = (int)card->cardLevel;
+    card->tint = cardKindTints[card->cardKind];
     card->cardMode = CARD_REC_FORM;
     card->modelIndex = (cardModelCount > 0) ? GetRandomValue(0, cardModelCount - 1) : 0;
     // Starts below the screen edge and springs up into its fan slot
     card->position = (Vector3){(float)screenWidth / 2.0f, (float)screenHeight + CARD_HEIGHT, 0.0f};
-    dealt++;
 }
 
 // Update and draw frame: a flat sequence of system steps, each its own pass
 // over the entity list
+// Leylines: conduit cards mark tiles; iridescent arcs connect adjacent
+// conducting tiles and energize when the network reaches the player. The
+// whole network renders alone on leylineTexture, and the composite stamps
+// that layer's silhouette in ink around itself -- a screen-space pen outline
+// on its own layer, then the color art on top.
+// Iridescent film color: hue slides with distance along the beam and drifts
+// with time, with a soft shimmer wave riding on top
+static Color LeylineIridColor(float along, float time)
+{
+    float h = leyHue + leyIrid * (0.55f * along + 0.18f * sinf(time * 1.4f + along * 6.2831f) + 0.08f * time);
+    h -= floorf(h);
+    return ColorFromHSV(h * 360.0f, 0.62f, 1.0f);
+}
+
+static Color LeylineDimColor(void)
+{
+    return ColorFromHSV(leyHue * 360.0f, 0.25f, 0.45f);
+}
+
+// Point at tt along the raised arc between two tile centers
+static Vector3 LeylineBezier(Vector3 a, Vector3 b, float tt)
+{
+    float mx = (a.x + b.x) / 2.0f;
+    float mz = (a.z + b.z) / 2.0f;
+    Vector3 out = {
+        (1 - tt) * (1 - tt) * a.x + 2 * (1 - tt) * tt * mx + tt * tt * b.x,
+        HEX_TILE_HEIGHT + 0.08f + 4.0f * leyArc * tt * (1 - tt),
+        (1 - tt) * (1 - tt) * a.z + 2 * (1 - tt) * tt * mz + tt * tt * b.z,
+    };
+    return out;
+}
+
 // One player mage billboard, perpendicular to the camera. Shared by the
 // world pass and the over-the-crystal redraw
 static void DrawPlayerSprite(const Entity *p)
@@ -1976,18 +2048,38 @@ static void UpdateDrawFrame(void)
             if ((card->kind != ENTITY_CARD) || !card->selected) continue;
 
             card->selected = false;
-            if ((hoveredCell != NULL) && (hoveredCell->value == 0))
+            if (hoveredCell != NULL)
             {
-                // The ghost commits: the tile takes the card's value, color,
-                // and hex model
-                hoveredCell->value = card->value;
-                hoveredCell->tint = card->tint;
-                hoveredCell->modelIndex = card->modelIndex;
-
-                impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
-
-                LOG("INFO: CARD: placed value %d at (q=%d, r=%d)\n", card->value, hoveredCell->q, hoveredCell->r);
-                EntityDespawn(i);
+                // 2048 rule: dropping onto a placed card of the SAME kind
+                // and SAME level merges them into one of the next level
+                bool canMerge = (hoveredCell->value > 0)
+                             && (hoveredCell->cardKind == card->cardKind)
+                             && (hoveredCell->cardLevel == card->cardLevel)
+                             && (hoveredCell->cardLevel < CARD_LVL_3);
+                if (canMerge)
+                {
+                    hoveredCell->cardLevel++;
+                    hoveredCell->value = (int)hoveredCell->cardLevel;
+                    impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
+                    LOG("INFO: CARD: merged %s to lvl %d at (q=%d, r=%d)\n",
+                        cardKindNames[card->cardKind], (int)hoveredCell->cardLevel, hoveredCell->q, hoveredCell->r);
+                    EntityDespawn(i);
+                }
+                else if (hoveredCell->value == 0)
+                {
+                    // The ghost commits: the tile takes the card's kind,
+                    // level, color, and hex model
+                    hoveredCell->cardKind = card->cardKind;
+                    hoveredCell->cardLevel = card->cardLevel;
+                    hoveredCell->value = (int)card->cardLevel;
+                    hoveredCell->tint = card->tint;
+                    hoveredCell->modelIndex = card->modelIndex;
+                    hoveredCell->isLeyline = hoveredCell->isLeyline || (card->cardKind == CARD_LEYLINE);
+                    impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
+                    LOG("INFO: CARD: placed %s lvl %d at (q=%d, r=%d)\n",
+                        cardKindNames[card->cardKind], (int)card->cardLevel, hoveredCell->q, hoveredCell->r);
+                    EntityDespawn(i);
+                }
             }
             break; // Only one card can be grabbed
         }
@@ -2222,6 +2314,46 @@ static void UpdateDrawFrame(void)
             }
         }
     }
+
+    //
+    // card return -- the default turn behavior until kinds grow their own
+    // logic: every placed card lifts off its tile and returns to the hand,
+    // kind and level intact, springing into the fan from the tile it left
+    //
+
+    {
+        static int lastReturnTurn = 0;
+        if (gameTurn != lastReturnTurn)
+        {
+            lastReturnTurn = gameTurn;
+            int cellCount = entityCount; // spawns below append to the pool
+            for (int i = 0; i < cellCount; i++)
+            {
+                Entity *cell = &entities[i];
+                if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0)) continue;
+
+                Entity *back = EntitySpawn(ENTITY_CARD);
+                if (back != NULL)
+                {
+                    back->cardKind = cell->cardKind;
+                    back->cardLevel = cell->cardLevel;
+                    back->value = (int)cell->cardLevel;
+                    back->tint = cardKindTints[cell->cardKind];
+                    back->cardMode = CARD_REC_FORM;
+                    back->modelIndex = cell->modelIndex;
+                    Vector2 lift = GetWorldToScreen(cell->position, camera);
+                    back->position = (Vector3){lift.x, lift.y, 0.0f};
+                    LOG("INFO: CARD: %s lvl %d returned to hand from (q=%d, r=%d)\n",
+                        cardKindNames[cell->cardKind], (int)cell->cardLevel, cell->q, cell->r);
+                }
+
+                cell->value = 0;
+                cell->cardKind = CARD_NONE;
+                cell->cardLevel = 0;
+                cell->isLeyline = false;
+            }
+        }
+    }
     //----------------------------------------------------------------------------------
 
     // Draw
@@ -2387,8 +2519,10 @@ static void UpdateDrawFrame(void)
             rlDisableBackfaceCulling();
             rlPushMatrix();
             rlTranslatef(cell->position.x, height + 0.01f, cell->position.z);
+            // Merged cards read bigger: +18% per level above 1
+            float levelScale = 1.0f + 0.18f * (float)(cell->cardLevel - CARD_LVL_1);
             DrawModel(hexModels[cell->modelIndex % cardModelCount], (Vector3){0},
-                      hexModelScale * HEX_SIZE / HEX_MODEL_R, WHITE);
+                      hexModelScale * HEX_SIZE / HEX_MODEL_R * levelScale, WHITE);
             rlPopMatrix();
             rlEnableBackfaceCulling();
         }
@@ -2406,10 +2540,15 @@ static void UpdateDrawFrame(void)
             const Entity *card = &entities[i];
             if ((card->kind != ENTITY_CARD) || !card->selected || (card->cardMode != CARD_HEX_FORM)) continue;
 
+            bool ghostMerge = (hoveredCell->value > 0)
+                           && (hoveredCell->cardKind == card->cardKind)
+                           && (hoveredCell->cardLevel == card->cardLevel)
+                           && (hoveredCell->cardLevel < CARD_LVL_3);
+            bool ghostValid = (hoveredCell->value == 0) || ghostMerge;
             if (cardModelCount > 0)
             {
                 // Translucent hex-form model, red-tinted over an invalid target
-                Color ghost = (hoveredCell->value == 0) ? Fade(WHITE, 0.55f) : Fade(RED, 0.55f);
+                Color ghost = ghostValid ? Fade(WHITE, 0.55f) : Fade(RED, 0.55f);
                 rlDisableBackfaceCulling();
                 rlPushMatrix();
                 rlTranslatef(reticle.position.x, reticle.position.y, reticle.position.z);
@@ -2421,7 +2560,7 @@ static void UpdateDrawFrame(void)
             else
             {
                 // Fallback: transparent hex fill + outline in the card's color
-                Color ghost = (hoveredCell->value == 0) ? card->tint : RED; // Red = invalid target
+                Color ghost = ghostValid ? card->tint : RED; // Red = invalid target
                 float size = HEX_SIZE * 0.92f;
                 DrawCylinder(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.35f));
                 DrawCylinderWires(reticle.position, size, size, 0.08f, 6, Fade(ghost, 0.85f));
@@ -2476,6 +2615,169 @@ static void UpdateDrawFrame(void)
     EndMode3D();
     EndTextureMode();
 
+    //
+    // leyline layer -- the conduit network alone on a transparent layer:
+    // iridescent arcs between adjacent conducting tiles, spinning runes on
+    // leyline tiles, pulses flowing where the network reaches the player.
+    // The composite below stamps this layer's silhouette as a pen outline
+    //
+
+    {
+        enum { LEY_W = 2 * GRID_RADIUS + 1 };
+        static const int leyDirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+        bool conductive[LEY_W][LEY_W] = {0};
+        bool endpoint[LEY_W][LEY_W] = {0};
+        bool live[LEY_W][LEY_W] = {0};
+
+        // conductivity: leyline cells conduct, tiles wearing a placed card
+        // are spell endpoints, the player's tile is the source
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *cell = &entities[i];
+            if (cell->kind != ENTITY_HEX_CELL) continue;
+            int qi = cell->q + GRID_RADIUS;
+            int ri = cell->r + GRID_RADIUS;
+            if (cell->isLeyline || (cell->value > 0)) conductive[qi][ri] = true;
+            if (cell->value > 0) endpoint[qi][ri] = true;
+        }
+        if (player != NULL) conductive[player->q + GRID_RADIUS][player->r + GRID_RADIUS] = true;
+
+        // flood from the player: everything reachable is energized
+        if (player != NULL)
+        {
+            int stackQ[MAX_ENTITIES];
+            int stackR[MAX_ENTITIES];
+            int top = 0;
+            live[player->q + GRID_RADIUS][player->r + GRID_RADIUS] = true;
+            stackQ[top] = player->q;
+            stackR[top] = player->r;
+            top++;
+            while (top > 0)
+            {
+                top--;
+                int q = stackQ[top];
+                int r = stackR[top];
+                for (int d = 0; d < 6; d++)
+                {
+                    int nq = q + leyDirs[d][0];
+                    int nr = r + leyDirs[d][1];
+                    if (!HexOnBoard(nq, nr)) continue;
+                    if (!conductive[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
+                    if (live[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
+                    live[nq + GRID_RADIUS][nr + GRID_RADIUS] = true;
+                    stackQ[top] = nq;
+                    stackR[top] = nr;
+                    top++;
+                }
+            }
+        }
+
+        BeginTextureMode(leylineTexture);
+        ClearBackground(BLANK);
+        BeginMode3D(camera);
+
+        // runes -- a spinning flat diamond on every leyline tile
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *cell = &entities[i];
+            if ((cell->kind != ENTITY_HEX_CELL) || !cell->isLeyline) continue;
+            bool lit = live[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS];
+            Color rc = lit ? LeylineIridColor((float)cell->q * 0.31f + (float)cell->r * 0.17f, airTime) : LeylineDimColor();
+            float rs = 0.26f + (lit ? 0.04f * sinf(airTime * 2.0f + (float)(cell->q + cell->r)) : 0.0f);
+            rlPushMatrix();
+            rlTranslatef(cell->position.x, HEX_TILE_HEIGHT + 0.02f, cell->position.z);
+            rlRotatef(airTime * (lit ? 30.0f : 6.0f), 0.0f, 1.0f, 0.0f);
+            rlBegin(RL_TRIANGLES);
+            rlColor4ub(rc.r, rc.g, rc.b, 255);
+            for (int k = 0; k < 4; k++)
+            {
+                float a0 = DEG2RAD * 90.0f * (float)k;
+                float a1 = DEG2RAD * 90.0f * (float)(k + 1);
+                rlVertex3f(0.0f, 0.0f, 0.0f);
+                rlVertex3f(cosf(a0) * rs, 0.0f, sinf(a0) * rs);
+                rlVertex3f(cosf(a1) * rs, 0.0f, sinf(a1) * rs);
+            }
+            rlEnd();
+            rlPopMatrix();
+        }
+
+        // beams -- iridescent arcs between adjacent conducting tiles, drawn
+        // as a color pass then an additive glow repeat for live spans
+        for (int pass = 0; pass < 2; pass++)
+        {
+            if (pass == 1) BeginBlendMode(BLEND_ADDITIVE);
+            for (int q = -GRID_RADIUS; q <= GRID_RADIUS; q++)
+            {
+                for (int r = -GRID_RADIUS; r <= GRID_RADIUS; r++)
+                {
+                    if (!HexOnBoard(q, r) || !conductive[q + GRID_RADIUS][r + GRID_RADIUS]) continue;
+                    for (int d = 0; d < 3; d++) // half the dirs = each pair once
+                    {
+                        int nq = q + leyDirs[d][0];
+                        int nr = r + leyDirs[d][1];
+                        if (!HexOnBoard(nq, nr) || !conductive[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
+                        bool lit = live[q + GRID_RADIUS][r + GRID_RADIUS] && live[nq + GRID_RADIUS][nr + GRID_RADIUS];
+                        if ((pass == 1) && !lit) continue;
+
+                        Vector3 a = HexAxialToWorld(q, r);
+                        Vector3 b = HexAxialToWorld(nq, nr);
+                        float seed = (a.x + b.x) * 0.35f + (a.z + b.z) * 0.21f;
+                        unsigned char alpha = (pass == 0) ? 255 : 150;
+                        rlSetLineWidth((pass == 0) ? leyWidth : leyWidth * 2.6f);
+                        rlBegin(RL_LINES);
+                        const int steps = 12;
+                        for (int k = 0; k < steps; k++)
+                        {
+                            Color c0 = lit ? LeylineIridColor((float)k / steps + seed, airTime) : LeylineDimColor();
+                            Color c1 = lit ? LeylineIridColor((float)(k + 1) / steps + seed, airTime) : LeylineDimColor();
+                            Vector3 p0 = LeylineBezier(a, b, (float)k / steps);
+                            Vector3 p1 = LeylineBezier(a, b, (float)(k + 1) / steps);
+                            rlColor4ub(c0.r, c0.g, c0.b, alpha);
+                            rlVertex3f(p0.x, p0.y, p0.z);
+                            rlColor4ub(c1.r, c1.g, c1.b, alpha);
+                            rlVertex3f(p1.x, p1.y, p1.z);
+                        }
+                        rlEnd();
+
+                        // pulses riding live beams, in the additive pass
+                        if ((pass == 1) && lit)
+                        {
+                            for (int k = 0; k < 3; k++)
+                            {
+                                float pt = airTime * 0.9f + (float)k / 3.0f;
+                                pt -= floorf(pt);
+                                Vector3 pp = LeylineBezier(a, b, pt);
+                                Color pc = LeylineIridColor(pt + seed, airTime);
+                                DrawSphere(pp, 0.055f, (Color){pc.r, pc.g, pc.b, 230});
+                                DrawSphere(pp, 0.10f, (Color){pc.r, pc.g, pc.b, 70});
+                            }
+                        }
+                    }
+                }
+            }
+            if (pass == 1) EndBlendMode();
+        }
+        rlSetLineWidth(1.0f);
+
+        // spell endpoints the network reaches get an activation ring
+        BeginBlendMode(BLEND_ADDITIVE);
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *cell = &entities[i];
+            if (cell->kind != ENTITY_HEX_CELL) continue;
+            if (!endpoint[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS]) continue;
+            if (!live[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS]) continue;
+            float ring = cell->radius * (0.62f + 0.06f * sinf(airTime * 3.0f));
+            Color rc = LeylineIridColor((float)cell->q * 0.31f + (float)cell->r * 0.17f, airTime);
+            DrawCylinder((Vector3){cell->position.x, HEX_TILE_HEIGHT + 0.03f, cell->position.z},
+                         ring, ring, 0.02f, 24, (Color){rc.r, rc.g, rc.b, 70});
+        }
+        EndBlendMode();
+
+        EndMode3D();
+        EndTextureMode();
+    }
+
     BeginTextureMode(target);
     ClearBackground(BLACK);
 
@@ -2484,6 +2786,28 @@ static void UpdateDrawFrame(void)
                    (Rectangle){0, 0, (float)screenWidth, -(float)screenHeight},
                    (Rectangle){0, 0, (float)screenWidth, (float)screenHeight},
                    (Vector2){0, 0}, 0.0f, WHITE);
+
+    // Leyline pen-outline composite: the network layer's silhouette stamped
+    // in ink around itself (offset draws tinted black keep only the alpha
+    // shape), then the color layer once on top -- outline and art never
+    // share a layer, so the contour stays one continuous pen line
+    {
+        Rectangle leySrc = {0, 0, (float)screenWidth, -(float)screenHeight};
+        static const int leyOff[8][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {-1, -1}, {-1, 1}, {1, -1}, {1, 1}};
+        if (leyInk > 0.1f)
+        {
+            for (int k = 0; k < 8; k++)
+            {
+                DrawTexturePro(leylineTexture.texture, leySrc,
+                               (Rectangle){(float)leyOff[k][0] * leyInk, (float)leyOff[k][1] * leyInk,
+                                           (float)screenWidth, (float)screenHeight},
+                               (Vector2){0, 0}, 0.0f, (Color){12, 10, 18, 255});
+            }
+        }
+        DrawTexturePro(leylineTexture.texture, leySrc,
+                       (Rectangle){0, 0, (float)screenWidth, (float)screenHeight},
+                       (Vector2){0, 0}, 0.0f, WHITE);
+    }
 
     BeginMode3D(camera);
 
@@ -2648,7 +2972,7 @@ static void UpdateDrawFrame(void)
         if ((card->kind != ENTITY_CARD) || (card->alpha < 0.01f)) continue;
         if (card->selected && (card->cardMode == CARD_HEX_FORM)) continue;
 
-        const char *valueText = TextFormat("%d", card->value);
+        const char *valueText = TextFormat("%s %d", cardKindNames[card->cardKind], (int)card->cardLevel);
         int vx = (int)card->position.x - MeasureText(valueText, 24) / 2;
         int vy = (int)(card->position.y + CARD_HEIGHT * cardScale * 0.18f);
         DrawText(valueText, vx + 2, vy + 2, 24, Fade(BLACK, card->alpha));
@@ -2670,7 +2994,8 @@ static void UpdateDrawFrame(void)
         DrawRectanglePro(border, (Vector2){border.width / 2.0f, border.height / 2.0f}, rotation, Fade(card->tint, card->alpha));
         DrawRectanglePro(body, (Vector2){body.width / 2.0f, body.height / 2.0f}, rotation, Fade(card->hovered ? WHITE : RAYWHITE, card->alpha));
 
-        DrawText(TextFormat("%d", card->value), (int)center.x - 5, (int)center.y - 10, 20, Fade(DARKGRAY, card->alpha));
+        DrawText(TextFormat("%s %d", cardKindNames[card->cardKind], (int)card->cardLevel),
+                 (int)center.x - 5, (int)center.y - 10, 20, Fade(DARKGRAY, card->alpha));
     }
 
     //
@@ -2802,6 +3127,11 @@ static void UpdateDrawFrame(void)
     igSliderFloat("enemy rim", &enemyRim, 0.0f, 1.5f, "%.2f", 0);
     igSliderFloat("enemy line width", &enemyLineWidth, 1.0f, 6.0f, "%.1f", 0);
     igSliderFloat("enemy red outline", &enemyOutline, 0.0f, 0.15f, "%.3f", 0);
+    igSliderFloat("ley hue", &leyHue, 0.0f, 1.0f, "%.2f", 0);
+    igSliderFloat("ley iridescence", &leyIrid, 0.0f, 1.0f, "%.2f", 0);
+    igSliderFloat("ley ink", &leyInk, 0.0f, 5.0f, "%.1f", 0);
+    igSliderFloat("ley arc", &leyArc, 0.0f, 0.8f, "%.2f", 0);
+    igSliderFloat("ley width", &leyWidth, 1.0f, 8.0f, "%.1f", 0);
 
     // Gem tile optics
     igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
@@ -2998,6 +3328,7 @@ int main(void)
     for (int i = 0; i < MAX_AIR_SHARDS; i++) airShards[i] = SpawnAirParticle(false, i);
     for (int i = 0; i < MAX_AIR_TRIS; i++) airTris[i] = SpawnAirParticle(true, MAX_AIR_SHARDS + i);
 
+    leylineTexture = LoadRenderTexture(screenWidth, screenHeight);
     glowTexture = LoadRenderTexture(screenWidth / 2, screenHeight / 2);
     blurTexture = LoadRenderTexture(screenWidth / 2, screenHeight / 2);
     SetTextureFilter(glowTexture.texture, TEXTURE_FILTER_BILINEAR);
@@ -3040,6 +3371,7 @@ int main(void)
     }
 
     SpawnEnemy(2, -2);
+
 
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
@@ -3084,6 +3416,7 @@ int main(void)
     UnloadMesh(hexPrismMesh);
     UnloadRenderTexture(sceneTexture);
     UnloadRenderTexture(worldTexture);
+    UnloadRenderTexture(leylineTexture);
     UnloadRenderTexture(glowTexture);
     UnloadRenderTexture(blurTexture);
     UnloadShader(blurShader);
