@@ -43,9 +43,8 @@
 #define HEX_SIZE 1.0f     // Hex circumradius (center to vertex) in world units
 
 // 2.5D: tiles are hexagonal prisms standing on the y=0 plane
-#define HEX_TILE_HEIGHT 0.2f          // Resting tile thickness
-#define HEX_TILE_HEIGHT_HOVER 0.4f    // Tile thickness while hovered
-#define HEX_TILE_HEIGHT_SELECTED 0.7f // Tile thickness while selected
+#define HEX_TILE_HEIGHT 0.2f       // Resting tile thickness
+#define HEX_TILE_HEIGHT_HOVER 0.4f // Tile thickness while hovered
 
 #define HEX_CELL_OFFBOARD 999 // Axial coord that can never be on the board
 
@@ -139,7 +138,7 @@ typedef struct Entity
     // Gameplay members
     int value;     // Merge value, 0 means empty
     bool hovered;  // True while the mouse ray hits this entity (refreshed every frame)
-    bool selected; // True when toggled by a click
+    bool selected; // True while grabbed (cards and the player)
     int health;    // Current health shown by a health bar
     int maxHealth; // Total hearts a health bar draws
 
@@ -188,6 +187,7 @@ typedef struct TurnLeverState
     float pull;     // 0..1 knob position along the track (0 = resting at the top)
     float velocity; // Pull units per second, integrated for the spring back
     bool dragging;  // True while the knob is grabbed
+    bool fired;     // True once this pull has committed the turn; resets on the next grab
 } TurnLeverState;
 
 // One-shot impact effect at the tile where a card just landed
@@ -214,8 +214,9 @@ static Texture2D impactLightTexture = {0}; // Light-burst sheet, 8 frames in a r
                                            // (resources/impact_light_8x256.png)
 static Texture2D playerTexture = {0};      // Player idle sheet, 8 frames of 64x32 in a row
                                            // (resources/player_mage_8x64x32.png)
-static Texture2D tileArtTexture = {0};     // Cloud art on the tile tops, hex-shaped with alpha
-                                           // (resources/tile_clouds_256.png)
+static Texture2D tileArtTexture = {0};     // Tile-top art atlas: 8 hex-masked cutout variants
+                                           // in a row (resources/tile_clouds_variants_8x256.png)
+#define TILE_ART_VARIANTS 8
 static Texture2D leverTrackTexture = {0};  // Turn lever track (resources/lever_track_128x16.png)
 static Texture2D leverFillTexture = {0};   // Turn lever pull fill (resources/lever_fill_120x8.png)
 static Texture2D leverKnobTexture = {0};   // Turn lever grab point (resources/lever_knob_16x18.png)
@@ -491,7 +492,8 @@ static GemShaderLocs inverseGemLocs = {0};
 static Material gemMaterial = {0};         // Draw any mesh with this = crystal
 static Material inverseGemMaterial = {0};  // ... = crystal transmitting the negative
 static Mesh hexPrismMesh = {0};            // 6-slice cylinder: the tile prism, with normals
-static RenderTexture2D sceneTexture = {0}; // What the gem materials refract (the aurora sky)
+static RenderTexture2D sceneTexture = {0}; // What the tile gems refract (the aurora sky)
+static RenderTexture2D worldTexture = {0}; // The rendered world; what the air shards refract
 
 // Gem optics tweakers, exposed in the hex debug ImGui window
 static float gemIor = 1.45f;
@@ -499,6 +501,89 @@ static float gemStrength = 0.35f;
 static float gemChromatic = 0.05f;
 
 static float tileArtScale = 1.0f; // Tile-top art size, relative to the tile (debug tweakable)
+
+static float mouseSwayAmount = 1.0f; // Camera lean toward the cursor, 0 = off (debug tweakable)
+
+// Air particles, ported from the python refraction demo: crystal shards drawn
+// with the gem material (they refract the aurora sky) and flat ReFantazio-ish
+// triangles that bloom in a post pass. Spawned in the default camera's view,
+// with a fifth of them big foreground pieces floating over the board.
+#define MAX_AIR_SHARDS 40
+#define MAX_AIR_TRIS 28
+#define SHARD_MODEL_COUNT 3
+
+typedef struct AirParticle
+{
+    Vector3 base;  // Rest position in the air
+    Vector3 off;   // Eased mouse-dodge offset
+    Vector3 axis;  // Tumble axis
+    float phase;   // Per-particle time offset
+    float bob;     // Bob amplitude
+    float speed;   // Bob speed
+    float spin;    // Tumble rate, degrees/second
+    float scale;   // World size
+    int variant;   // Which shard model (shards) / palette color (triangles)
+} AirParticle;
+
+static AirParticle airShards[MAX_AIR_SHARDS] = {0};
+static AirParticle airTris[MAX_AIR_TRIS] = {0};
+static Model shardModels[SHARD_MODEL_COUNT] = {0};
+static int shardModelCount = 0;
+
+// Selective bloom for the triangles: they render alone into a half-res glow
+// buffer, get a separable gaussian blur, and composite additively on top
+static RenderTexture2D glowTexture = {0};
+static RenderTexture2D blurTexture = {0};
+static Shader blurShader = {0};
+static int blurDirLoc = -1;
+
+#if defined(PLATFORM_WEB)
+static const char *blurFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec2 fragTexCoord;\n"
+    "varying vec4 fragColor;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec2 dir;\n"
+    "void main()\n"
+    "{\n"
+    "    vec3 c = texture2D(texture0, fragTexCoord).rgb*0.227027;\n"
+    "    c += texture2D(texture0, fragTexCoord + dir*1.0).rgb*0.194594;\n"
+    "    c += texture2D(texture0, fragTexCoord - dir*1.0).rgb*0.194594;\n"
+    "    c += texture2D(texture0, fragTexCoord + dir*2.0).rgb*0.121621;\n"
+    "    c += texture2D(texture0, fragTexCoord - dir*2.0).rgb*0.121621;\n"
+    "    c += texture2D(texture0, fragTexCoord + dir*3.0).rgb*0.054054;\n"
+    "    c += texture2D(texture0, fragTexCoord - dir*3.0).rgb*0.054054;\n"
+    "    c += texture2D(texture0, fragTexCoord + dir*4.0).rgb*0.016216;\n"
+    "    c += texture2D(texture0, fragTexCoord - dir*4.0).rgb*0.016216;\n"
+    "    gl_FragColor = vec4(c, 1.0)*fragColor;\n"
+    "}\n";
+#else
+static const char *blurFS =
+    "#version 330\n"
+    "in vec2 fragTexCoord;\n"
+    "in vec4 fragColor;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec2 dir;\n"
+    "out vec4 finalColor;\n"
+    "void main()\n"
+    "{\n"
+    "    float w[5] = float[](0.227027, 0.194594, 0.121621, 0.054054, 0.016216);\n"
+    "    vec3 c = texture(texture0, fragTexCoord).rgb*w[0];\n"
+    "    for (int i = 1; i < 5; i++)\n"
+    "    {\n"
+    "        c += texture(texture0, fragTexCoord + dir*float(i)).rgb*w[i];\n"
+    "        c += texture(texture0, fragTexCoord - dir*float(i)).rgb*w[i];\n"
+    "    }\n"
+    "    finalColor = vec4(c, 1.0)*fragColor;\n"
+    "}\n";
+#endif
+
+// Air particle tweakers, exposed in the hex debug ImGui window
+static float airShardCount = 24.0f;  // How many shards are active
+static float airTriCount = 18.0f;    // How many glow triangles are active
+static float airParticleScale = 1.0f;
+static float triGlowStrength = 0.8f;
 
 // Impact light-burst tweakers, exposed in the hex debug ImGui window
 static float impactLightSize = 1.7f;   // Half-size of the burst quad, in hex sizes
@@ -515,6 +600,80 @@ static float playerSpriteSize = 1.4f; // Player billboard height in world units
 static float cardScale = 1.0f;        // Card rectangle scale (fan spacing follows)
 static float reticleScale = 0.85f;    // Reticle half-size at rest, frames one tile
 static float leverScale = 2.0f;       // Turn lever art scale (track is 128px long at 1x)
+
+//----------------------------------------------------------------------------------
+// Tweak persistence: every debug-tweakable global lives in this table, loads
+// from resources/tweaks.json at startup, and the ImGui save button writes it
+// back -- to the runtime copy AND to src/resources, so a rebuild's resource
+// copy does not clobber tuned values (and the file stays committable).
+//----------------------------------------------------------------------------------
+#define TWEAKS_FILE "resources/tweaks.json"
+#define TWEAKS_SOURCE_FILE "../../src/resources/tweaks.json"
+
+typedef struct Tweak
+{
+    const char *name;
+    float *value;
+} Tweak;
+
+static const Tweak tweaks[] = {
+    {"impact_size", &impactLightSize},
+    {"impact_height", &impactLightHeight},
+    {"impact_anim_speed", &impactAnimSpeed},
+    {"card_model_scale", &cardModelScale},
+    {"hex_model_scale", &hexModelScale},
+    {"press_tilt_deg", &cardPressTiltDeg},
+    {"player_size", &playerSpriteSize},
+    {"card_scale", &cardScale},
+    {"reticle_scale", &reticleScale},
+    {"lever_scale", &leverScale},
+    {"aurora_intensity", &auroraIntensity},
+    {"gem_ior", &gemIor},
+    {"gem_strength", &gemStrength},
+    {"gem_chromatic", &gemChromatic},
+    {"tile_art_scale", &tileArtScale},
+    {"mouse_sway", &mouseSwayAmount},
+    {"air_shards", &airShardCount},
+    {"air_tris", &airTriCount},
+    {"air_particle_scale", &airParticleScale},
+    {"tri_glow", &triGlowStrength},
+};
+#define TWEAK_COUNT (int)(sizeof(tweaks) / sizeof(tweaks[0]))
+
+// Populate the tweakable globals from the JSON; keys missing from the file
+// keep their compiled defaults
+static void LoadTweaks(void)
+{
+    char *text = LoadFileText(TWEAKS_FILE);
+    if (text == NULL) return;
+
+    for (int i = 0; i < TWEAK_COUNT; i++)
+    {
+        const char *at = strstr(text, TextFormat("\"%s\"", tweaks[i].name));
+        if (at == NULL) continue;
+        const char *colon = strchr(at, ':');
+        if (colon != NULL) *tweaks[i].value = strtof(colon + 1, NULL);
+    }
+    UnloadFileText(text);
+    LOG("INFO: TWEAKS: loaded %s\n", TWEAKS_FILE);
+}
+
+// Write the current tweak values back out (runtime copy + source copy)
+static void SaveTweaks(void)
+{
+    char json[2048] = {0};
+    int length = snprintf(json, sizeof(json), "{\n");
+    for (int i = 0; i < TWEAK_COUNT; i++)
+    {
+        length += snprintf(json + length, sizeof(json) - (size_t)length, "    \"%s\": %.4f%s\n",
+                           tweaks[i].name, *tweaks[i].value, (i < TWEAK_COUNT - 1) ? "," : "");
+    }
+    snprintf(json + length, sizeof(json) - (size_t)length, "}\n");
+
+    SaveFileText(TWEAKS_FILE, json);
+    SaveFileText(TWEAKS_SOURCE_FILE, json); // Keep the versioned copy in sync (no-op on web)
+    LOG("INFO: TWEAKS: saved %s\n", TWEAKS_FILE);
+}
 
 static Entity *entities = NULL;  // Entity pool, one calloc at startup, packed array
 static int entityCount = 0;      // Live entities in the pool
@@ -621,6 +780,108 @@ static void UpdateGemShader(Shader shader, const GemShaderLocs *locs)
     SetShaderValue(shader, locs->chromatic, &gemChromatic, SHADER_UNIFORM_FLOAT);
 }
 
+// ReFantazio-ish triangle palette: royal blues and cyans with white/gold
+static const Color airTriColors[4] = {
+    {70, 130, 255, 255}, {130, 220, 255, 255}, {255, 255, 255, 255}, {255, 215, 130, 255}};
+
+// Spawn one air particle in the default camera's view; a fifth become big
+// foreground pieces hung between the camera and the board
+static AirParticle SpawnAirParticle(bool isTriangle)
+{
+    Vector3 fwd = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    Vector3 right = Vector3Normalize(Vector3CrossProduct(fwd, camera.up));
+    Vector3 up = Vector3CrossProduct(right, fwd);
+    float halfView = camera.fovy / 2.0f;
+
+    AirParticle p = {0};
+    bool foreground = (GetRandomValue(0, 99) < 20);
+    float u = (float)GetRandomValue(-85, 85) / 100.0f;
+    float v = (float)GetRandomValue(-65, 80) / 100.0f;
+    float depth = foreground ? (float)GetRandomValue(5, 9) : (float)GetRandomValue(12, 26);
+
+    p.base = Vector3Add(camera.position, Vector3Scale(fwd, depth));
+    p.base = Vector3Add(p.base, Vector3Scale(right, u * halfView * 0.95f));
+    p.base = Vector3Add(p.base, Vector3Scale(up, v * halfView * 0.9f));
+    if (p.base.y < 0.5f) p.base.y = 0.5f + (float)GetRandomValue(0, 150) / 100.0f;
+
+    p.axis = Vector3Normalize((Vector3){(float)GetRandomValue(-100, 100) / 100.0f,
+                                        (float)GetRandomValue(-100, 100) / 100.0f + 0.01f,
+                                        (float)GetRandomValue(-100, 100) / 100.0f});
+    p.phase = (float)GetRandomValue(0, 628) / 100.0f;
+    p.bob = 0.1f + (float)GetRandomValue(0, 40) / 100.0f;
+    p.speed = 0.3f + (float)GetRandomValue(0, 90) / 100.0f;
+    p.spin = 15.0f + (float)GetRandomValue(0, 65);
+    if (isTriangle)
+    {
+        p.scale = (foreground ? 0.28f : 0.10f) + (float)GetRandomValue(0, 12) / 100.0f;
+        p.variant = GetRandomValue(0, 3);
+    }
+    else
+    {
+        p.scale = (foreground ? 0.45f : 0.10f) + (float)GetRandomValue(0, 20) / 100.0f;
+        p.variant = GetRandomValue(0, SHARD_MODEL_COUNT - 1);
+    }
+    return p;
+}
+
+// Air particle mouse dodge: near the cursor's board point they ease away,
+// then drift back (same feel as the python demo)
+static void UpdateAirParticles(AirParticle *parts, int count, float dt)
+{
+    if (!mouseOnPlane) return;
+    Vector3 mouseWorld = {mouseBoardX, 0.8f, mouseBoardZ};
+    const float radius = 1.6f;
+    for (int i = 0; i < count; i++)
+    {
+        Vector3 d = Vector3Subtract(Vector3Add(parts[i].base, parts[i].off), mouseWorld);
+        float dist = Vector3Length(d);
+        Vector3 target = {0};
+        if ((dist > 0.001f) && (dist < radius))
+        {
+            float push = (radius - dist) / radius * 0.5f;
+            target = Vector3Scale(d, push / dist);
+        }
+        float ease = 1.0f - expf(-6.0f * dt);
+        parts[i].off = Vector3Add(parts[i].off, Vector3Scale(Vector3Subtract(target, parts[i].off), ease));
+    }
+}
+
+// Current world position of one air particle (bob + drift + dodge)
+static Vector3 AirParticlePosition(const AirParticle *p, float t)
+{
+    Vector3 pos = p->base;
+    pos.x += sinf(t * 0.22f + p->phase) * 0.35f + p->off.x;
+    pos.y += sinf(t * p->speed + p->phase) * p->bob + p->off.y;
+    pos.z += cosf(t * 0.18f + p->phase * 1.4f) * 0.3f + p->off.z;
+    return pos;
+}
+
+// The flat glow triangles, drawn wherever the current render pass points
+// (the 3D scene for the sharp pass, the glow buffer for the bloom mask)
+static void DrawAirTriangles(float t)
+{
+    rlDisableBackfaceCulling();
+    for (int i = 0; i < (int)airTriCount && i < MAX_AIR_TRIS; i++)
+    {
+        const AirParticle *p = &airTris[i];
+        Vector3 pos = AirParticlePosition(p, t);
+        float s = p->scale * airParticleScale;
+
+        rlPushMatrix();
+        rlTranslatef(pos.x, pos.y, pos.z);
+        rlRotatef(t * p->spin + p->phase * 57.3f, p->axis.x, p->axis.y, p->axis.z);
+        rlBegin(RL_TRIANGLES);
+        Color c = airTriColors[p->variant % 4];
+        rlColor4ub(c.r, c.g, c.b, c.a);
+        rlVertex3f(0.0f, s, 0.0f);
+        rlVertex3f(-s * 0.87f, -s * 0.5f, 0.0f);
+        rlVertex3f(s * 0.87f, -s * 0.5f, 0.0f);
+        rlEnd();
+        rlPopMatrix();
+    }
+    rlEnableBackfaceCulling();
+}
+
 // CRPG camera controls (Baldur's Gate style): WASD pans along the board
 // plane, right-drag orbits the target, mouse wheel zooms (orthographic
 // camera, so fovy is the zoom)
@@ -678,6 +939,31 @@ static void UpdateGameCamera(void)
         if (camera.fovy < 6.0f) camera.fovy = 6.0f;
         if (camera.fovy > 30.0f) camera.fovy = 30.0f;
     }
+
+    // Mouse sway: the camera leans a touch toward the cursor. Eased, and
+    // applied as an incremental orbit (only the frame's sway delta), so it
+    // rides on top of the controls above without fighting or drifting.
+    static Vector2 sway = {0};
+    Vector2 mouse = GetMousePosition();
+    Vector2 swayTarget = {
+        ((mouse.x / (float)screenWidth) * 2.0f - 1.0f) * 0.035f * mouseSwayAmount,
+        ((mouse.y / (float)screenHeight) * 2.0f - 1.0f) * 0.022f * mouseSwayAmount,
+    };
+    float swayDeltaYaw = (swayTarget.x - sway.x) * 0.05f;
+    float swayDeltaPitch = (swayTarget.y - sway.y) * 0.05f;
+    sway.x += swayDeltaYaw;
+    sway.y += swayDeltaPitch;
+
+    Vector3 swayOffset = Vector3Subtract(camera.position, camera.target);
+    float swayRadius = Vector3Length(swayOffset);
+    float swayYaw = atan2f(swayOffset.x, swayOffset.z) - swayDeltaYaw;
+    float swayPitch = asinf(swayOffset.y / swayRadius) - swayDeltaPitch;
+    if (swayPitch < 0.2f) swayPitch = 0.2f;
+    if (swayPitch > 1.5f) swayPitch = 1.5f;
+    swayOffset.x = swayRadius * cosf(swayPitch) * sinf(swayYaw);
+    swayOffset.y = swayRadius * sinf(swayPitch);
+    swayOffset.z = swayRadius * cosf(swayPitch) * cosf(swayYaw);
+    camera.position = Vector3Add(camera.target, swayOffset);
 }
 
 // Convert a point on the board plane to axial coordinates, rounded to the nearest cell
@@ -738,8 +1024,13 @@ static void TurnLever(void)
     bool overKnob = CheckCollisionPointRec(mouse, knobRect);
     leverWantsMouse = (overKnob || turnLever.dragging);
 
-    // Standard slide and drag: grab on press, knob sticks to the cursor
-    if (overKnob && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) turnLever.dragging = true;
+    // Standard slide and drag: grab on press, knob sticks to the cursor and
+    // stays in hand until the mouse lifts (even after the turn commits)
+    if (overKnob && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    {
+        turnLever.dragging = true;
+        turnLever.fired = false;
+    }
     if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) turnLever.dragging = false;
 
     if (turnLever.dragging)
@@ -750,26 +1041,30 @@ static void TurnLever(void)
         turnLever.pull = pullTarget;
         turnLever.velocity = 0.0f; // Spring starts from rest when the knob is released
 
-        // Pulled all the way: the turn changes here
-        if (turnLever.pull >= triggerPull)
+        // Pulled all the way: the turn changes here, once per grab; the knob
+        // is NOT released -- it springs home when the mouse lifts
+        if (!turnLever.fired && (turnLever.pull >= triggerPull))
         {
             gameTurn++;
             shakeTimeLeft = SHAKE_DURATION;
-            turnLever.dragging = false; // Kick the knob loose; it springs back up
+            turnLever.fired = true;
             LOG("INFO: TURN: lever pulled, turn is now %d\n", gameTurn);
         }
     }
-    else if (turnLever.pull > 0.0f)
+    else if ((turnLever.pull > 0.0f) || (turnLever.velocity != 0.0f))
     {
-        // Under-damped spring back to the top (critical ~36): clunks home
+        // Under-damped spring back to the top; hitting the top rebounds with
+        // some energy left, so the knob visibly bounces before settling
         const float stiffness = 320.0f;
         const float damping = 16.0f;
+        const float restitution = 0.45f;
         turnLever.velocity += (-turnLever.pull * stiffness - turnLever.velocity * damping) * dt;
         turnLever.pull += turnLever.velocity * dt;
         if (turnLever.pull < 0.0f)
         {
             turnLever.pull = 0.0f;
-            turnLever.velocity = 0.0f;
+            turnLever.velocity = -turnLever.velocity * restitution; // The bounce
+            if (fabsf(turnLever.velocity) < 0.08f) turnLever.velocity = 0.0f;
         }
     }
 
@@ -872,8 +1167,7 @@ static void UpdateHoverReticle(const Entity *hoveredCell)
     // Float above whatever height the tile is currently drawn at
     reticle.bobPhase += bobSpeed * dt;
     if (reticle.bobPhase > 2.0f * PI) reticle.bobPhase -= 2.0f * PI;
-    float tileTop = hoveredCell->selected ? HEX_TILE_HEIGHT_SELECTED : HEX_TILE_HEIGHT_HOVER;
-    reticle.position.y = tileTop + floatHeight + sinf(reticle.bobPhase) * bobAmplitude;
+    reticle.position.y = HEX_TILE_HEIGHT_HOVER + floatHeight + sinf(reticle.bobPhase) * bobAmplitude;
 }
 
 // Reticle draw: a textured quad spinning flat on the board plane; in true 3D
@@ -1054,9 +1348,8 @@ static void UpdateDrawFrame(void)
     }
 
     //
-    // hex cell hover + click selection; remember the hovered cell for the
-    // card, player, reticle, and debug steps below. Clicking the player's own
-    // tile grabs him instead of toggling the tile
+    // hex cell hover -- remember the hovered cell for the card, player,
+    // reticle, and debug steps below
     //
 
     Entity *hoveredCell = NULL;
@@ -1067,13 +1360,6 @@ static void UpdateDrawFrame(void)
 
         cell->hovered = ((cell->q == mouseHexQ) && (cell->r == mouseHexR) && !uiWantsMouse && !leverWantsMouse);
         if (cell->hovered) hoveredCell = cell;
-
-        bool cellIsPlayers = ((player != NULL) && (player->q == cell->q) && (player->r == cell->r));
-        if (cell->hovered && !cellIsPlayers && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-        {
-            cell->selected = !cell->selected;
-            LOG("INFO: HEX: clicked cell (q=%d, r=%d) selected=%d\n", cell->q, cell->r, cell->selected);
-        }
     }
 
     //
@@ -1210,6 +1496,13 @@ static void UpdateDrawFrame(void)
     }
 
     //
+    // air particles -- dodge softly away from the cursor's board point
+    //
+
+    UpdateAirParticles(airShards, (int)airShardCount < MAX_AIR_SHARDS ? (int)airShardCount : MAX_AIR_SHARDS, dt);
+    UpdateAirParticles(airTris, (int)airTriCount < MAX_AIR_TRIS ? (int)airTriCount : MAX_AIR_TRIS, dt);
+
+    //
     // effect state -- reticle chases the hovered tile, impact ages out
     //
 
@@ -1290,7 +1583,35 @@ static void UpdateDrawFrame(void)
     UpdateGemShader(gemShader, &gemLocs);
     UpdateGemShader(inverseGemShader, &inverseGemLocs);
 
-    BeginTextureMode(target);
+    //
+    // triangle glow mask -- the triangles alone, half res, on black; whatever
+    // lands here blooms in the composite step (no lights involved)
+    //
+
+    float airTime = (float)GetTime();
+    BeginTextureMode(glowTexture);
+    ClearBackground(BLACK);
+    BeginMode3D(camera);
+    DrawAirTriangles(airTime);
+    EndMode3D();
+    EndTextureMode();
+
+    // Blur, horizontal leg into the scratch buffer
+    float gw = (float)glowTexture.texture.width;
+    float gh = (float)glowTexture.texture.height;
+    float dirH[2] = {1.6f / gw, 0.0f};
+    BeginTextureMode(blurTexture);
+    ClearBackground(BLACK);
+    SetShaderValue(blurShader, blurDirLoc, dirH, SHADER_UNIFORM_VEC2);
+    BeginShaderMode(blurShader);
+    DrawTexturePro(glowTexture.texture, (Rectangle){0, 0, gw, -gh},
+                   (Rectangle){0, 0, gw, gh}, (Vector2){0, 0}, 0.0f, WHITE);
+    EndShaderMode();
+    EndTextureMode();
+
+    // The world pass renders into its own texture so the air shards can
+    // refract the finished board, not just the sky
+    BeginTextureMode(worldTexture);
     ClearBackground(BLACK);
 
     // The sky as the visible background
@@ -1303,7 +1624,7 @@ static void UpdateDrawFrame(void)
     BeginMode3D(camera);
 
     //
-    // board tiles -- raised prisms, fill shows hover/selection
+    // board tiles -- raised prisms, hover reads as a raised tile
     //
 
     for (int i = 0; i < entityCount; i++)
@@ -1313,12 +1634,7 @@ static void UpdateDrawFrame(void)
 
         float drawSize = cell->radius * 0.92f; // Small gap between neighbour cells
 
-        // Hover and selection read as raised tiles
-        float height = HEX_TILE_HEIGHT;
-        if (cell->selected)
-            height = HEX_TILE_HEIGHT_SELECTED;
-        else if (cell->hovered)
-            height = HEX_TILE_HEIGHT_HOVER;
+        float height = cell->hovered ? HEX_TILE_HEIGHT_HOVER : HEX_TILE_HEIGHT;
 
         // Every tile is an inverse gem: the prism mesh drawn with the inverse
         // gem material refracts the aurora sky as its negative. GenMeshCylinder
@@ -1333,6 +1649,12 @@ static void UpdateDrawFrame(void)
         // drawn with the gem material -- the art obscures the effect and the
         // effect leaves the art alone. The art hex is flat-top, the board is
         // pointy-top, hence the 90-degree yaw; art vertex-to-vertex = 2R.
+        // Each tile picks one atlas variant by a stable hash of its axial
+        // coords, so the board reads varied instead of wallpapered
+        int variant = ((cell->q * 5 + cell->r * 9) % TILE_ART_VARIANTS + TILE_ART_VARIANTS) % TILE_ART_VARIANTS;
+        float u0 = (float)variant / TILE_ART_VARIANTS;
+        float u1 = (float)(variant + 1) / TILE_ART_VARIANTS;
+
         float artHalf = drawSize * tileArtScale;
         rlPushMatrix();
         rlTranslatef(cell->position.x, height + 0.005f, cell->position.z);
@@ -1341,22 +1663,20 @@ static void UpdateDrawFrame(void)
         rlBegin(RL_QUADS);
         rlColor4ub(255, 255, 255, 255);
         rlNormal3f(0.0f, 1.0f, 0.0f);
-        rlTexCoord2f(0.0f, 0.0f);
+        rlTexCoord2f(u0, 0.0f);
         rlVertex3f(-artHalf, 0.0f, -artHalf);
-        rlTexCoord2f(0.0f, 1.0f);
+        rlTexCoord2f(u0, 1.0f);
         rlVertex3f(-artHalf, 0.0f, artHalf);
-        rlTexCoord2f(1.0f, 1.0f);
+        rlTexCoord2f(u1, 1.0f);
         rlVertex3f(artHalf, 0.0f, artHalf);
-        rlTexCoord2f(1.0f, 0.0f);
+        rlTexCoord2f(u1, 0.0f);
         rlVertex3f(artHalf, 0.0f, -artHalf);
         rlEnd();
         rlSetTexture(0);
         rlPopMatrix();
 
-        // Hover/selection/placed color reads as a translucent wash over the gem
-        if (cell->selected)
-            DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(GOLD, 0.45f));
-        else if (cell->hovered)
+        // Hover/placed color reads as a translucent wash over the gem
+        if (cell->hovered)
             DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(SKYBLUE, 0.35f));
         else if (cell->value > 0)
             DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(cell->tint, 0.30f));
@@ -1439,6 +1759,42 @@ static void UpdateDrawFrame(void)
 
     DrawHoverReticle(); // Drawn late in 3D so its alpha blends over the tiles
     DrawImpactEffect();
+    EndMode3D();
+    EndTextureMode();
+
+    BeginTextureMode(target);
+    ClearBackground(BLACK);
+
+    // The finished world as this frame's base layer
+    DrawTexturePro(worldTexture.texture,
+                   (Rectangle){0, 0, (float)screenWidth, -(float)screenHeight},
+                   (Rectangle){0, 0, (float)screenWidth, (float)screenHeight},
+                   (Vector2){0, 0}, 0.0f, WHITE);
+
+    BeginMode3D(camera);
+
+    //
+    // air particles -- gem shards refracting the rendered world beneath them,
+    // and the sharp pass of the glow triangles
+    //
+
+    if (shardModelCount > 0)
+    {
+        rlDisableBackfaceCulling();
+        for (int i = 0; i < (int)airShardCount && i < MAX_AIR_SHARDS; i++)
+        {
+            const AirParticle *p = &airShards[i];
+            Vector3 pos = AirParticlePosition(p, airTime);
+            rlPushMatrix();
+            rlTranslatef(pos.x, pos.y, pos.z);
+            rlRotatef(airTime * p->spin + p->phase * 57.3f, p->axis.x, p->axis.y, p->axis.z);
+            DrawModel(shardModels[p->variant % shardModelCount], (Vector3){0},
+                      p->scale * airParticleScale, WHITE);
+            rlPopMatrix();
+        }
+        rlEnableBackfaceCulling();
+    }
+    DrawAirTriangles(airTime);
 
     //
     // hand cards -- glb card models standing at the fan positions (converted
@@ -1505,6 +1861,21 @@ static void UpdateDrawFrame(void)
     }
 
     EndMode3D();
+
+    //
+    // triangle glow composite -- vertical blur leg, additive: the bloom lands
+    // wherever the triangles are on screen
+    //
+
+    float dirV[2] = {0.0f, 1.6f / gh};
+    SetShaderValue(blurShader, blurDirLoc, dirV, SHADER_UNIFORM_VEC2);
+    BeginBlendMode(BLEND_ADDITIVE);
+    BeginShaderMode(blurShader);
+    DrawTexturePro(blurTexture.texture, (Rectangle){0, 0, gw, -gh},
+                   (Rectangle){0, 0, (float)screenWidth, (float)screenHeight},
+                   (Vector2){0, 0}, 0.0f, Fade(WHITE, triGlowStrength > 1.0f ? 1.0f : triGlowStrength));
+    EndShaderMode();
+    EndBlendMode();
 
     //
     // card rectangles -- fallback when no glb models are loaded; with models
@@ -1606,19 +1977,11 @@ static void UpdateDrawFrame(void)
     igText("entities: %d/%d", entityCount, MAX_ENTITIES);
     igText("mouse cell: (q=%d, r=%d)", mouseHexQ, mouseHexR);
 
-    int selectedCount = 0;
-    for (int i = 0; i < entityCount; i++)
-    {
-        if ((entities[i].kind == ENTITY_HEX_CELL) && entities[i].selected) selectedCount++;
-    }
-    igText("selected: %d", selectedCount);
-
-    if (igButton("clear selection", (ImVec2_c){0, 0}))
-    {
-        for (int i = 0; i < entityCount; i++) entities[i].selected = false;
-    }
-
     if (igButton("deal card", (ImVec2_c){0, 0})) SpawnCard();
+
+    if (igButton("save tweaks", (ImVec2_c){0, 0})) SaveTweaks();
+    igSameLine(0.0f, 8.0f);
+    if (igButton("reload tweaks", (ImVec2_c){0, 0})) LoadTweaks();
 
     // Impact burst tweakers; the button replays the effect at the board center
     igSliderFloat("impact size", &impactLightSize, 0.5f, 4.0f, "%.2f", 0);
@@ -1637,6 +2000,13 @@ static void UpdateDrawFrame(void)
     igSliderFloat("gem strength", &gemStrength, 0.0f, 1.0f, "%.2f", 0);
     igSliderFloat("gem dispersion", &gemChromatic, 0.0f, 0.15f, "%.3f", 0);
     igSliderFloat("tile art size", &tileArtScale, 0.3f, 1.4f, "%.2f", 0);
+    igSliderFloat("mouse sway", &mouseSwayAmount, 0.0f, 3.0f, "%.2f", 0);
+
+    // Air particle tweakers
+    igSliderFloat("air shards", &airShardCount, 0.0f, (float)MAX_AIR_SHARDS, "%.0f", 0);
+    igSliderFloat("air triangles", &airTriCount, 0.0f, (float)MAX_AIR_TRIS, "%.0f", 0);
+    igSliderFloat("air particle scale", &airParticleScale, 0.3f, 3.0f, "%.2f", 0);
+    igSliderFloat("tri glow", &triGlowStrength, 0.0f, 1.0f, "%.2f", 0);
 
     if (igButton("reset camera", (ImVec2_c){0, 0}))
     {
@@ -1704,7 +2074,7 @@ int main(void)
     playerTexture = LoadTexture("resources/player_mage_8x64x32.png");
     SetTextureFilter(playerTexture, TEXTURE_FILTER_POINT); // Keep the pixel art crisp when scaled
 
-    tileArtTexture = LoadTexture("resources/tile_clouds_256.png");
+    tileArtTexture = LoadTexture("resources/tile_clouds_variants_8x256.png");
     SetTextureFilter(tileArtTexture, TEXTURE_FILTER_BILINEAR); // Smooth vector art, not pixel art
 
     // Card models: every *_card.glb in resources/models with its *_hex.glb twin
@@ -1756,6 +2126,7 @@ int main(void)
     SetShaderValue(inverseGemShader, GetShaderLocation(inverseGemShader, "invertColors"), &invertOn, SHADER_UNIFORM_INT);
 
     sceneTexture = LoadRenderTexture(screenWidth, screenHeight);
+    worldTexture = LoadRenderTexture(screenWidth, screenHeight);
 
     gemMaterial = LoadMaterialDefault();
     gemMaterial.shader = gemShader;
@@ -1765,6 +2136,34 @@ int main(void)
     inverseGemMaterial.maps[MATERIAL_MAP_ALBEDO].texture = sceneTexture.texture;
 
     hexPrismMesh = GenMeshCylinder(1.0f, 1.0f, 6); // Unit hex prism, scaled per tile
+
+    // Air particles: shard models become gem-material crystals refracting the
+    // sky; triangles get the bloom buffers
+    for (int i = 0; i < SHARD_MODEL_COUNT; i++)
+    {
+        const char *shardPath = TextFormat("resources/models/shard%d.glb", i);
+        if (!FileExists(shardPath)) break;
+        shardModels[shardModelCount] = LoadModel(shardPath);
+        for (int m = 0; m < shardModels[shardModelCount].materialCount; m++)
+        {
+            shardModels[shardModelCount].materials[m].shader = gemShader;
+            shardModels[shardModelCount].materials[m].maps[MATERIAL_MAP_ALBEDO].texture = worldTexture.texture;
+        }
+        shardModelCount++;
+    }
+    LOG("INFO: PARTICLES: %d shard models\n", shardModelCount);
+
+    for (int i = 0; i < MAX_AIR_SHARDS; i++) airShards[i] = SpawnAirParticle(false);
+    for (int i = 0; i < MAX_AIR_TRIS; i++) airTris[i] = SpawnAirParticle(true);
+
+    glowTexture = LoadRenderTexture(screenWidth / 2, screenHeight / 2);
+    blurTexture = LoadRenderTexture(screenWidth / 2, screenHeight / 2);
+    SetTextureFilter(glowTexture.texture, TEXTURE_FILTER_BILINEAR);
+    SetTextureFilter(blurTexture.texture, TEXTURE_FILTER_BILINEAR);
+    blurShader = LoadShaderFromMemory(NULL, blurFS);
+    blurDirLoc = GetShaderLocation(blurShader, "dir");
+
+    LoadTweaks(); // Tweakable globals populate from resources/tweaks.json
 
     leverTrackTexture = LoadTexture("resources/lever_track_128x16.png");
     leverFillTexture = LoadTexture("resources/lever_fill_120x8.png");
@@ -1833,6 +2232,11 @@ int main(void)
     UnloadShader(inverseGemShader);
     UnloadMesh(hexPrismMesh);
     UnloadRenderTexture(sceneTexture);
+    UnloadRenderTexture(worldTexture);
+    UnloadRenderTexture(glowTexture);
+    UnloadRenderTexture(blurTexture);
+    UnloadShader(blurShader);
+    for (int i = 0; i < shardModelCount; i++) UnloadModel(shardModels[i]);
     UnloadTexture(whiteTexture);
     UnloadRenderTexture(target);
     free(entities);

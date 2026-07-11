@@ -209,15 +209,40 @@ TRI_COLORS = [(70, 130, 255, 255), (130, 220, 255, 255),
               (255, 255, 255, 255), (255, 215, 130, 255)]
 
 
-def make_tri_particles(count, rng):
+def frustum_base(rng, cam):
+    """A spawn point inside the camera frustum: pick a screen position and a
+    depth along the view ray. A fifth of them hug the lens -- big foreground
+    shards drifting right past the camera."""
+    pos = np.array([cam.position.x, cam.position.y, cam.position.z])
+    tgt = np.array([cam.target.x, cam.target.y, cam.target.z])
+    fwd = tgt - pos
+    fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, [0.0, 1.0, 0.0])
+    right /= np.linalg.norm(right)
+    up = np.cross(right, fwd)
+
+    if rng.random() < 0.22:
+        depth = rng.uniform(0.9, 2.2)   # really close to the camera
+    else:
+        depth = rng.uniform(2.5, 13.0)  # spread through the scene
+
+    half_h = math.tan(math.radians(cam.fovy / 2.0)) * depth
+    half_w = half_h * (SCREEN_W / SCREEN_H)
+    p = (pos + fwd * depth
+         + right * (rng.uniform(-0.92, 0.92) * half_w)
+         + up * (rng.uniform(-0.85, 0.9) * half_h))
+    p[1] = max(p[1], 0.2)  # stay off the floor
+    return (float(p[0]), float(p[1]), float(p[2]))
+
+
+def make_tri_particles(count, rng, cam):
     """Flat triangles drifting in the air; tumble/drift params like the shards."""
     parts = []
     for _ in range(count):
         axis = rng.normal(size=3)
         axis /= np.linalg.norm(axis)
         parts.append({
-            "base": (float(rng.uniform(-5.0, 5.0)), float(rng.uniform(0.4, 4.6)),
-                     float(rng.uniform(-4.5, 3.0))),
+            "base": frustum_base(rng, cam),
             "phase": float(rng.uniform(0.0, math.tau)),
             "bob": float(rng.uniform(0.15, 0.6)),
             "speed": float(rng.uniform(0.25, 1.0)),
@@ -319,16 +344,15 @@ def make_shard_glb(path, seed):
     return path
 
 
-def make_particles(count, rng):
-    """Floating shard particles: a base position in the air plus drift, bob,
-    and tumble parameters, all integrated from time in the draw loop."""
+def make_particles(count, rng, cam):
+    """Floating shard particles: a base position in the camera frustum plus
+    drift, bob, and tumble parameters, integrated from time in the draw loop."""
     parts = []
     for _ in range(count):
         axis = rng.normal(size=3)
         axis /= np.linalg.norm(axis)
         parts.append({
-            "base": (float(rng.uniform(-4.5, 4.5)), float(rng.uniform(0.5, 4.4)),
-                     float(rng.uniform(-4.0, 2.8))),
+            "base": frustum_base(rng, cam),
             "phase": float(rng.uniform(0.0, math.tau)),
             "bob": float(rng.uniform(0.1, 0.5)),
             "speed": float(rng.uniform(0.3, 1.2)),
@@ -436,13 +460,13 @@ def main():
         shards.append(shard)
 
     MAX_PARTICLES = 120
-    particles = make_particles(MAX_PARTICLES, np.random.default_rng(3))
+    particles = make_particles(MAX_PARTICLES, np.random.default_rng(3), cam)
     count_ptr = ffi.new("float *", 60.0)
     psize_ptr = ffi.new("float *", 1.0)
 
     # Triangle glow: half-res mask + blur scratch buffer, blur shader
     MAX_TRIS = 80
-    tris = make_tri_particles(MAX_TRIS, np.random.default_rng(9))
+    tris = make_tri_particles(MAX_TRIS, np.random.default_rng(9), cam)
     tri_ptr = ffi.new("float *", 40.0)
     glow_ptr = ffi.new("float *", 0.9)
     gw, gh = SCREEN_W // 2, SCREEN_H // 2
