@@ -579,6 +579,11 @@ static const char *blurFS =
     "}\n";
 #endif
 
+// The big crystal hovering at board center, straight from the python demo
+static Model centerGemModel = {0};
+static bool centerGemLoaded = false;
+static float centerGemScale = 1.2f; // Debug tweakable
+
 // Air particle tweakers, exposed in the hex debug ImGui window
 static float airShardCount = 24.0f;  // How many shards are active
 static float airTriCount = 18.0f;    // How many glow triangles are active
@@ -637,6 +642,7 @@ static const Tweak tweaks[] = {
     {"air_tris", &airTriCount},
     {"air_particle_scale", &airParticleScale},
     {"tri_glow", &triGlowStrength},
+    {"center_gem_scale", &centerGemScale},
 };
 #define TWEAK_COUNT (int)(sizeof(tweaks) / sizeof(tweaks[0]))
 
@@ -1774,6 +1780,22 @@ static void UpdateDrawFrame(void)
     BeginMode3D(camera);
 
     //
+    // center crystal -- the demo's big quartz hovering over the middle of the
+    // board, refracting the world behind it; slow turn + gentle bob
+    //
+
+    if (centerGemLoaded)
+    {
+        rlDisableBackfaceCulling();
+        rlPushMatrix();
+        rlTranslatef(0.0f, 2.4f + sinf(airTime * 0.8f) * 0.15f, 0.0f);
+        rlRotatef(airTime * 12.0f, 0.0f, 1.0f, 0.0f);
+        DrawModel(centerGemModel, (Vector3){0}, centerGemScale, WHITE);
+        rlPopMatrix();
+        rlEnableBackfaceCulling();
+    }
+
+    //
     // air particles -- gem shards refracting the rendered world beneath them,
     // and the sharp pass of the glow triangles
     //
@@ -2007,6 +2029,7 @@ static void UpdateDrawFrame(void)
     igSliderFloat("air triangles", &airTriCount, 0.0f, (float)MAX_AIR_TRIS, "%.0f", 0);
     igSliderFloat("air particle scale", &airParticleScale, 0.3f, 3.0f, "%.2f", 0);
     igSliderFloat("tri glow", &triGlowStrength, 0.0f, 1.0f, "%.2f", 0);
+    igSliderFloat("center gem scale", &centerGemScale, 0.0f, 3.0f, "%.2f", 0);
 
     if (igButton("reset camera", (ImVec2_c){0, 0}))
     {
@@ -2153,6 +2176,17 @@ int main(void)
     }
     LOG("INFO: PARTICLES: %d shard models\n", shardModelCount);
 
+    if (FileExists("resources/models/centergem.glb"))
+    {
+        centerGemModel = LoadModel("resources/models/centergem.glb");
+        for (int m = 0; m < centerGemModel.materialCount; m++)
+        {
+            centerGemModel.materials[m].shader = gemShader;
+            centerGemModel.materials[m].maps[MATERIAL_MAP_ALBEDO].texture = worldTexture.texture;
+        }
+        centerGemLoaded = true;
+    }
+
     for (int i = 0; i < MAX_AIR_SHARDS; i++) airShards[i] = SpawnAirParticle(false);
     for (int i = 0; i < MAX_AIR_TRIS; i++) airTris[i] = SpawnAirParticle(true);
 
@@ -2237,6 +2271,7 @@ int main(void)
     UnloadRenderTexture(blurTexture);
     UnloadShader(blurShader);
     for (int i = 0; i < shardModelCount; i++) UnloadModel(shardModels[i]);
+    if (centerGemLoaded) UnloadModel(centerGemModel);
     UnloadTexture(whiteTexture);
     UnloadRenderTexture(target);
     free(entities);

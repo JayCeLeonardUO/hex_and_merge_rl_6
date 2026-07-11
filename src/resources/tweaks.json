@@ -14,5 +14,10 @@
     "gem_strength": 0.3500,
     "gem_chromatic": 0.0500,
     "tile_art_scale": 0.7700,
-    "mouse_sway": 2.8300
+    "mouse_sway": 2.8300,
+    "air_shards": 24.0000,
+    "air_tris": 18.0000,
+    "air_particle_scale": 1.0000,
+    "tri_glow": 0.8000,
+    "center_gem_scale": 1.2000
 }
