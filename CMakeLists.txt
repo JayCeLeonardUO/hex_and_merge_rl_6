@@ -47,6 +47,18 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 set_property(TARGET ${PROJECT_NAME} PROPERTY VS_DEBUGGER_WORKING_DIRECTORY $<TARGET_FILE_DIR:${PROJECT_NAME}>)
 
+# Build id baked into the binary: the short git hash at configure time (CI
+# configures fresh per commit, so the Pages build always carries its commit)
+execute_process(COMMAND git rev-parse --short HEAD
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                OUTPUT_VARIABLE GIT_COMMIT_HASH
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+if(NOT GIT_COMMIT_HASH)
+    set(GIT_COMMIT_HASH "nogit")
+endif()
+target_compile_definitions(${PROJECT_NAME} PRIVATE BUILD_GIT_HASH="${GIT_COMMIT_HASH}")
+
 # Pull card exports from the sandbox into src/resources/models before the
 # resource copy, so a fresh export only needs a recompile
 add_custom_command(

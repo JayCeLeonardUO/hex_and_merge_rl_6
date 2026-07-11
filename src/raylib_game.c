@@ -906,7 +906,7 @@ static float mouseSwayAmount = 1.0f; // Camera lean toward the cursor, 0 = off (
 // triangles that bloom in a post pass. Spawned in the default camera's view,
 // with a fifth of them big foreground pieces floating over the board.
 #define MAX_AIR_SHARDS 40
-#define MAX_AIR_TRIS 28
+#define MAX_AIR_TRIS 90
 #define SHARD_MODEL_COUNT 3
 
 typedef struct AirParticle
@@ -1215,7 +1215,23 @@ static const Color airTriColors[4] = {
 
 // Spawn one air particle in the default camera's view; a fifth become big
 // foreground pieces hung between the camera and the board
-static AirParticle SpawnAirParticle(bool isTriangle)
+// Low-discrepancy sequence (van der Corput in the given base): successive
+// indices land far apart, so particles cover the view evenly instead of
+// clumping the way plain uniform randoms do
+static float Halton(int index, int base)
+{
+    float f = 1.0f;
+    float r = 0.0f;
+    while (index > 0)
+    {
+        f /= (float)base;
+        r += f * (float)(index % base);
+        index /= base;
+    }
+    return r;
+}
+
+static AirParticle SpawnAirParticle(bool isTriangle, int seqIndex)
 {
     Vector3 fwd = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
     Vector3 right = Vector3Normalize(Vector3CrossProduct(fwd, camera.up));
@@ -1224,8 +1240,10 @@ static AirParticle SpawnAirParticle(bool isTriangle)
 
     AirParticle p = {0};
     bool foreground = (GetRandomValue(0, 99) < 20);
-    float u = (float)GetRandomValue(-85, 85) / 100.0f;
-    float v = (float)GetRandomValue(-65, 80) / 100.0f;
+    // Halton bases 2/3 spread the frustum placement evenly; a little random
+    // jitter on top keeps it from reading as a lattice
+    float u = -0.85f + Halton(seqIndex + 1, 2) * 1.70f + (float)GetRandomValue(-6, 6) / 100.0f;
+    float v = -0.65f + Halton(seqIndex + 1, 3) * 1.45f + (float)GetRandomValue(-6, 6) / 100.0f;
     float depth = foreground ? (float)GetRandomValue(5, 9) : (float)GetRandomValue(12, 26);
 
     p.base = Vector3Add(camera.position, Vector3Scale(fwd, depth));
@@ -2750,6 +2768,12 @@ static void UpdateDrawFrame(void)
     rlImGuiBegin();
 
     igBegin("hex debug", NULL, 0);
+#if !defined(BUILD_GIT_HASH)
+#define BUILD_GIT_HASH "dev"
+#endif
+    // Which build is this? Commit at configure time + compile timestamp --
+    // compare against git to tell whether a Pages deploy actually updated
+    igText("build %s  (%s %s)", BUILD_GIT_HASH, __DATE__, __TIME__);
     igText("entities: %d/%d", entityCount, MAX_ENTITIES);
     igText("mouse cell: (q=%d, r=%d)", mouseHexQ, mouseHexR);
 
@@ -2971,8 +2995,8 @@ int main(void)
         enemyModelLoaded = (enemyModel.meshCount > 0);
     }
 
-    for (int i = 0; i < MAX_AIR_SHARDS; i++) airShards[i] = SpawnAirParticle(false);
-    for (int i = 0; i < MAX_AIR_TRIS; i++) airTris[i] = SpawnAirParticle(true);
+    for (int i = 0; i < MAX_AIR_SHARDS; i++) airShards[i] = SpawnAirParticle(false, i);
+    for (int i = 0; i < MAX_AIR_TRIS; i++) airTris[i] = SpawnAirParticle(true, MAX_AIR_SHARDS + i);
 
     glowTexture = LoadRenderTexture(screenWidth / 2, screenHeight / 2);
     blurTexture = LoadRenderTexture(screenWidth / 2, screenHeight / 2);
