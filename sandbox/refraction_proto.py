@@ -202,6 +202,114 @@ void main()
 }
 """
 
+# Water: a plane that mirrors the sky. Wave noise perturbs the normal, the
+# eye ray reflects off it, and the reflected ray is intersected with the same
+# aurora sky plane the demo hangs at z = -10 -- so the water shows a true
+# planar reflection of the exact curtains above it. Fresnel fades the mirror
+# into a deep-water teal when looking straight down; glints ride wave crests.
+WATER_FS = """
+#version 330
+in vec3 fragPosition;
+in vec3 fragNormal;
+uniform vec3 viewPos;
+uniform float time;
+uniform float intensity;   // aurora brightness, kept in sync with the sky
+uniform float waveAmp;
+uniform float waveScale;
+out vec4 finalColor;
+
+float hash(float n) { return fract(sin(n)*43758.5453); }
+
+float noise(vec2 p)
+{
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f*f*(3.0 - 2.0*f);
+    float a = hash(i.x + i.y*57.0);
+    float b = hash(i.x + 1.0 + i.y*57.0);
+    float c = hash(i.x + (i.y + 1.0)*57.0);
+    float d = hash(i.x + 1.0 + (i.y + 1.0)*57.0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// same curtain math as AURORA_FS, so the reflection matches the sky
+vec3 aurora(vec2 uv)
+{
+    vec3 col = vec3(0.0);
+    for (int i = 0; i < 3; i++)
+    {
+        float fi = float(i);
+        float wave = noise(vec2(uv.x*3.0 + fi*7.3 + time*(0.05 + fi*0.03),
+                                time*0.1 + fi*3.1));
+        float base = 0.20 + 0.16*fi + (wave - 0.5)*0.35;
+        float d = uv.y - base;
+        float curtain = exp(-max(d, 0.0)*(7.0 - fi*1.5))
+                      * exp(-max(-d, 0.0)*30.0);
+        float rays = 0.55 + 0.45*noise(vec2(uv.x*26.0 + fi*13.0, time*(0.35 + 0.1*fi)));
+        vec3 tint = mix(vec3(0.10, 0.95, 0.45), vec3(0.45, 0.25, 0.95),
+                        clamp(d*2.2 + fi*0.2, 0.0, 1.0));
+        col += tint*curtain*rays;
+    }
+    return col*intensity;
+}
+
+// what a ray leaving the water sees: night gradient, stars, aurora curtains
+vec3 skyColor(vec3 org, vec3 dir)
+{
+    float up = clamp(dir.y, 0.0, 1.0);
+    vec3 col = mix(vec3(0.10, 0.10, 0.16), vec3(0.03, 0.03, 0.07), up);
+
+    // stars: hash the direction on a coarse dome grid
+    vec2 sp = dir.xz/(dir.y + 0.25);
+    float star = hash(floor(sp.x*60.0) + floor(sp.y*60.0)*91.7);
+    col += vec3(smoothstep(0.995, 1.0, star))*up;
+
+    // the aurora hangs on the plane z = -10, x -18..18, y 1..14
+    if (dir.z < -0.001)
+    {
+        float tt = (-10.0 - org.z)/dir.z;
+        vec3 hit = org + dir*tt;
+        vec2 uv = vec2((hit.x + 18.0)/36.0, (hit.y - 1.0)/13.0);
+        if (tt > 0.0 && uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0)
+            col += aurora(uv);
+    }
+    return col;
+}
+
+float waveHeight(vec2 xz)
+{
+    // two drifting octaves; the reflection wobble does the visual work
+    return noise(xz*waveScale + vec2(time*0.35, time*0.22))
+         + 0.5*noise(xz*waveScale*2.7 - vec2(time*0.28, time*0.4));
+}
+
+void main()
+{
+    vec2 xz = fragPosition.xz;
+    float e = 0.18;
+    float hC = waveHeight(xz);
+    float hX = waveHeight(xz + vec2(e, 0.0));
+    float hZ = waveHeight(xz + vec2(0.0, e));
+    vec3 N = normalize(vec3(-(hX - hC)/e*waveAmp, 1.0, -(hZ - hC)/e*waveAmp));
+
+    vec3 I = normalize(fragPosition - viewPos);
+    vec3 R = reflect(I, N);
+    R.y = abs(R.y);  // waves never reflect below the horizon
+
+    vec3 sky = skyColor(fragPosition, R);
+    vec3 deep = vec3(0.02, 0.07, 0.09);
+
+    float fres = pow(1.0 - max(dot(-I, N), 0.0), 3.0);
+    vec3 col = mix(deep, sky, 0.25 + 0.75*fres);
+
+    // crest glints: bright pinpricks where the wave slope peaks toward the eye
+    float glint = pow(max(dot(R, normalize(vec3(0.3, 0.5, -1.0))), 0.0), 60.0);
+    col += vec3(0.7, 0.9, 1.0)*glint*0.6;
+
+    finalColor = vec4(col, 1.0);
+}
+"""
+
 RL_TRIANGLES = 0x0004
 
 # ReFantazio-ish palette: royal blues and cyans with white/gold sparks
@@ -278,6 +386,22 @@ def draw_aurora_plane(shader, t_loc, i_loc, t, intensity):
     rl.rl_vertex3f(18.0, 14.0, -10.0)
     rl.rl_end()
     rl.end_blend_mode()
+    rl.end_shader_mode()
+
+
+def draw_water_plane(shader):
+    """The water: one big quad at y = 0 drawn through the water shader. The
+    shader does everything -- waves, sky reflection, fresnel, glints."""
+    rl.begin_shader_mode(shader)
+    rl.rl_begin(RL_QUADS)
+    rl.rl_color4ub(255, 255, 255, 255)
+    rl.rl_normal3f(0.0, 1.0, 0.0)
+    rl.rl_vertex3f(-24.0, 0.0, -10.0)
+    rl.rl_vertex3f(-24.0, 0.0, 14.0)
+    rl.rl_vertex3f(24.0, 0.0, 14.0)
+    rl.rl_vertex3f(24.0, 0.0, -10.0)
+    rl.rl_end()
+    rl.rl_draw_render_batch_active()
     rl.end_shader_mode()
 
 
@@ -386,11 +510,8 @@ def set_v4(shader, loc, rgba):
 
 
 def draw_backdrop(t):
-    """Colorful things for the gem to bend: checker floor, pillars, a wanderer."""
-    for x in range(-6, 7):
-        for z in range(-6, 7):
-            c = rl.Color(70, 70, 78, 255) if (x + z) % 2 == 0 else rl.Color(40, 40, 46, 255)
-            rl.draw_plane(rl.Vector3(x, 0.0, z), rl.Vector2(1, 1), c)
+    """Colorful things for the gem to bend: pillars and a wanderer standing
+    in the water (the floor is the water plane, drawn separately)."""
 
     # striped back wall so the gem always has color behind it to bend; short
     # enough that the aurora sky shows above it
@@ -482,6 +603,12 @@ def main():
     aurora_intensity_loc = rl.get_shader_location(aurora_shader, "intensity")
     aurora_ptr = ffi.new("float *", 0.9)
 
+    water_shader = rl.load_shader_from_memory(GEM_VS, WATER_FS)
+    water_locs = {name: rl.get_shader_location(water_shader, name)
+                  for name in ("viewPos", "time", "intensity", "waveAmp", "waveScale")}
+    wave_amp_ptr = ffi.new("float *", 0.35)
+    wave_scale_ptr = ffi.new("float *", 1.4)
+
     # live optics (raygui sliders write these pointers)
     ior_ptr = ffi.new("float *", 1.55)       # quartz
     strength_ptr = ffi.new("float *", 0.5)   # screen-space shift scale
@@ -489,7 +616,7 @@ def main():
     fresnel_ptr = ffi.new("float *", 4.0)
     tint_ptr = ffi.new("float *", 0.10)      # how milky the quartz is
 
-    panel = rl.Rectangle(652, 36, 236, 400)
+    panel = rl.Rectangle(652, 36, 236, 460)
     spin = 0.0
     frame = 0
     show_normals = False
@@ -537,6 +664,12 @@ def main():
         rl.clear_background(rl.Color(12, 12, 18, 255))
         rl.begin_mode_3d(cam)
         draw_aurora_plane(aurora_shader, aurora_time_loc, aurora_intensity_loc, t, aurora_ptr[0])
+        set_v3(water_shader, water_locs["viewPos"], cam.position.x, cam.position.y, cam.position.z)
+        set_f(water_shader, water_locs["time"], t)
+        set_f(water_shader, water_locs["intensity"], aurora_ptr[0])
+        set_f(water_shader, water_locs["waveAmp"], wave_amp_ptr[0])
+        set_f(water_shader, water_locs["waveScale"], wave_scale_ptr[0])
+        draw_water_plane(water_shader)
         draw_backdrop(t)
         draw_tri_particles(tris, int(tri_ptr[0]), t, 1.0)
         rl.end_mode_3d()
@@ -650,6 +783,10 @@ def main():
         rl.gui_slider_bar(rl.Rectangle(px, py + 302, 216, 14), "", "", glow_ptr, 0.0, 1.0)
         rl.gui_label(rl.Rectangle(px, py + 324, 216, 14), f"aurora  {aurora_ptr[0]:.2f}")
         rl.gui_slider_bar(rl.Rectangle(px, py + 338, 216, 14), "", "", aurora_ptr, 0.0, 2.0)
+        rl.gui_label(rl.Rectangle(px, py + 360, 216, 14), f"wave amp  {wave_amp_ptr[0]:.2f}")
+        rl.gui_slider_bar(rl.Rectangle(px, py + 374, 216, 14), "", "", wave_amp_ptr, 0.0, 1.2)
+        rl.gui_label(rl.Rectangle(px, py + 396, 216, 14), f"wave scale  {wave_scale_ptr[0]:.2f}")
+        rl.gui_slider_bar(rl.Rectangle(px, py + 410, 216, 14), "", "", wave_scale_ptr, 0.3, 4.0)
 
         rl.draw_text("wheel: zoom   left/right: spin gem   n: show normals", 16, SCREEN_H - 28, 20, rl.GRAY)
         rl.end_drawing()
