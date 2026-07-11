@@ -363,6 +363,179 @@ static int auroraIntensityLoc = -1;
 static float auroraIntensity = 0.9f; // Sky brightness, debug tweakable
 static Texture2D whiteTexture = {0}; // 1x1 white, the canvas for fullscreen shader quads
 
+// Water: an endless plane under the board that mirrors the sky. Wave noise
+// perturbs the normal, the eye ray reflects off it, and the reflected ray is
+// intersected with a virtual sky plane running the same aurora curtain math
+// (and the same time/intensity), so the water reflects the sky it sits under.
+// Fresnel fades the mirror into deep teal looking straight down; crest glints
+// on top. Uses gemVS for world position/normal.
+#if defined(PLATFORM_WEB)
+static const char *waterFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec3 fragPosition;\n"
+    "varying vec3 fragNormal;\n"
+    "uniform vec3 viewPos;\n"
+    "uniform float time;\n"
+    "uniform float intensity;\n"
+    "uniform float waveAmp;\n"
+    "uniform float waveScale;\n"
+    "float hash(float n) { return fract(sin(n)*43758.5453); }\n"
+    "float noise(vec2 p)\n"
+    "{\n"
+    "    vec2 i = floor(p);\n"
+    "    vec2 f = fract(p);\n"
+    "    f = f*f*(3.0 - 2.0*f);\n"
+    "    float a = hash(i.x + i.y*57.0);\n"
+    "    float b = hash(i.x + 1.0 + i.y*57.0);\n"
+    "    float c = hash(i.x + (i.y + 1.0)*57.0);\n"
+    "    float d = hash(i.x + 1.0 + (i.y + 1.0)*57.0);\n"
+    "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);\n"
+    "}\n"
+    "vec3 aurora(vec2 uv)\n"
+    "{\n"
+    "    vec3 col = vec3(0.0);\n"
+    "    for (int i = 0; i < 3; i++)\n"
+    "    {\n"
+    "        float fi = float(i);\n"
+    "        float wave = noise(vec2(uv.x*3.0 + fi*7.3 + time*(0.05 + fi*0.03), time*0.1 + fi*3.1));\n"
+    "        float base = 0.35 + 0.18*fi + (wave - 0.5)*0.35;\n"
+    "        float d = uv.y - base;\n"
+    "        float curtain = exp(-max(d, 0.0)*(7.0 - fi*1.5))*exp(-max(-d, 0.0)*30.0);\n"
+    "        float rays = 0.55 + 0.45*noise(vec2(uv.x*26.0 + fi*13.0, time*(0.35 + 0.1*fi)));\n"
+    "        vec3 tint = mix(vec3(0.10, 0.95, 0.45), vec3(0.45, 0.25, 0.95), clamp(d*2.2 + fi*0.2, 0.0, 1.0));\n"
+    "        col += tint*curtain*rays;\n"
+    "    }\n"
+    "    return col*intensity;\n"
+    "}\n"
+    "vec3 skyColor(vec3 org, vec3 dir)\n"
+    "{\n"
+    "    float up = clamp(dir.y, 0.0, 1.0);\n"
+    "    vec3 col = mix(vec3(0.06, 0.06, 0.10), vec3(0.01, 0.01, 0.03), up);\n"
+    "    vec2 sp = dir.xz/(dir.y + 0.25);\n"
+    "    float star = hash(floor(sp.x*60.0) + floor(sp.y*60.0)*91.7);\n"
+    "    col += vec3(smoothstep(0.995, 1.0, star))*up;\n"
+    "    if (dir.z < -0.001)\n"
+    "    {\n"
+    "        float tt = (-30.0 - org.z)/dir.z;\n"
+    "        vec3 hit = org + dir*tt;\n"
+    "        vec2 uv = vec2((hit.x + 40.0)/80.0, hit.y/26.0);\n"
+    "        if (tt > 0.0 && uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0) col += aurora(uv);\n"
+    "    }\n"
+    "    return col;\n"
+    "}\n"
+    "float waveHeight(vec2 xz)\n"
+    "{\n"
+    "    return noise(xz*waveScale + vec2(time*0.35, time*0.22)) + 0.5*noise(xz*waveScale*2.7 - vec2(time*0.28, time*0.4));\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "    vec2 xz = fragPosition.xz;\n"
+    "    float e = 0.18;\n"
+    "    float hC = waveHeight(xz);\n"
+    "    float hX = waveHeight(xz + vec2(e, 0.0));\n"
+    "    float hZ = waveHeight(xz + vec2(0.0, e));\n"
+    "    vec3 N = normalize(vec3(-(hX - hC)/e*waveAmp, 1.0, -(hZ - hC)/e*waveAmp));\n"
+    "    vec3 I = normalize(fragPosition - viewPos);\n"
+    "    vec3 R = reflect(I, N);\n"
+    "    R.y = abs(R.y);\n"
+    "    vec3 sky = skyColor(fragPosition, R);\n"
+    "    vec3 deep = vec3(0.02, 0.07, 0.09);\n"
+    "    float fres = pow(1.0 - max(dot(-I, N), 0.0), 3.0);\n"
+    "    vec3 col = mix(deep, sky, 0.25 + 0.75*fres);\n"
+    "    float glint = pow(max(dot(R, normalize(vec3(0.3, 0.5, -1.0))), 0.0), 60.0);\n"
+    "    col += vec3(0.7, 0.9, 1.0)*glint*0.6;\n"
+    "    gl_FragColor = vec4(col, 1.0);\n"
+    "}\n";
+#else
+static const char *waterFS =
+    "#version 330\n"
+    "in vec3 fragPosition;\n"
+    "in vec3 fragNormal;\n"
+    "uniform vec3 viewPos;\n"
+    "uniform float time;\n"
+    "uniform float intensity;\n"
+    "uniform float waveAmp;\n"
+    "uniform float waveScale;\n"
+    "out vec4 finalColor;\n"
+    "float hash(float n) { return fract(sin(n)*43758.5453); }\n"
+    "float noise(vec2 p)\n"
+    "{\n"
+    "    vec2 i = floor(p);\n"
+    "    vec2 f = fract(p);\n"
+    "    f = f*f*(3.0 - 2.0*f);\n"
+    "    float a = hash(i.x + i.y*57.0);\n"
+    "    float b = hash(i.x + 1.0 + i.y*57.0);\n"
+    "    float c = hash(i.x + (i.y + 1.0)*57.0);\n"
+    "    float d = hash(i.x + 1.0 + (i.y + 1.0)*57.0);\n"
+    "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);\n"
+    "}\n"
+    "vec3 aurora(vec2 uv)\n"
+    "{\n"
+    "    vec3 col = vec3(0.0);\n"
+    "    for (int i = 0; i < 3; i++)\n"
+    "    {\n"
+    "        float fi = float(i);\n"
+    "        float wave = noise(vec2(uv.x*3.0 + fi*7.3 + time*(0.05 + fi*0.03), time*0.1 + fi*3.1));\n"
+    "        float base = 0.35 + 0.18*fi + (wave - 0.5)*0.35;\n"
+    "        float d = uv.y - base;\n"
+    "        float curtain = exp(-max(d, 0.0)*(7.0 - fi*1.5))*exp(-max(-d, 0.0)*30.0);\n"
+    "        float rays = 0.55 + 0.45*noise(vec2(uv.x*26.0 + fi*13.0, time*(0.35 + 0.1*fi)));\n"
+    "        vec3 tint = mix(vec3(0.10, 0.95, 0.45), vec3(0.45, 0.25, 0.95), clamp(d*2.2 + fi*0.2, 0.0, 1.0));\n"
+    "        col += tint*curtain*rays;\n"
+    "    }\n"
+    "    return col*intensity;\n"
+    "}\n"
+    "vec3 skyColor(vec3 org, vec3 dir)\n"
+    "{\n"
+    "    float up = clamp(dir.y, 0.0, 1.0);\n"
+    "    vec3 col = mix(vec3(0.06, 0.06, 0.10), vec3(0.01, 0.01, 0.03), up);\n"
+    "    vec2 sp = dir.xz/(dir.y + 0.25);\n"
+    "    float star = hash(floor(sp.x*60.0) + floor(sp.y*60.0)*91.7);\n"
+    "    col += vec3(smoothstep(0.995, 1.0, star))*up;\n"
+    "    if (dir.z < -0.001)\n"
+    "    {\n"
+    "        float tt = (-30.0 - org.z)/dir.z;\n"
+    "        vec3 hit = org + dir*tt;\n"
+    "        vec2 uv = vec2((hit.x + 40.0)/80.0, hit.y/26.0);\n"
+    "        if (tt > 0.0 && uv.x > 0.0 && uv.x < 1.0 && uv.y > 0.0 && uv.y < 1.0) col += aurora(uv);\n"
+    "    }\n"
+    "    return col;\n"
+    "}\n"
+    "float waveHeight(vec2 xz)\n"
+    "{\n"
+    "    return noise(xz*waveScale + vec2(time*0.35, time*0.22)) + 0.5*noise(xz*waveScale*2.7 - vec2(time*0.28, time*0.4));\n"
+    "}\n"
+    "void main()\n"
+    "{\n"
+    "    vec2 xz = fragPosition.xz;\n"
+    "    float e = 0.18;\n"
+    "    float hC = waveHeight(xz);\n"
+    "    float hX = waveHeight(xz + vec2(e, 0.0));\n"
+    "    float hZ = waveHeight(xz + vec2(0.0, e));\n"
+    "    vec3 N = normalize(vec3(-(hX - hC)/e*waveAmp, 1.0, -(hZ - hC)/e*waveAmp));\n"
+    "    vec3 I = normalize(fragPosition - viewPos);\n"
+    "    vec3 R = reflect(I, N);\n"
+    "    R.y = abs(R.y);\n"
+    "    vec3 sky = skyColor(fragPosition, R);\n"
+    "    vec3 deep = vec3(0.02, 0.07, 0.09);\n"
+    "    float fres = pow(1.0 - max(dot(-I, N), 0.0), 3.0);\n"
+    "    vec3 col = mix(deep, sky, 0.25 + 0.75*fres);\n"
+    "    float glint = pow(max(dot(R, normalize(vec3(0.3, 0.5, -1.0))), 0.0), 60.0);\n"
+    "    col += vec3(0.7, 0.9, 1.0)*glint*0.6;\n"
+    "    finalColor = vec4(col, 1.0);\n"
+    "}\n";
+#endif
+static Shader waterShader = {0};
+static int waterViewPosLoc = -1;
+static int waterTimeLoc = -1;
+static int waterIntensityLoc = -1;
+static int waterWaveAmpLoc = -1;
+static int waterWaveScaleLoc = -1;
+static float waterWaveAmp = 0.35f;   // Wave steepness; 0 = flat mirror
+static float waterWaveScale = 1.4f;  // Ripple frequency
+#define WATER_LEVEL (-0.05f)
+
 // Gem materials: any mesh drawn with gemMaterial or inverseGemMaterial renders
 // as screen-space refractive crystal -- the shader bends the view ray against
 // the mesh normals and samples the scene texture (the aurora sky), with
@@ -641,6 +814,8 @@ static const Tweak tweaks[] = {
     {"reticle_scale", &reticleScale},
     {"lever_scale", &leverScale},
     {"aurora_intensity", &auroraIntensity},
+    {"water_wave_amp", &waterWaveAmp},
+    {"water_wave_scale", &waterWaveScale},
     {"gem_ior", &gemIor},
     {"gem_strength", &gemStrength},
     {"gem_chromatic", &gemChromatic},
@@ -1657,6 +1832,31 @@ static void UpdateDrawFrame(void)
     BeginMode3D(camera);
 
     //
+    // water -- an endless plane under the board mirroring the aurora sky;
+    // wave noise bends the reflection, fresnel fades it into deep teal
+    //
+
+    {
+        float waterCamPos[3] = {camera.position.x, camera.position.y, camera.position.z};
+        SetShaderValue(waterShader, waterViewPosLoc, waterCamPos, SHADER_UNIFORM_VEC3);
+        SetShaderValue(waterShader, waterTimeLoc, &auroraTime, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(waterShader, waterIntensityLoc, &auroraIntensity, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(waterShader, waterWaveAmpLoc, &waterWaveAmp, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(waterShader, waterWaveScaleLoc, &waterWaveScale, SHADER_UNIFORM_FLOAT);
+        BeginShaderMode(waterShader);
+        rlBegin(RL_QUADS);
+        rlColor4ub(255, 255, 255, 255);
+        rlNormal3f(0.0f, 1.0f, 0.0f);
+        rlVertex3f(-60.0f, WATER_LEVEL, -60.0f);
+        rlVertex3f(-60.0f, WATER_LEVEL, 60.0f);
+        rlVertex3f(60.0f, WATER_LEVEL, 60.0f);
+        rlVertex3f(60.0f, WATER_LEVEL, -60.0f);
+        rlEnd();
+        rlDrawRenderBatchActive();
+        EndShaderMode();
+    }
+
+    //
     // board tiles -- raised prisms, hover reads as a raised tile
     //
 
@@ -2077,6 +2277,8 @@ static void UpdateDrawFrame(void)
     igSliderFloat("reticle size", &reticleScale, 0.4f, 1.6f, "%.2f", 0);
     igSliderFloat("lever scale", &leverScale, 1.0f, 4.0f, "%.2f", 0);
     igSliderFloat("aurora", &auroraIntensity, 0.0f, 2.0f, "%.2f", 0);
+    igSliderFloat("water wave amp", &waterWaveAmp, 0.0f, 1.2f, "%.2f", 0);
+    igSliderFloat("water wave scale", &waterWaveScale, 0.3f, 4.0f, "%.2f", 0);
 
     // Gem tile optics
     igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
@@ -2196,6 +2398,13 @@ int main(void)
     auroraShader = LoadShaderFromMemory(NULL, auroraFS);
     auroraTimeLoc = GetShaderLocation(auroraShader, "time");
     auroraIntensityLoc = GetShaderLocation(auroraShader, "intensity");
+
+    waterShader = LoadShaderFromMemory(gemVS, waterFS);
+    waterViewPosLoc = GetShaderLocation(waterShader, "viewPos");
+    waterTimeLoc = GetShaderLocation(waterShader, "time");
+    waterIntensityLoc = GetShaderLocation(waterShader, "intensity");
+    waterWaveAmpLoc = GetShaderLocation(waterShader, "waveAmp");
+    waterWaveScaleLoc = GetShaderLocation(waterShader, "waveScale");
     Image whiteImage = GenImageColor(1, 1, WHITE);
     whiteTexture = LoadTextureFromImage(whiteImage);
     UnloadImage(whiteImage);
@@ -2325,6 +2534,7 @@ int main(void)
     }
     UnloadShader(shineShader);
     UnloadShader(auroraShader);
+    UnloadShader(waterShader);
     UnloadShader(gemShader);
     UnloadShader(inverseGemShader);
     UnloadMesh(hexPrismMesh);

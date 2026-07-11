@@ -21,5 +21,7 @@
     "air_particle_scale": 1.0,
     "tri_glow": 0.8,
     "center_gem_scale": 1.2,
-    "lever_gem_milkiness": 0.35
+    "lever_gem_milkiness": 0.35,
+    "water_wave_amp": 0.35,
+    "water_wave_scale": 1.4
 }
