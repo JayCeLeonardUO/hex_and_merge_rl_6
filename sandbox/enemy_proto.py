@@ -125,7 +125,7 @@ varying vec4 fragColor;
 varying vec3 fragNormal;
 varying vec3 fragWorldPos;
 varying vec3 fragBary;
-uniform float time;
+uniform highp float time;  // match the VS's implicit highp or WebGL won't link
 uniform float alpha;
 
 void main()

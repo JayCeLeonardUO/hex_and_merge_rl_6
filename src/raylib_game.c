@@ -621,7 +621,9 @@ static const char *enemyOutlineFS =
     "varying vec3 fragNormal;\n"
     "varying vec3 fragWorldPos;\n"
     "varying vec3 fragBary;\n"
-    "uniform float time;\n"
+    // highp to match the VS's implicit precision: WebGL refuses to link
+    // programs whose shared uniforms differ in precision between stages
+    "uniform highp float time;\n"
     "uniform float alpha;\n"
     "void main()\n"
     "{\n"
