@@ -222,7 +222,8 @@ static Texture2D leverFillTexture = {0};  // Turn lever pull fill (resources/lev
 static Texture2D leverKnobTexture = {0};  // Turn lever grab point (resources/lever_knob_16x18.png)
 
 static TurnLeverState turnLever = {0};
-static bool leverWantsMouse = false; // True when the lever owns the mouse; board ignores it
+static bool leverWantsMouse = false;          // True when the lever owns the mouse; board ignores it
+static Vector2 leverKnobScreenPos = {0};      // Knob center this frame; the 3D gem knob draws here
                                      // (set during the lever step, so it lags one frame like ImGui)
 
 static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
@@ -504,7 +505,8 @@ static RenderTexture2D worldTexture = {0}; // The rendered world; what the air s
 static float gemIor = 1.45f;
 static float gemStrength = 0.35f;
 static float gemChromatic = 0.05f;
-static float gemMilkiness = 0.15f; // Inverse gem (tile) milkiness, 0 = clear
+static float gemMilkiness = 0.15f;      // Inverse gem (tile) milkiness, 0 = clear
+static float leverGemMilkiness = 0.35f; // Lever knob crystal milkiness
 
 static float tileArtScale = 1.0f; // Tile-top art size, relative to the tile (debug tweakable)
 
@@ -643,6 +645,7 @@ static const Tweak tweaks[] = {
     {"gem_strength", &gemStrength},
     {"gem_chromatic", &gemChromatic},
     {"gem_milkiness", &gemMilkiness},
+    {"lever_gem_milkiness", &leverGemMilkiness},
     {"tile_art_scale", &tileArtScale},
     {"mouse_sway", &mouseSwayAmount},
     {"air_shards", &airShardCount},
@@ -1095,8 +1098,14 @@ static void TurnLever(void)
                        (Rectangle){cx, top + 4.0f * leverScale, (trackLen - 8.0f * leverScale) * turnLever.pull, trackWidth / 2.0f},
                        (Vector2){0, trackWidth / 4.0f}, 90.0f, WHITE);
     }
-    DrawTexturePro(leverKnobTexture, (Rectangle){0, 0, 16, 18},
-                   (Rectangle){cx, knobY, knobHalfW * 2.0f, knobHalfH * 2.0f}, (Vector2){knobHalfW, knobHalfH}, 0.0f, WHITE);
+    // Knob: a spinning 3D gem drawn in its own pass after this one; the flat
+    // coin art only shows when the gem model is missing
+    leverKnobScreenPos = (Vector2){cx, knobY};
+    if (!centerGemLoaded)
+    {
+        DrawTexturePro(leverKnobTexture, (Rectangle){0, 0, 16, 18},
+                       (Rectangle){cx, knobY, knobHalfW * 2.0f, knobHalfH * 2.0f}, (Vector2){knobHalfW, knobHalfH}, 0.0f, WHITE);
+    }
 
     const char *turnText = TextFormat("turn %d", gameTurn);
     DrawText(turnText, (int)cx - MeasureText(turnText, 20) / 2, (int)(top + trackLen) + 12, 20, LIGHTGRAY);
@@ -1609,6 +1618,15 @@ static void UpdateDrawFrame(void)
     BeginMode3D(camera);
     DrawAirTriangles(airTime);
     EndMode3D();
+    // Lever knob gem halo: a soft icy disc at the knob (half-res screen
+    // coords); the blur legs turn it into the gem's glow
+    if (centerGemLoaded)
+    {
+        float haloR = 20.0f * leverScale * (0.9f + 0.1f * sinf(airTime * 2.2f)); // Gentle pulse
+        Vector2 haloAt = {leverKnobScreenPos.x / 2.0f, leverKnobScreenPos.y / 2.0f};
+        DrawCircleGradient(haloAt, haloR, (Color){120, 170, 255, 255}, BLANK);
+        DrawCircleGradient(haloAt, haloR * 0.45f, (Color){235, 245, 255, 255}, BLANK); // Hot core
+    }
     EndTextureMode();
 
     // Blur, horizontal leg into the scratch buffer
@@ -1970,6 +1988,40 @@ static void UpdateDrawFrame(void)
 
     TurnLever();
 
+    //
+    // lever knob gem -- the grab point rendered as a small spinning crystal
+    // riding the knob's screen position, refracting the world behind it
+    //
+
+    if (centerGemLoaded)
+    {
+        // Constant screen size: world scale tracks the ortho zoom (fovy)
+        float knobGemScale = 7.5f * leverScale * camera.fovy / (float)screenHeight;
+        Vector3 knobWorld = ScreenToHandPlane(leverKnobScreenPos);
+        BeginMode3D(camera);
+        rlDisableBackfaceCulling();
+        rlDisableDepthTest();
+        rlPushMatrix();
+        rlTranslatef(knobWorld.x, knobWorld.y, knobWorld.z);
+        rlRotatef(airTime * 30.0f, 0.0f, 1.0f, 0.0f);
+        // The knob crystal gets its own milkiness; the frame-start uniform
+        // update restores the shared gem shader for everyone else next frame
+        SetShaderValue(gemShader, gemLocs.milkiness, &leverGemMilkiness, SHADER_UNIFORM_FLOAT);
+        DrawModel(centerGemModel, (Vector3){0}, knobGemScale, WHITE);
+        rlPopMatrix();
+        rlEnableDepthTest();
+        rlEnableBackfaceCulling();
+        EndMode3D();
+
+        // Bloom over the crystal itself: the half-res mask halo only survives
+        // around the silhouette, so the shine on top is drawn here directly
+        float shineR = 15.0f * leverScale * (0.9f + 0.1f * sinf(airTime * 2.2f));
+        BeginBlendMode(BLEND_ADDITIVE);
+        DrawCircleGradient(leverKnobScreenPos, shineR, (Color){70, 110, 200, 255}, BLANK);
+        DrawCircleGradient(leverKnobScreenPos, shineR * 0.4f, (Color){120, 150, 220, 255}, BLANK);
+        EndBlendMode();
+    }
+
     if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, LIGHTGRAY);
 
     if ((frameCounter / 20) % 2) DrawText("hex merge time!", screenWidth / 2 - MeasureText("hex merge time!", 30) / 2, 28, 30, MAROON);
@@ -2031,6 +2083,7 @@ static void UpdateDrawFrame(void)
     igSliderFloat("gem strength", &gemStrength, 0.0f, 1.0f, "%.2f", 0);
     igSliderFloat("gem dispersion", &gemChromatic, 0.0f, 0.15f, "%.3f", 0);
     igSliderFloat("gem milkiness", &gemMilkiness, 0.0f, 1.0f, "%.2f", 0);
+    igSliderFloat("lever gem milkiness", &leverGemMilkiness, 0.0f, 1.0f, "%.2f", 0);
     igSliderFloat("tile art size", &tileArtScale, 0.3f, 1.4f, "%.2f", 0);
     igSliderFloat("mouse sway", &mouseSwayAmount, 0.0f, 3.0f, "%.2f", 0);
 
