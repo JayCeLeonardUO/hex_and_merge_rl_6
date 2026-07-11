@@ -1751,6 +1751,76 @@ static void SpawnCard(void)
 
 // Update and draw frame: a flat sequence of system steps, each its own pass
 // over the entity list
+// One player mage billboard, perpendicular to the camera. Shared by the
+// world pass and the over-the-crystal redraw
+static void DrawPlayerSprite(const Entity *p)
+{
+    int frame = (frameCounter / 8) % PLAYER_FRAMES; // ~7.5 fps idle at 60 fps
+    Rectangle src = {(float)(frame * PLAYER_FRAME_W), 0.0f, (float)PLAYER_FRAME_W, (float)PLAYER_FRAME_H};
+
+    float spriteH = playerSpriteSize;                                          // World height of the billboard
+    float spriteW = spriteH * ((float)PLAYER_FRAME_W / (float)PLAYER_FRAME_H); // Frames are 2:1, square pixels
+    float ground = (p->selected && reticle.active) ? reticle.position.y : HEX_TILE_HEIGHT;
+    Vector3 pos = {p->position.x, ground + spriteH / 2.0f, p->position.z};
+
+    // Perpendicular to the camera: use the view-space up axis instead of
+    // world Y, so the tilted camera does not foreshorten the sprite
+    Matrix matView = MatrixLookAt(camera.position, camera.target, camera.up);
+    Vector3 camUp = {matView.m1, matView.m5, matView.m9};
+    DrawBillboardPro(camera, playerTexture, src, pos, camUp, (Vector2){spriteW, spriteH},
+                     (Vector2){spriteW / 2.0f, spriteH / 2.0f}, 0.0f, WHITE);
+}
+
+// One enemy instance: red outline hulls + spiky body, everything per-instance
+// read from the entity. Expects the frame's shared enemy uniforms (time,
+// spikes, view) already set. Shared by the world pass and the redraw
+static void DrawEnemyInstance(const Entity *enemy, float airTime)
+{
+    // Per-instance motion from the entity: spawn frame gives each one its own
+    // phase, pulse/breathe rates ride the struct. Mesh draws flush
+    // immediately, so per-instance uniforms are safe
+    float phase = (float)(enemy->frameCreated % 628) * 0.01f;
+    float enemyYaw = airTime * 0.35f + phase;
+    Vector3 enemyPos = enemy->position;
+    enemyPos.y = HEX_TILE_HEIGHT + enemySize + 0.5f + sinf(airTime * 1.3f + phase) * 0.08f;
+    if (enemy->selected) enemyPos.y += 0.25f; // Lifted while grabbed
+
+    // L4D red outline: inverted hulls under the body -- a solid ring plus a
+    // fainter, fatter additive glow ring, tracking the spikes
+    if (enemyOutline > 0.002f)
+    {
+        float glowExpand = enemyOutline * 2.6f;
+        float solidAlpha = 1.0f;
+        float glowAlpha = 0.28f;
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.pulseSpeed, &enemy->enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.breatheAmp, &enemy->enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.breatheSpeed, &enemy->enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
+        enemyModel.materials[0].shader = enemyOutlineShader;
+        // Flush queued batch geometry (tile art quads etc.) before flipping
+        // the cull face, or it renders front-culled and disappears when the
+        // blend mode change flushes it
+        rlDrawRenderBatchActive();
+        rlSetCullFace(RL_CULL_FACE_FRONT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.expand, &enemyOutline, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.alpha, &solidAlpha, SHADER_UNIFORM_FLOAT);
+        DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+        BeginBlendMode(BLEND_ADDITIVE);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.expand, &glowExpand, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.alpha, &glowAlpha, SHADER_UNIFORM_FLOAT);
+        DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+        EndBlendMode();
+        rlSetCullFace(RL_CULL_FACE_BACK);
+        enemyModel.materials[0].shader = enemyShader;
+    }
+
+    SetShaderValue(enemyShader, enemyLocs.yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(enemyShader, enemyLocs.pulseSpeed, &enemy->enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(enemyShader, enemyLocs.breatheAmp, &enemy->enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(enemyShader, enemyLocs.breatheSpeed, &enemy->enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
+    DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+}
+
 static void UpdateDrawFrame(void)
 {
     // Update
@@ -2367,50 +2437,7 @@ static void UpdateDrawFrame(void)
         {
             const Entity *enemy = &entities[i];
             if (enemy->kind != ENTITY_ENEMY) continue;
-
-            // Per-instance motion from the entity: spawn frame gives each one
-            // its own phase, pulse/breathe rates ride the struct. Mesh draws
-            // flush immediately, so per-instance uniforms are safe
-            float phase = (float)(enemy->frameCreated % 628) * 0.01f;
-            float enemyYaw = airTime * 0.35f + phase;
-            Vector3 enemyPos = enemy->position;
-            enemyPos.y = HEX_TILE_HEIGHT + enemySize + 0.5f + sinf(airTime * 1.3f + phase) * 0.08f;
-            if (enemy->selected) enemyPos.y += 0.25f; // Lifted while grabbed
-
-            // L4D red outline: inverted hulls under the body -- a solid ring
-            // plus a fainter, fatter additive glow ring, tracking the spikes
-            if (enemyOutline > 0.002f)
-            {
-                float glowExpand = enemyOutline * 2.6f;
-                float solidAlpha = 1.0f;
-                float glowAlpha = 0.28f;
-                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
-                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.pulseSpeed, &enemy->enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
-                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.breatheAmp, &enemy->enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
-                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.breatheSpeed, &enemy->enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
-                enemyModel.materials[0].shader = enemyOutlineShader;
-                // Flush queued batch geometry (tile art quads etc.) before
-                // flipping the cull face, or it renders front-culled and
-                // disappears when the blend mode change flushes it
-                rlDrawRenderBatchActive();
-                rlSetCullFace(RL_CULL_FACE_FRONT);
-                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.expand, &enemyOutline, SHADER_UNIFORM_FLOAT);
-                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.alpha, &solidAlpha, SHADER_UNIFORM_FLOAT);
-                DrawModel(enemyModel, enemyPos, enemySize, WHITE);
-                BeginBlendMode(BLEND_ADDITIVE);
-                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.expand, &glowExpand, SHADER_UNIFORM_FLOAT);
-                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.alpha, &glowAlpha, SHADER_UNIFORM_FLOAT);
-                DrawModel(enemyModel, enemyPos, enemySize, WHITE);
-                EndBlendMode();
-                rlSetCullFace(RL_CULL_FACE_BACK);
-                enemyModel.materials[0].shader = enemyShader;
-            }
-
-            SetShaderValue(enemyShader, enemyLocs.yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
-            SetShaderValue(enemyShader, enemyLocs.pulseSpeed, &enemy->enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
-            SetShaderValue(enemyShader, enemyLocs.breatheAmp, &enemy->enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
-            SetShaderValue(enemyShader, enemyLocs.breatheSpeed, &enemy->enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
-            DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+            DrawEnemyInstance(enemy, airTime);
         }
     }
 
@@ -2423,21 +2450,7 @@ static void UpdateDrawFrame(void)
     {
         const Entity *p = &entities[i];
         if (p->kind != ENTITY_PLAYER) continue;
-
-        int frame = (frameCounter / 8) % PLAYER_FRAMES; // ~7.5 fps idle at 60 fps
-        Rectangle src = {(float)(frame * PLAYER_FRAME_W), 0.0f, (float)PLAYER_FRAME_W, (float)PLAYER_FRAME_H};
-
-        float spriteH = playerSpriteSize;                                          // World height of the billboard
-        float spriteW = spriteH * ((float)PLAYER_FRAME_W / (float)PLAYER_FRAME_H); // Frames are 2:1, square pixels
-        float ground = (p->selected && reticle.active) ? reticle.position.y : HEX_TILE_HEIGHT;
-        Vector3 pos = {p->position.x, ground + spriteH / 2.0f, p->position.z};
-
-        // Perpendicular to the camera: use the view-space up axis instead of
-        // world Y, so the tilted camera does not foreshorten the sprite
-        Matrix matView = MatrixLookAt(camera.position, camera.target, camera.up);
-        Vector3 camUp = {matView.m1, matView.m5, matView.m9};
-        DrawBillboardPro(camera, playerTexture, src, pos, camUp, (Vector2){spriteW, spriteH},
-                         (Vector2){spriteW / 2.0f, spriteH / 2.0f}, 0.0f, WHITE);
+        DrawPlayerSprite(p);
     }
 
     DrawHoverReticle(); // Drawn late in 3D so its alpha blends over the tiles
@@ -2470,6 +2483,36 @@ static void UpdateDrawFrame(void)
         DrawModel(centerGemModel, (Vector3){0}, centerGemScale, WHITE);
         rlPopMatrix();
         rlEnableBackfaceCulling();
+    }
+
+    //
+    // over-the-crystal redraw -- the gem is drawn on top of the blitted world,
+    // so anything standing nearer the camera than it must draw again or it
+    // reads as behind the glass. The gem's depth is in the buffer, so these
+    // depth-tested redraws resolve the overlap per pixel at the silhouette
+    //
+
+    if (centerGemLoaded)
+    {
+        Vector3 crystalFwd = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+        Vector3 crystalCenter = {0.0f, 2.4f + sinf(airTime * 0.8f) * 0.15f, 0.0f};
+        float crystalDepth = Vector3DotProduct(Vector3Subtract(crystalCenter, camera.position), crystalFwd);
+
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *p = &entities[i];
+            if (p->kind != ENTITY_PLAYER) continue;
+            if (Vector3DotProduct(Vector3Subtract(p->position, camera.position), crystalFwd) >= crystalDepth) continue;
+            DrawPlayerSprite(p);
+        }
+
+        for (int i = 0; i < entityCount && enemyModelLoaded; i++)
+        {
+            const Entity *enemy = &entities[i];
+            if (enemy->kind != ENTITY_ENEMY) continue;
+            if (Vector3DotProduct(Vector3Subtract(enemy->position, camera.position), crystalFwd) >= crystalDepth) continue;
+            DrawEnemyInstance(enemy, airTime);
+        }
     }
 
     //
