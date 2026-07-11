@@ -38,11 +38,14 @@ TILE_H = 0.35
 PASTELS = [(255, 179, 186), (255, 223, 186), (255, 255, 186),
            (186, 255, 201), (186, 225, 255), (222, 197, 255)]
 
+# All three shaders are written in GLSL 100 -- the WebGL/GLES dialect the
+# wasm build compiles -- and desktop GL accepts them through ES2
+# compatibility, so what works here works in the browser verbatim.
 ENEMY_VS = """
-#version 330
-in vec3 vertexPosition;
-in vec3 vertexNormal;
-in vec4 vertexColor;
+#version 100
+attribute vec3 vertexPosition;
+attribute vec3 vertexNormal;
+attribute vec4 vertexColor;
 uniform mat4 mvp;
 uniform float time;
 uniform float yaw;          // spin lives here so world pos stays honest
@@ -51,10 +54,11 @@ uniform float spikeDensity; // fraction of vertices that grow spikes
 uniform float pulseSpeed;
 uniform float breatheAmp;
 uniform float breatheSpeed;
-out vec4 fragColor;
-out vec3 fragNormal;
-out vec3 fragWorldPos;
-out vec3 fragBary;
+uniform float expand;       // inverted-hull outline pass pushes along normals
+varying vec4 fragColor;
+varying vec3 fragNormal;
+varying vec3 fragWorldPos;
+varying vec3 fragBary;
 
 float hash(vec3 p) { return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719)))*43758.5453); }
 
@@ -65,7 +69,7 @@ void main()
     float wob = 0.7 + 0.3*sin(time*pulseSpeed + h*6.2831);
     float breath = 1.0 + breatheAmp*sin(time*breatheSpeed);
 
-    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob))*breath;
+    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob + expand))*breath;
     float c = cos(yaw); float s = sin(yaw);
     mat3 rot = mat3(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c);
     p = rot*p;
@@ -83,19 +87,20 @@ void main()
 """
 
 # One pass does it all: near-black body, pastel fresnel rim, and the mesh
-# lines drawn where any barycentric coord runs out -- fwidth keeps the line
-# width constant in screen pixels, and it works on GLES/WebGL too (no
-# glPolygonMode needed)
+# lines drawn where any barycentric coord runs out -- fwidth (via the
+# standard_derivatives extension on GLES) keeps the line width constant in
+# screen pixels
 ENEMY_FS = """
-#version 330
-in vec4 fragColor;
-in vec3 fragNormal;
-in vec3 fragWorldPos;
-in vec3 fragBary;
+#version 100
+#extension GL_OES_standard_derivatives : enable
+precision mediump float;
+varying vec4 fragColor;
+varying vec3 fragNormal;
+varying vec3 fragWorldPos;
+varying vec3 fragBary;
 uniform vec3 viewPos;
 uniform float rim;        // how much pastel bleeds in at grazing angles
 uniform float lineWidth;  // wire width in screen pixels
-out vec4 finalColor;
 
 void main()
 {
@@ -106,7 +111,27 @@ void main()
     vec3 V = normalize(viewPos - fragWorldPos);
     float fres = pow(1.0 - clamp(dot(V, normalize(fragNormal)), 0.0, 1.0), 2.5);
     vec3 body = mix(vec3(0.05, 0.05, 0.09), fragColor.rgb, fres*rim);
-    finalColor = vec4(mix(body, fragColor.rgb, edge), 1.0);
+    gl_FragColor = vec4(mix(body, fragColor.rgb, edge), 1.0);
+}
+"""
+
+# Left 4 Dead style outline: the same displaced mesh expanded along its
+# normals with front faces culled (inverted hull), flat danger-red with a
+# slow pulse -- so the silhouette ring tracks the spikes exactly
+OUTLINE_FS = """
+#version 100
+precision mediump float;
+varying vec4 fragColor;
+varying vec3 fragNormal;
+varying vec3 fragWorldPos;
+varying vec3 fragBary;
+uniform float time;
+uniform float alpha;
+
+void main()
+{
+    float pulse = 0.85 + 0.15*sin(time*2.6);
+    gl_FragColor = vec4(vec3(1.0, 0.08, 0.06)*pulse, alpha);
 }
 """
 
@@ -156,7 +181,11 @@ def main():
     shader = rl.load_shader_from_memory(ENEMY_VS, ENEMY_FS)
     U = {name: rl.get_shader_location(shader, name)
          for name in ("time", "yaw", "spikeLen", "spikeDensity", "pulseSpeed",
-                      "breatheAmp", "breatheSpeed", "viewPos", "rim", "lineWidth")}
+                      "breatheAmp", "breatheSpeed", "viewPos", "rim", "lineWidth", "expand")}
+    outline_shader = rl.load_shader_from_memory(ENEMY_VS, OUTLINE_FS)
+    UO = {name: rl.get_shader_location(outline_shader, name)
+          for name in ("time", "yaw", "spikeLen", "spikeDensity", "pulseSpeed",
+                       "breatheAmp", "breatheSpeed", "expand", "alpha")}
 
     params = {
         "size": ffi.new("float *", 0.9),
@@ -167,6 +196,7 @@ def main():
         "breathe_speed": ffi.new("float *", 1.6),
         "spin": ffi.new("float *", 18.0),
         "line_width": ffi.new("float *", 2.0),
+        "red_outline": ffi.new("float *", 0.05),  # hull expansion, 0 = off
         "rim": ffi.new("float *", 0.8),
         "subdiv": ffi.new("float *", 2.0),
         "seed": ffi.new("float *", 7.0),
@@ -199,7 +229,7 @@ def main():
     load_look()
     rebuild()
 
-    panel = rl.Rectangle(636, 12, 254, 470)
+    panel = rl.Rectangle(636, 12, 254, 500)
     status = "icosphere enemy"
     yaw = 0.0
     frame_counter = 0
@@ -238,9 +268,17 @@ def main():
         set_f(shader, U["breatheSpeed"], params["breathe_speed"][0])
         set_f(shader, U["rim"], params["rim"][0])
         set_f(shader, U["lineWidth"], params["line_width"][0])
+        set_f(shader, U["expand"], 0.0)
         rl.set_shader_value(shader, U["viewPos"],
                             ffi.new("float[3]", [cam.position.x, cam.position.y, cam.position.z]),
                             rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
+        for name in ("time", "yaw"):
+            set_f(outline_shader, UO[name], t if name == "time" else yaw)
+        set_f(outline_shader, UO["spikeLen"], params["spike_len"][0])
+        set_f(outline_shader, UO["spikeDensity"], params["spike_density"][0])
+        set_f(outline_shader, UO["pulseSpeed"], params["pulse_speed"][0])
+        set_f(outline_shader, UO["breatheAmp"], params["breathe_amp"][0])
+        set_f(outline_shader, UO["breatheSpeed"], params["breathe_speed"][0])
 
         rl.begin_drawing()
         rl.clear_background(rl.Color(18, 18, 26, 255))
@@ -260,6 +298,24 @@ def main():
         size = params["size"][0]
         hover_y = TILE_H + size + 0.35
         pos = rl.Vector3(0.0, hover_y, 0.0)
+
+        # L4D red outline: inverted hulls drawn before the body -- a solid
+        # ring plus a fainter, fatter glow ring, both tracking the spikes
+        o = params["red_outline"][0]
+        if o > 0.002:
+            # flush queued batch quads before flipping the cull face
+            rl.rl_draw_render_batch_active()
+            rl.rl_set_cull_face(rl.rl.RL_CULL_FACE_FRONT)
+            model.materials[0].shader = outline_shader
+            set_f(outline_shader, UO["expand"], o)
+            set_f(outline_shader, UO["alpha"], 1.0)
+            rl.draw_model(model, pos, size, rl.WHITE)
+            rl.begin_blend_mode(rl.BlendMode.BLEND_ADDITIVE)
+            set_f(outline_shader, UO["expand"], o * 2.6)
+            set_f(outline_shader, UO["alpha"], 0.28)
+            rl.draw_model(model, pos, size, rl.WHITE)
+            rl.end_blend_mode()
+            rl.rl_set_cull_face(rl.rl.RL_CULL_FACE_BACK)
 
         model.materials[0].shader = shader
         rl.draw_model(model, pos, size, rl.WHITE)
@@ -291,9 +347,10 @@ def main():
         slider(6, "spin deg/s", "spin", 0.0, 120.0, "{:.0f}")
         slider(7, "line width", "line_width", 1.0, 6.0, "{:.1f}")
         slider(8, "pastel rim", "rim", 0.0, 1.5)
-        slider(9, "subdiv", "subdiv", 0.0, 3.0, "{:.0f}")
+        slider(9, "red outline", "red_outline", 0.0, 0.15)
+        slider(10, "subdiv", "subdiv", 0.0, 3.0, "{:.0f}")
 
-        by = py + 20 + 10 * 30
+        by = py + 20 + 11 * 30
         if rl.gui_button(rl.Rectangle(px, by, 113, 22), "reroll colors"):
             params["seed"][0] += 1.0
         if rl.gui_button(rl.Rectangle(px + 121, by, 113, 22), "save look"):

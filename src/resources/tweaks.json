@@ -28,5 +28,6 @@
     "enemy_spike_len": 0.35,
     "enemy_spike_density": 0.45,
     "enemy_rim": 0.8,
-    "enemy_line_width": 2.0
+    "enemy_line_width": 2.0,
+    "enemy_outline": 0.05
 }

@@ -163,9 +163,17 @@ typedef struct Entity
     // Kind of Card: tags the logic of the card
     CardKind cardKind;
 
-    // Entitiy Texture
+    // Enemy Shader params
 
-    // Entitiy Model
+    float enemyPulseSpeed;
+    float enemyBreatheAmp;
+    float enemyBreatheSpeed;
+    int enemyMoveRange; // Tiles walked toward the player per committed turn
+
+    bool IsDraggable;
+
+    // Movement Range
+    int moveRange;
 
 } Entity;
 
@@ -222,9 +230,9 @@ static Texture2D leverFillTexture = {0};  // Turn lever pull fill (resources/lev
 static Texture2D leverKnobTexture = {0};  // Turn lever grab point (resources/lever_knob_16x18.png)
 
 static TurnLeverState turnLever = {0};
-static bool leverWantsMouse = false;          // True when the lever owns the mouse; board ignores it
-static Vector2 leverKnobScreenPos = {0};      // Knob center this frame; the 3D gem knob draws here
-                                     // (set during the lever step, so it lags one frame like ImGui)
+static bool leverWantsMouse = false;     // True when the lever owns the mouse; board ignores it
+static Vector2 leverKnobScreenPos = {0}; // Knob center this frame; the 3D gem knob draws here
+                                         // (set during the lever step, so it lags one frame like ImGui)
 
 static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
 
@@ -532,8 +540,8 @@ static int waterTimeLoc = -1;
 static int waterIntensityLoc = -1;
 static int waterWaveAmpLoc = -1;
 static int waterWaveScaleLoc = -1;
-static float waterWaveAmp = 0.35f;   // Wave steepness; 0 = flat mirror
-static float waterWaveScale = 1.4f;  // Ripple frequency
+static float waterWaveAmp = 0.35f;  // Wave steepness; 0 = flat mirror
+static float waterWaveScale = 1.4f; // Ripple frequency
 #define WATER_LEVEL (-0.05f)
 
 // Enemy: the architect demo's icosphere, spiked and breathing entirely in
@@ -560,6 +568,7 @@ static const char *enemyVS =
     "uniform float pulseSpeed;\n"
     "uniform float breatheAmp;\n"
     "uniform float breatheSpeed;\n"
+    "uniform float expand;\n"
     "varying vec4 fragColor;\n"
     "varying vec3 fragNormal;\n"
     "varying vec3 fragWorldPos;\n"
@@ -571,7 +580,7 @@ static const char *enemyVS =
     "    float mask = smoothstep(1.0 - spikeDensity, 1.0, h);\n"
     "    float wob = 0.7 + 0.3*sin(time*pulseSpeed + h*6.2831);\n"
     "    float breath = 1.0 + breatheAmp*sin(time*breatheSpeed);\n"
-    "    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob))*breath;\n"
+    "    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob + expand))*breath;\n"
     "    float c = cos(yaw); float s = sin(yaw);\n"
     "    mat3 rot = mat3(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c);\n"
     "    p = rot*p;\n"
@@ -603,6 +612,22 @@ static const char *enemyFS =
     "    vec3 body = mix(vec3(0.05, 0.05, 0.09), fragColor.rgb, fres*rim);\n"
     "    gl_FragColor = vec4(mix(body, fragColor.rgb, edge), 1.0);\n"
     "}\n";
+// L4D-style outline: inverted hull (front faces culled, expand > 0 in the
+// shared VS), flat danger-red pulsing slowly
+static const char *enemyOutlineFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec4 fragColor;\n"
+    "varying vec3 fragNormal;\n"
+    "varying vec3 fragWorldPos;\n"
+    "varying vec3 fragBary;\n"
+    "uniform float time;\n"
+    "uniform float alpha;\n"
+    "void main()\n"
+    "{\n"
+    "    float pulse = 0.85 + 0.15*sin(time*2.6);\n"
+    "    gl_FragColor = vec4(vec3(1.0, 0.08, 0.06)*pulse, alpha);\n"
+    "}\n";
 #else
 static const char *enemyVS =
     "#version 330\n"
@@ -618,6 +643,7 @@ static const char *enemyVS =
     "uniform float pulseSpeed;\n"
     "uniform float breatheAmp;\n"
     "uniform float breatheSpeed;\n"
+    "uniform float expand;\n"
     "out vec4 fragColor;\n"
     "out vec3 fragNormal;\n"
     "out vec3 fragWorldPos;\n"
@@ -629,7 +655,7 @@ static const char *enemyVS =
     "    float mask = smoothstep(1.0 - spikeDensity, 1.0, h);\n"
     "    float wob = 0.7 + 0.3*sin(time*pulseSpeed + h*6.2831);\n"
     "    float breath = 1.0 + breatheAmp*sin(time*breatheSpeed);\n"
-    "    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob))*breath;\n"
+    "    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob + expand))*breath;\n"
     "    float c = cos(yaw); float s = sin(yaw);\n"
     "    mat3 rot = mat3(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c);\n"
     "    p = rot*p;\n"
@@ -660,6 +686,20 @@ static const char *enemyFS =
     "    vec3 body = mix(vec3(0.05, 0.05, 0.09), fragColor.rgb, fres*rim);\n"
     "    finalColor = vec4(mix(body, fragColor.rgb, edge), 1.0);\n"
     "}\n";
+static const char *enemyOutlineFS =
+    "#version 330\n"
+    "in vec4 fragColor;\n"
+    "in vec3 fragNormal;\n"
+    "in vec3 fragWorldPos;\n"
+    "in vec3 fragBary;\n"
+    "uniform float time;\n"
+    "uniform float alpha;\n"
+    "out vec4 finalColor;\n"
+    "void main()\n"
+    "{\n"
+    "    float pulse = 0.85 + 0.15*sin(time*2.6);\n"
+    "    finalColor = vec4(vec3(1.0, 0.08, 0.06)*pulse, alpha);\n"
+    "}\n";
 #endif
 
 typedef struct EnemyShaderLocs
@@ -674,10 +714,14 @@ typedef struct EnemyShaderLocs
     int viewPos;
     int rim;
     int lineWidth;
+    int expand;
+    int alpha;
 } EnemyShaderLocs;
 
 static Shader enemyShader = {0};
+static Shader enemyOutlineShader = {0};
 static EnemyShaderLocs enemyLocs = {0};
+static EnemyShaderLocs enemyOutlineLocs = {0};
 static Model enemyModel = {0};
 static bool enemyModelLoaded = false;
 static float enemySize = 0.55f;         // Body radius, world units
@@ -685,6 +729,7 @@ static float enemySpikeLen = 0.35f;     // Spike reach past the body
 static float enemySpikeDensity = 0.45f; // Fraction of vertices that spike
 static float enemyRim = 0.8f;           // Pastel fresnel bleed on the fill
 static float enemyLineWidth = 2.0f;     // Wire line width, screen px
+static float enemyOutline = 0.05f;      // L4D red hull thickness, 0 = off
 
 static EnemyShaderLocs GetEnemyShaderLocs(Shader shader)
 {
@@ -699,6 +744,8 @@ static EnemyShaderLocs GetEnemyShaderLocs(Shader shader)
         .viewPos = GetShaderLocation(shader, "viewPos"),
         .rim = GetShaderLocation(shader, "rim"),
         .lineWidth = GetShaderLocation(shader, "lineWidth"),
+        .expand = GetShaderLocation(shader, "expand"),
+        .alpha = GetShaderLocation(shader, "alpha"),
     };
     return locs;
 }
@@ -988,6 +1035,7 @@ static const Tweak tweaks[] = {
     {"enemy_spike_density", &enemySpikeDensity},
     {"enemy_rim", &enemyRim},
     {"enemy_line_width", &enemyLineWidth},
+    {"enemy_outline", &enemyOutline},
     {"gem_ior", &gemIor},
     {"gem_strength", &gemStrength},
     {"gem_chromatic", &gemChromatic},
@@ -1099,6 +1147,20 @@ static Vector3 HexAxialToWorld(int q, int r)
     world.y = 0.0f;
     world.z = HEX_SIZE * (3.0f / 2.0f) * (float)r;
     return world;
+}
+
+// Axial hex distance in tiles between two cells
+static int HexDistance(int q1, int r1, int q2, int r2)
+{
+    int dq = q1 - q2;
+    int dr = r1 - r2;
+    return (abs(dq) + abs(dr) + abs(dq + dr)) / 2;
+}
+
+// True when the axial cell exists on the board (same rule SpawnHexGrid uses)
+static bool HexOnBoard(int q, int r)
+{
+    return (abs(q) <= GRID_RADIUS) && (abs(r) <= GRID_RADIUS) && (abs(q + r) <= GRID_RADIUS);
 }
 
 // Convert a screen point to the world position where hand cards stand: along
@@ -1640,6 +1702,27 @@ static void DrawImpactEffect(void)
 }
 
 // Deal one card into the hand fan, cycling a small test palette
+// Spawn one enemy on tile (q, r). Everything instance-specific lives on the
+// entity: home tile, pulse/breathe rates (offset per spawn so a crowd never
+// throbs in sync), and whether it can be grabbed
+static void SpawnEnemy(int q, int r)
+{
+    static int spawned = 0;
+
+    Entity *enemy = EntitySpawn(ENTITY_ENEMY);
+    if (enemy == NULL) return;
+
+    enemy->q = q;
+    enemy->r = r;
+    enemy->position = HexAxialToWorld(q, r);
+    enemy->enemyPulseSpeed = 2.2f + 0.3f * (float)(spawned % 3);
+    enemy->enemyBreatheAmp = 0.06f;
+    enemy->enemyBreatheSpeed = 1.6f + 0.2f * (float)(spawned % 4);
+    enemy->enemyMoveRange = 1;
+    enemy->IsDraggable = true;
+    spawned++;
+}
+
 static void SpawnCard(void)
 {
     // Plain brace initializers: raylib's GOLD/PINK/... macros are compound
@@ -1740,6 +1823,22 @@ static void UpdateDrawFrame(void)
     if ((player != NULL) && (hoveredCell != NULL) && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && (player->q == hoveredCell->q) && (player->r == hoveredCell->r))
     {
         player->selected = true;
+    }
+
+    //
+    // enemy grab -- a press on a draggable enemy's tile picks it up, unless
+    // the player is standing there too (he wins the grab)
+    //
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *enemy = &entities[i];
+        if ((enemy->kind != ENTITY_ENEMY) || !enemy->IsDraggable) continue;
+        if ((hoveredCell == NULL) || uiWantsMouse || !IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) continue;
+        if ((enemy->q != hoveredCell->q) || (enemy->r != hoveredCell->r)) continue;
+        if ((player != NULL) && player->selected) continue;
+
+        enemy->selected = true;
     }
 
     //
@@ -1926,6 +2025,111 @@ static void UpdateDrawFrame(void)
             player->velocity.z += ((targetZ - player->position.z) * stiffness - player->velocity.z * damping) * dt;
             player->position.x += player->velocity.x * dt;
             player->position.z += player->velocity.z * dt;
+        }
+    }
+
+    //
+    // enemy drag/drop -- same behavior as the player: grabbed it rides the
+    // reticle, released it takes the hovered cell (or springs back home)
+    //
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *enemy = &entities[i];
+        if (enemy->kind != ENTITY_ENEMY) continue;
+
+        if (enemy->selected && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+        {
+            enemy->selected = false;
+            if (hoveredCell != NULL)
+            {
+                enemy->q = hoveredCell->q;
+                enemy->r = hoveredCell->r;
+                LOG("INFO: ENEMY: placed at (q=%d, r=%d)\n", enemy->q, enemy->r);
+            }
+        }
+
+        if (enemy->selected && reticle.active)
+        {
+            enemy->position.x = reticle.position.x;
+            enemy->position.z = reticle.position.z;
+            enemy->velocity = (Vector3){0};
+        }
+        else
+        {
+            Vector3 home = HexAxialToWorld(enemy->q, enemy->r);
+            float targetX = home.x;
+            float targetZ = home.z;
+            if (enemy->selected && mouseOnPlane)
+            {
+                targetX = mouseBoardX;
+                targetZ = mouseBoardZ;
+            }
+
+            float stiffness = 420.0f;
+            float damping = 24.0f;
+            enemy->velocity.x += ((targetX - enemy->position.x) * stiffness - enemy->velocity.x * damping) * dt;
+            enemy->velocity.z += ((targetZ - enemy->position.z) * stiffness - enemy->velocity.z * damping) * dt;
+            enemy->position.x += enemy->velocity.x * dt;
+            enemy->position.z += enemy->velocity.z * dt;
+        }
+    }
+
+    //
+    // enemy chase -- when the lever commits a turn, every enemy walks up to
+    // its move range toward the player: greedy neighbor steps, stopping once
+    // adjacent, never onto another enemy's tile. The drag/drop spring above
+    // animates the walk to the new home on the following frames
+    //
+
+    {
+        static int lastChaseTurn = 0;
+        if ((gameTurn != lastChaseTurn) && (player != NULL))
+        {
+            lastChaseTurn = gameTurn;
+            for (int i = 0; i < entityCount; i++)
+            {
+                Entity *enemy = &entities[i];
+                if ((enemy->kind != ENTITY_ENEMY) || enemy->selected) continue;
+
+                for (int step = 0; step < enemy->enemyMoveRange; step++)
+                {
+                    if (HexDistance(enemy->q, enemy->r, player->q, player->r) <= 1) break;
+
+                    static const int dirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+                    int bestQ = enemy->q;
+                    int bestR = enemy->r;
+                    int bestDist = HexDistance(enemy->q, enemy->r, player->q, player->r);
+                    for (int d = 0; d < 6; d++)
+                    {
+                        int nq = enemy->q + dirs[d][0];
+                        int nr = enemy->r + dirs[d][1];
+                        if (!HexOnBoard(nq, nr)) continue;
+
+                        bool occupied = false;
+                        for (int j = 0; j < entityCount; j++)
+                        {
+                            const Entity *other = &entities[j];
+                            if ((other->kind != ENTITY_ENEMY) || (other == enemy)) continue;
+                            if ((other->q == nq) && (other->r == nr)) occupied = true;
+                        }
+                        if (occupied) continue;
+
+                        int dist = HexDistance(nq, nr, player->q, player->r);
+                        if (dist < bestDist)
+                        {
+                            bestDist = dist;
+                            bestQ = nq;
+                            bestR = nr;
+                        }
+                    }
+
+                    if ((bestQ == enemy->q) && (bestR == enemy->r)) break; // boxed in
+                    enemy->q = bestQ;
+                    enemy->r = bestR;
+                    LOG("INFO: ENEMY: chased to (q=%d, r=%d)\n", enemy->q, enemy->r);
+                }
+            }
         }
     }
     //----------------------------------------------------------------------------------
@@ -2144,25 +2348,68 @@ static void UpdateDrawFrame(void)
 
     if (enemyModelLoaded)
     {
-        const float enemyPulseSpeed = 2.2f;
-        const float enemyBreatheAmp = 0.06f;
-        const float enemyBreatheSpeed = 1.6f;
-        float enemyYaw = airTime * 0.35f;
         float enemyCamPos[3] = {camera.position.x, camera.position.y, camera.position.z};
-        Vector3 enemyPos = HexAxialToWorld(2, -2);
-        enemyPos.y = HEX_TILE_HEIGHT + enemySize + 0.5f + sinf(airTime * 1.3f) * 0.08f;
-
+        float enemyZero = 0.0f;
         SetShaderValue(enemyShader, enemyLocs.time, &airTime, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(enemyShader, enemyLocs.yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
         SetShaderValue(enemyShader, enemyLocs.spikeLen, &enemySpikeLen, SHADER_UNIFORM_FLOAT);
         SetShaderValue(enemyShader, enemyLocs.spikeDensity, &enemySpikeDensity, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(enemyShader, enemyLocs.pulseSpeed, &enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(enemyShader, enemyLocs.breatheAmp, &enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
-        SetShaderValue(enemyShader, enemyLocs.breatheSpeed, &enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
         SetShaderValue(enemyShader, enemyLocs.viewPos, enemyCamPos, SHADER_UNIFORM_VEC3);
         SetShaderValue(enemyShader, enemyLocs.rim, &enemyRim, SHADER_UNIFORM_FLOAT);
         SetShaderValue(enemyShader, enemyLocs.lineWidth, &enemyLineWidth, SHADER_UNIFORM_FLOAT);
-        DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+        SetShaderValue(enemyShader, enemyLocs.expand, &enemyZero, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.time, &airTime, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.spikeLen, &enemySpikeLen, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.spikeDensity, &enemySpikeDensity, SHADER_UNIFORM_FLOAT);
+
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *enemy = &entities[i];
+            if (enemy->kind != ENTITY_ENEMY) continue;
+
+            // Per-instance motion from the entity: spawn frame gives each one
+            // its own phase, pulse/breathe rates ride the struct. Mesh draws
+            // flush immediately, so per-instance uniforms are safe
+            float phase = (float)(enemy->frameCreated % 628) * 0.01f;
+            float enemyYaw = airTime * 0.35f + phase;
+            Vector3 enemyPos = enemy->position;
+            enemyPos.y = HEX_TILE_HEIGHT + enemySize + 0.5f + sinf(airTime * 1.3f + phase) * 0.08f;
+            if (enemy->selected) enemyPos.y += 0.25f; // Lifted while grabbed
+
+            // L4D red outline: inverted hulls under the body -- a solid ring
+            // plus a fainter, fatter additive glow ring, tracking the spikes
+            if (enemyOutline > 0.002f)
+            {
+                float glowExpand = enemyOutline * 2.6f;
+                float solidAlpha = 1.0f;
+                float glowAlpha = 0.28f;
+                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.pulseSpeed, &enemy->enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.breatheAmp, &enemy->enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.breatheSpeed, &enemy->enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
+                enemyModel.materials[0].shader = enemyOutlineShader;
+                // Flush queued batch geometry (tile art quads etc.) before
+                // flipping the cull face, or it renders front-culled and
+                // disappears when the blend mode change flushes it
+                rlDrawRenderBatchActive();
+                rlSetCullFace(RL_CULL_FACE_FRONT);
+                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.expand, &enemyOutline, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.alpha, &solidAlpha, SHADER_UNIFORM_FLOAT);
+                DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+                BeginBlendMode(BLEND_ADDITIVE);
+                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.expand, &glowExpand, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(enemyOutlineShader, enemyOutlineLocs.alpha, &glowAlpha, SHADER_UNIFORM_FLOAT);
+                DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+                EndBlendMode();
+                rlSetCullFace(RL_CULL_FACE_BACK);
+                enemyModel.materials[0].shader = enemyShader;
+            }
+
+            SetShaderValue(enemyShader, enemyLocs.yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(enemyShader, enemyLocs.pulseSpeed, &enemy->enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(enemyShader, enemyLocs.breatheAmp, &enemy->enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
+            SetShaderValue(enemyShader, enemyLocs.breatheSpeed, &enemy->enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
+            DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+        }
     }
 
     //
@@ -2485,6 +2732,7 @@ static void UpdateDrawFrame(void)
     igSliderFloat("enemy spike density", &enemySpikeDensity, 0.05f, 1.0f, "%.2f", 0);
     igSliderFloat("enemy rim", &enemyRim, 0.0f, 1.5f, "%.2f", 0);
     igSliderFloat("enemy line width", &enemyLineWidth, 1.0f, 6.0f, "%.1f", 0);
+    igSliderFloat("enemy red outline", &enemyOutline, 0.0f, 0.15f, "%.3f", 0);
 
     // Gem tile optics
     igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
@@ -2671,7 +2919,9 @@ int main(void)
     {
         enemyModel = LoadModel("resources/models/enemy_ico.glb");
         enemyShader = LoadShaderFromMemory(enemyVS, enemyFS);
+        enemyOutlineShader = LoadShaderFromMemory(enemyVS, enemyOutlineFS);
         enemyLocs = GetEnemyShaderLocs(enemyShader);
+        enemyOutlineLocs = GetEnemyShaderLocs(enemyOutlineShader);
         enemyModel.materials[0].shader = enemyShader;
         enemyModelLoaded = (enemyModel.meshCount > 0);
     }
@@ -2720,6 +2970,8 @@ int main(void)
         playerSpawn->position = HexAxialToWorld(0, 0);
     }
 
+    SpawnEnemy(2, -2);
+
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
 #else
@@ -2756,6 +3008,7 @@ int main(void)
     {
         UnloadModel(enemyModel);
         UnloadShader(enemyShader);
+        UnloadShader(enemyOutlineShader);
     }
     UnloadShader(gemShader);
     UnloadShader(inverseGemShader);
