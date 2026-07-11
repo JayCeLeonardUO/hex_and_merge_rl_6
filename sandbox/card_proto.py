@@ -433,7 +433,12 @@ def main():
         "outline": load("fire_card_39x66.png"),
         "icons": load("gandalf_icons_16x16.png"),
         "coin": load("CoinIcon_16x18.png"),
+        "impact_fx": load("impact_c_8x192.png"),
     }
+    rl.set_texture_filter(tex["impact_fx"], rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+    FX_FRAMES = 8
+    FX_DUR = 0.5
+    fx_start = -10.0  # trigger animation clock; clicking the hex card restarts it
 
     # Live brightness segmentation (OpenCV): the raised layer is re-cut from
     # the current art source whenever the threshold moves, straight into the
@@ -510,7 +515,11 @@ def main():
     tilt_ptr = ffi.new("float *", TILT_DEG)
     file_ptr = ffi.new("int *", file_idx)
     scroll_ptr = ffi.new("int *", 0)
-    files_text = ";".join(art_names)
+    # gui_list_view truncates its joined string at 1024 chars / 128 items;
+    # the _ex variant takes a real string array so every file shows up
+    name_bufs = [ffi.new("char[]", n.encode()) for n in art_names]
+    name_arr = ffi.new("char *[]", name_bufs)
+    focus_ptr = ffi.new("int *", -1)
     export_status = ""
     export_status_until = 0.0
 
@@ -635,10 +644,16 @@ def main():
         tilts[ci][1] += (tilt_target[1] - tilts[ci][1]) * 0.12
 
         hex_target = (0.0, 0.0)
+        hex_hovered = False
         if board_hit is not None and not ui_mouse:
             hdx, hdz = (board_hit[0] - HEX_X) / HEX_WORLD_R, (board_hit[1] - HEX_Z) / HEX_WORLD_R
             if hdx * hdx + hdz * hdz < 1.0:
                 hex_target = (hdx, hdz)
+                hex_hovered = True
+
+        # clicking the hex card fires its trigger animation
+        if hex_hovered and rl.is_mouse_button_pressed(rl.MouseButton.MOUSE_BUTTON_LEFT):
+            fx_start = t
         hex_tilts[ci][0] += (hex_target[0] - hex_tilts[ci][0]) * 0.12
         hex_tilts[ci][1] += (hex_target[1] - hex_tilts[ci][1]) * 0.12
 
@@ -710,6 +725,18 @@ def main():
         draw_art_relief_3d([art["back"], art["raised"]], icon_src, HEX_X, 0.02, HEX_Z, hex_art, hex_art,
                            -90.0, hex_tilts[ci], 0.0, 0.0, ART_Z0, ART_Z_STEP,
                            hexfx, t, phase + 0.1)
+
+        # trigger animation: the impact footage on a quad facing the camera,
+        # centered over the hex card. The NopiA effect is a dark ink splash,
+        # so it draws with plain alpha blending, not additive.
+        fx_t = (t - fx_start) / FX_DUR
+        if 0.0 <= fx_t < 1.0:
+            fx_frame = min(int(fx_t * FX_FRAMES), FX_FRAMES - 1)
+            fx_src = rl.Rectangle(fx_frame * 192, 0, 192, 192)
+            fx_size = HEX_WORLD_R * 3.2
+            draw_art_relief_3d([tex["impact_fx"]], fx_src, HEX_X, 0.9, HEX_Z,
+                               fx_size, fx_size, -CAM_ELEV_DEG, (0.0, 0.0),
+                               0.0, 0.0, 0.0, 0.0)
         rl.end_mode_3d()
 
         # Text overlay, projected from world space so it floats above the art
@@ -754,7 +781,7 @@ def main():
         rl.gui_label(rl.Rectangle(px, py + 168, 216, 16), f"press tilt  {TILT_DEG:.0f} deg")
         rl.gui_slider_bar(rl.Rectangle(px, py + 186, 216, 16), "", "", tilt_ptr, 0.0, 45.0)
         rl.gui_label(rl.Rectangle(px, py + 212, 216, 16), "art source:")
-        rl.gui_list_view(rl.Rectangle(px, py + 230, 216, 252), files_text, scroll_ptr, file_ptr)
+        rl.gui_list_view_ex(rl.Rectangle(px, py + 230, 216, 252), name_arr, len(name_bufs), scroll_ptr, file_ptr, focus_ptr)
 
         # Export the current composition (threshold, heights, art, color) to glb
         if rl.gui_button(rl.Rectangle(px, py + 490, 216, 26), "export .glb"):

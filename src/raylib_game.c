@@ -217,9 +217,9 @@ static Texture2D playerTexture = {0};      // Player idle sheet, 8 frames of 64x
 static Texture2D tileArtTexture = {0};     // Tile-top art atlas: 8 hex-masked cutout variants
                                            // in a row (resources/tile_clouds_variants_8x256.png)
 #define TILE_ART_VARIANTS 8
-static Texture2D leverTrackTexture = {0};  // Turn lever track (resources/lever_track_128x16.png)
-static Texture2D leverFillTexture = {0};   // Turn lever pull fill (resources/lever_fill_120x8.png)
-static Texture2D leverKnobTexture = {0};   // Turn lever grab point (resources/lever_knob_16x18.png)
+static Texture2D leverTrackTexture = {0}; // Turn lever track (resources/lever_track_128x16.png)
+static Texture2D leverFillTexture = {0};  // Turn lever pull fill (resources/lever_fill_120x8.png)
+static Texture2D leverKnobTexture = {0};  // Turn lever grab point (resources/lever_knob_16x18.png)
 
 static TurnLeverState turnLever = {0};
 static bool leverWantsMouse = false; // True when the lever owns the mouse; board ignores it
@@ -396,6 +396,7 @@ static const char *gemFS =
     "uniform float ior;\n"
     "uniform float strength;\n"
     "uniform float chromatic;\n"
+    "uniform float milkiness;\n"
     "uniform int invertColors;\n"
     "vec3 refrSample(vec2 baseUV, vec3 I, vec3 N, float eta)\n"
     "{\n"
@@ -415,6 +416,7 @@ static const char *gemFS =
     "    col.g = refrSample(baseUV, I, N, eta).g;\n"
     "    col.b = refrSample(baseUV, I, N, eta*(1.0 + chromatic)).b;\n"
     "    if (invertColors == 1) col = vec3(1.0) - col;\n"
+    "    col = mix(col, vec3(0.82, 0.86, 0.95), milkiness);\n"
     "    float fres = pow(1.0 - max(dot(-I, N), 0.0), 4.0);\n"
     "    col += vec3(0.85, 0.9, 1.0)*fres*0.5;\n"
     "    gl_FragColor = vec4(col, 1.0);\n"
@@ -447,6 +449,7 @@ static const char *gemFS =
     "uniform float ior;\n"
     "uniform float strength;\n"
     "uniform float chromatic;\n"
+    "uniform float milkiness;\n"
     "uniform int invertColors;\n"
     "out vec4 finalColor;\n"
     "vec3 refrSample(vec2 baseUV, vec3 I, vec3 N, float eta)\n"
@@ -467,6 +470,7 @@ static const char *gemFS =
     "    col.g = refrSample(baseUV, I, N, eta).g;\n"
     "    col.b = refrSample(baseUV, I, N, eta*(1.0 + chromatic)).b;\n"
     "    if (invertColors == 1) col = vec3(1.0) - col;\n"
+    "    col = mix(col, vec3(0.82, 0.86, 0.95), milkiness);\n"
     "    float fres = pow(1.0 - max(dot(-I, N), 0.0), 4.0);\n"
     "    col += vec3(0.85, 0.9, 1.0)*fres*0.5;\n"
     "    finalColor = vec4(col, 1.0);\n"
@@ -483,6 +487,7 @@ typedef struct GemShaderLocs
     int ior;
     int strength;
     int chromatic;
+    int milkiness;
 } GemShaderLocs;
 
 static Shader gemShader = {0};        // invertColors = 0
@@ -499,6 +504,7 @@ static RenderTexture2D worldTexture = {0}; // The rendered world; what the air s
 static float gemIor = 1.45f;
 static float gemStrength = 0.35f;
 static float gemChromatic = 0.05f;
+static float gemMilkiness = 0.15f; // Inverse gem (tile) milkiness, 0 = clear
 
 static float tileArtScale = 1.0f; // Tile-top art size, relative to the tile (debug tweakable)
 
@@ -514,15 +520,15 @@ static float mouseSwayAmount = 1.0f; // Camera lean toward the cursor, 0 = off (
 
 typedef struct AirParticle
 {
-    Vector3 base;  // Rest position in the air
-    Vector3 off;   // Eased mouse-dodge offset
-    Vector3 axis;  // Tumble axis
-    float phase;   // Per-particle time offset
-    float bob;     // Bob amplitude
-    float speed;   // Bob speed
-    float spin;    // Tumble rate, degrees/second
-    float scale;   // World size
-    int variant;   // Which shard model (shards) / palette color (triangles)
+    Vector3 base; // Rest position in the air
+    Vector3 off;  // Eased mouse-dodge offset
+    Vector3 axis; // Tumble axis
+    float phase;  // Per-particle time offset
+    float bob;    // Bob amplitude
+    float speed;  // Bob speed
+    float spin;   // Tumble rate, degrees/second
+    float scale;  // World size
+    int variant;  // Which shard model (shards) / palette color (triangles)
 } AirParticle;
 
 static AirParticle airShards[MAX_AIR_SHARDS] = {0};
@@ -585,8 +591,8 @@ static bool centerGemLoaded = false;
 static float centerGemScale = 1.2f; // Debug tweakable
 
 // Air particle tweakers, exposed in the hex debug ImGui window
-static float airShardCount = 24.0f;  // How many shards are active
-static float airTriCount = 18.0f;    // How many glow triangles are active
+static float airShardCount = 24.0f; // How many shards are active
+static float airTriCount = 18.0f;   // How many glow triangles are active
 static float airParticleScale = 1.0f;
 static float triGlowStrength = 0.8f;
 
@@ -636,6 +642,7 @@ static const Tweak tweaks[] = {
     {"gem_ior", &gemIor},
     {"gem_strength", &gemStrength},
     {"gem_chromatic", &gemChromatic},
+    {"gem_milkiness", &gemMilkiness},
     {"tile_art_scale", &tileArtScale},
     {"mouse_sway", &mouseSwayAmount},
     {"air_shards", &airShardCount},
@@ -765,12 +772,13 @@ static GemShaderLocs GetGemShaderLocs(Shader shader)
         .ior = GetShaderLocation(shader, "ior"),
         .strength = GetShaderLocation(shader, "strength"),
         .chromatic = GetShaderLocation(shader, "chromatic"),
+        .milkiness = GetShaderLocation(shader, "milkiness"),
     };
     return locs;
 }
 
 // Push this frame's camera basis + optics into one gem shader
-static void UpdateGemShader(Shader shader, const GemShaderLocs *locs)
+static void UpdateGemShader(Shader shader, const GemShaderLocs *locs, float milkiness)
 {
     Vector3 forward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
     Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, camera.up));
@@ -784,6 +792,7 @@ static void UpdateGemShader(Shader shader, const GemShaderLocs *locs)
     SetShaderValue(shader, locs->ior, &gemIor, SHADER_UNIFORM_FLOAT);
     SetShaderValue(shader, locs->strength, &gemStrength, SHADER_UNIFORM_FLOAT);
     SetShaderValue(shader, locs->chromatic, &gemChromatic, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(shader, locs->milkiness, &milkiness, SHADER_UNIFORM_FLOAT);
 }
 
 // ReFantazio-ish triangle palette: royal blues and cyans with white/gold
@@ -1293,7 +1302,7 @@ static void SpawnCard(void)
     card->value = (dealt % 4) + 1;
     card->tint = palette[dealt % 4];
     card->cardMode = CARD_REC_FORM;
-    card->modelIndex = (cardModelCount > 0) ? (dealt % cardModelCount) : 0;
+    card->modelIndex = (cardModelCount > 0) ? GetRandomValue(0, cardModelCount - 1) : 0;
     // Starts below the screen edge and springs up into its fan slot
     card->position = (Vector3){(float)screenWidth / 2.0f, (float)screenHeight + CARD_HEIGHT, 0.0f};
     dealt++;
@@ -1586,8 +1595,8 @@ static void UpdateDrawFrame(void)
     EndTextureMode();
 
     // This frame's camera basis + optics for both gem shaders
-    UpdateGemShader(gemShader, &gemLocs);
-    UpdateGemShader(inverseGemShader, &inverseGemLocs);
+    UpdateGemShader(gemShader, &gemLocs, 0.0f);
+    UpdateGemShader(inverseGemShader, &inverseGemLocs, gemMilkiness);
 
     //
     // triangle glow mask -- the triangles alone, half res, on black; whatever
@@ -2021,6 +2030,7 @@ static void UpdateDrawFrame(void)
     igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
     igSliderFloat("gem strength", &gemStrength, 0.0f, 1.0f, "%.2f", 0);
     igSliderFloat("gem dispersion", &gemChromatic, 0.0f, 0.15f, "%.3f", 0);
+    igSliderFloat("gem milkiness", &gemMilkiness, 0.0f, 1.0f, "%.2f", 0);
     igSliderFloat("tile art size", &tileArtScale, 0.3f, 1.4f, "%.2f", 0);
     igSliderFloat("mouse sway", &mouseSwayAmount, 0.0f, 3.0f, "%.2f", 0);
 

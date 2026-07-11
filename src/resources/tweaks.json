@@ -13,6 +13,7 @@
     "gem_ior": 1.4500,
     "gem_strength": 0.3500,
     "gem_chromatic": 0.0500,
+    "gem_milkiness": 0.1500,
     "tile_art_scale": 0.7700,
     "mouse_sway": 2.8300,
     "air_shards": 24.0000,

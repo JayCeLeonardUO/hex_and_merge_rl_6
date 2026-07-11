@@ -47,6 +47,16 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 set_property(TARGET ${PROJECT_NAME} PROPERTY VS_DEBUGGER_WORKING_DIRECTORY $<TARGET_FILE_DIR:${PROJECT_NAME}>)
 
+# Pull card exports from the sandbox into src/resources/models before the
+# resource copy, so a fresh export only needs a recompile
+add_custom_command(
+    TARGET ${PROJECT_NAME} PRE_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DEXPORT_DIR=${CMAKE_SOURCE_DIR}/sandbox/export
+        -DMODELS_DIR=${CMAKE_SOURCE_DIR}/src/resources/models
+        -P ${CMAKE_SOURCE_DIR}/cmake/sync_card_exports.cmake
+)
+
 if ("${PLATFORM}" STREQUAL "Web")
     add_custom_command(
         TARGET ${PROJECT_NAME} PRE_BUILD

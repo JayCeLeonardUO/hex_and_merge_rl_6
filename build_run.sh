@@ -8,6 +8,10 @@ CMAKE="${CMAKE:-$HOME/.local/bin/cmake}"
 TARGET="raylib-game-template"
 DEBUG_MODE="${1:-}"
 
+# Force a relink even when nothing changed, so the PRE_BUILD card-export
+# sync and POST_BUILD resource copy always run
+rm -f "build/$TARGET/$TARGET"
+
 TMUX_DEBUG_SESSION="hex-gdbgui-debug"
 TMUX_RUN_SESSION="hex-game-run"
 
