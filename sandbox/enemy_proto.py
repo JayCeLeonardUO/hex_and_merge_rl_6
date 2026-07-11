@@ -6,12 +6,11 @@
 
 The enemy is an icosphere displaced entirely in the vertex shader: a stable
 per-vertex hash picks which vertices spike, spikes pulse over time, and the
-whole body breathes. It renders in two passes sharing that vertex shader:
-
-  1. fill  -- near-black body with the pastel showing as a fresnel rim
-  2. wires -- glPolygonMode(GL_LINE) pass; every vertex carries a pastel
-              palette color baked into the GLB, so the mesh-defining lines
-              interpolate pastel-to-pastel along every edge
+whole body breathes. One shader draws the whole look: near-black body with a
+pastel fresnel rim, plus the mesh-defining lines rendered in the fragment
+shader from barycentric coords (corner ids ride the vertex color alpha of
+the unwelded mesh; the RGB is the pastel palette). fwidth keeps the lines a
+constant pixel width -- and it all works on GLES/WebGL, unlike glPolygonMode.
 
 "save look" writes enemy_look.json; "reroll colors" / subdiv rebuild the mesh.
 
@@ -52,10 +51,10 @@ uniform float spikeDensity; // fraction of vertices that grow spikes
 uniform float pulseSpeed;
 uniform float breatheAmp;
 uniform float breatheSpeed;
-uniform float inflate;      // wire pass floats just off the fill surface
 out vec4 fragColor;
 out vec3 fragNormal;
 out vec3 fragWorldPos;
+out vec3 fragBary;
 
 float hash(vec3 p) { return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719)))*43758.5453); }
 
@@ -66,58 +65,76 @@ void main()
     float wob = 0.7 + 0.3*sin(time*pulseSpeed + h*6.2831);
     float breath = 1.0 + breatheAmp*sin(time*breatheSpeed);
 
-    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob + inflate))*breath;
+    vec3 p = (vertexPosition + vertexNormal*(spikeLen*mask*wob))*breath;
     float c = cos(yaw); float s = sin(yaw);
     mat3 rot = mat3(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c);
     p = rot*p;
 
-    fragColor = vertexColor;
+    // corner id one-hot from the color alpha (0 / 0.5 / 1): interpolating it
+    // across the triangle yields barycentric coords for the edge shader
+    float aa = vertexColor.a;
+    fragBary = vec3(1.0 - step(0.25, aa), step(0.25, aa)*(1.0 - step(0.75, aa)), step(0.75, aa));
+
+    fragColor = vec4(vertexColor.rgb, 1.0);
     fragNormal = rot*vertexNormal;
     fragWorldPos = p;
     gl_Position = mvp*vec4(p, 1.0);
 }
 """
 
-FILL_FS = """
+# One pass does it all: near-black body, pastel fresnel rim, and the mesh
+# lines drawn where any barycentric coord runs out -- fwidth keeps the line
+# width constant in screen pixels, and it works on GLES/WebGL too (no
+# glPolygonMode needed)
+ENEMY_FS = """
 #version 330
 in vec4 fragColor;
 in vec3 fragNormal;
 in vec3 fragWorldPos;
+in vec3 fragBary;
 uniform vec3 viewPos;
-uniform float rim;   // how much pastel bleeds in at grazing angles
+uniform float rim;        // how much pastel bleeds in at grazing angles
+uniform float lineWidth;  // wire width in screen pixels
 out vec4 finalColor;
 
 void main()
 {
+    vec3 d = fwidth(fragBary);
+    vec3 a3 = smoothstep(vec3(0.0), d*lineWidth, fragBary);
+    float edge = 1.0 - min(min(a3.x, a3.y), a3.z);
+
     vec3 V = normalize(viewPos - fragWorldPos);
     float fres = pow(1.0 - clamp(dot(V, normalize(fragNormal)), 0.0, 1.0), 2.5);
-    vec3 body = vec3(0.05, 0.05, 0.09);
-    vec3 col = mix(body, fragColor.rgb, fres*rim);
-    finalColor = vec4(col, 1.0);
+    vec3 body = mix(vec3(0.05, 0.05, 0.09), fragColor.rgb, fres*rim);
+    finalColor = vec4(mix(body, fragColor.rgb, edge), 1.0);
 }
-"""
-
-WIRE_FS = """
-#version 330
-in vec4 fragColor;
-in vec3 fragNormal;
-in vec3 fragWorldPos;
-out vec4 finalColor;
-
-void main() { finalColor = vec4(fragColor.rgb, 1.0); }
 """
 
 
 def build_enemy_glb(subdiv, seed):
-    """Icosphere with a pastel palette color per vertex, baked as COLOR_0."""
+    """Icosphere with pastel palette vertex colors. Triangles are unwelded so
+    every corner can carry its barycentric id in the color alpha (0/128/255);
+    smooth normals from the welded sphere are kept so shared corners displace
+    identically and the spiked mesh stays watertight."""
     rng = np.random.default_rng(seed)
     ico = trimesh.creation.icosphere(subdivisions=subdiv, radius=1.0)
-    colors = np.array(PASTELS, np.uint8)[rng.integers(0, len(PASTELS), len(ico.vertices))]
-    ico.visual = trimesh.visual.ColorVisuals(
-        ico, vertex_colors=np.column_stack([colors, np.full(len(ico.vertices), 255, np.uint8)]))
+    smooth_normals = np.asarray(ico.vertex_normals, np.float64).copy()
+    palette = np.array(PASTELS, np.uint8)[rng.integers(0, len(PASTELS), len(ico.vertices))]
+
+    idx = ico.faces.ravel()
+    verts = ico.vertices[idx]
+    norms = smooth_normals[idx]
+    rgb = palette[idx]
+    alpha = np.tile(np.array([0, 128, 255], np.uint8), len(ico.faces))
+    colors = np.column_stack([rgb, alpha])
+
+    faces = np.arange(len(verts)).reshape(-1, 3)
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces,
+                           vertex_normals=norms, process=False)
+    mesh.visual = trimesh.visual.ColorVisuals(mesh, vertex_colors=colors)
     ASSETS.mkdir(parents=True, exist_ok=True)
     out = ASSETS / "enemy_ico.glb"
-    ico.export(str(out), include_normals=True)
+    mesh.export(str(out), include_normals=True)
     return out
 
 
@@ -136,13 +153,10 @@ def main():
                       rl.Vector3(0.0, 1.0, 0.0), 42.0,
                       rl.CameraProjection.CAMERA_PERSPECTIVE)
 
-    fill_shader = rl.load_shader_from_memory(ENEMY_VS, FILL_FS)
-    wire_shader = rl.load_shader_from_memory(ENEMY_VS, WIRE_FS)
-    U = {}
-    for sh, tag in ((fill_shader, "fill"), (wire_shader, "wire")):
-        for name in ("time", "yaw", "spikeLen", "spikeDensity", "pulseSpeed",
-                     "breatheAmp", "breatheSpeed", "inflate", "viewPos", "rim"):
-            U[(tag, name)] = rl.get_shader_location(sh, name)
+    shader = rl.load_shader_from_memory(ENEMY_VS, ENEMY_FS)
+    U = {name: rl.get_shader_location(shader, name)
+         for name in ("time", "yaw", "spikeLen", "spikeDensity", "pulseSpeed",
+                      "breatheAmp", "breatheSpeed", "viewPos", "rim", "lineWidth")}
 
     params = {
         "size": ffi.new("float *", 0.9),
@@ -215,19 +229,16 @@ def main():
 
         rebuild()
 
-        # shared uniforms for both passes
-        for tag, sh in (("fill", fill_shader), ("wire", wire_shader)):
-            set_f(sh, U[(tag, "time")], t)
-            set_f(sh, U[(tag, "yaw")], yaw)
-            set_f(sh, U[(tag, "spikeLen")], params["spike_len"][0])
-            set_f(sh, U[(tag, "spikeDensity")], params["spike_density"][0])
-            set_f(sh, U[(tag, "pulseSpeed")], params["pulse_speed"][0])
-            set_f(sh, U[(tag, "breatheAmp")], params["breathe_amp"][0])
-            set_f(sh, U[(tag, "breatheSpeed")], params["breathe_speed"][0])
-        set_f(fill_shader, U[("fill", "inflate")], 0.0)
-        set_f(wire_shader, U[("wire", "inflate")], 0.012)
-        set_f(fill_shader, U[("fill", "rim")], params["rim"][0])
-        rl.set_shader_value(fill_shader, U[("fill", "viewPos")],
+        set_f(shader, U["time"], t)
+        set_f(shader, U["yaw"], yaw)
+        set_f(shader, U["spikeLen"], params["spike_len"][0])
+        set_f(shader, U["spikeDensity"], params["spike_density"][0])
+        set_f(shader, U["pulseSpeed"], params["pulse_speed"][0])
+        set_f(shader, U["breatheAmp"], params["breathe_amp"][0])
+        set_f(shader, U["breatheSpeed"], params["breathe_speed"][0])
+        set_f(shader, U["rim"], params["rim"][0])
+        set_f(shader, U["lineWidth"], params["line_width"][0])
+        rl.set_shader_value(shader, U["viewPos"],
                             ffi.new("float[3]", [cam.position.x, cam.position.y, cam.position.z]),
                             rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
 
@@ -250,15 +261,8 @@ def main():
         hover_y = TILE_H + size + 0.35
         pos = rl.Vector3(0.0, hover_y, 0.0)
 
-        model.materials[0].shader = fill_shader
+        model.materials[0].shader = shader
         rl.draw_model(model, pos, size, rl.WHITE)
-
-        model.materials[0].shader = wire_shader
-        rl.rl_set_line_width(params["line_width"][0])
-        rl.rl_enable_wire_mode()
-        rl.draw_model(model, pos, size, rl.WHITE)
-        rl.rl_disable_wire_mode()
-        rl.rl_set_line_width(1.0)
 
         # blob shadow, breathing with the body
         breath = 1.0 + params["breathe_amp"][0] * math.sin(t * params["breathe_speed"][0])
