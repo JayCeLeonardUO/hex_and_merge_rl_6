@@ -131,6 +131,16 @@ typedef enum
 
 // Hand label + deal tint per kind (index by CardKind)
 static const char *cardKindNames[NUM_CARD_KINDS] = {"", "ley", "fire", "hex", "ward"};
+// Exodia theming: a lvl 4 card stops being a spell and becomes a sealed
+// piece of the hex king (index by the kind that merged into it)
+static const char *exodiaPieceNames[NUM_CARD_KINDS] = {
+    "",
+    "the hex king's head",      // leyline
+    "the hex king's right arm", // fireball
+    "the hex king's left arm",  // hex
+    "the hex king's legs",      // ward
+};
+static const char *exodiaPieceShort[NUM_CARD_KINDS] = {"", "king's head", "right arm", "left arm", "king's legs"};
 // Hover tooltip per kind, copied into the card's tooltip buffer at deal
 static const char *cardKindTooltips[NUM_CARD_KINDS] = {
     "",
@@ -2127,7 +2137,8 @@ static Entity *ReturnPlacedCard(Entity *cell)
         back->cardMode = CARD_REC_FORM;
         back->modelIndex = cell->modelIndex;
         if (back->cardLevel >= CARD_LVL_4)
-            snprintf(back->tooltip, sizeof(back->tooltip), "exodia piece! collect all four kinds at lvl 4 to win");
+            snprintf(back->tooltip, sizeof(back->tooltip), "%s -- an exodia piece! collect all four to win",
+                     exodiaPieceNames[back->cardKind]);
         else
             snprintf(back->tooltip, sizeof(back->tooltip), "%s -- stays %d turns on the field",
                      cardKindTooltips[back->cardKind], cardKindLifetimes[back->cardKind]);
@@ -3049,7 +3060,7 @@ static void UpdateDrawFrame(void)
                     // lives in the hand as an inert trophy
                     if (hoveredCell->cardLevel >= CARD_LVL_4)
                     {
-                        LOG("INFO: EXODIA: %s piece assembled!\n", cardKindNames[hoveredCell->cardKind]);
+                        LOG("INFO: EXODIA: %s assembled!\n", exodiaPieceNames[hoveredCell->cardKind]);
                         ReturnPlacedCard(hoveredCell);
                     }
                     EnemyAIUpdate(); // card played: re-plan
@@ -4196,7 +4207,7 @@ static void UpdateDrawFrame(void)
 
         bool isPiece = (card->cardLevel >= CARD_LVL_4);
         const char *valueText = (card->huskTurns > 0)  ? TextFormat("%s zzz", cardKindNames[card->cardKind])
-                                : isPiece              ? TextFormat("%s exodia", cardKindNames[card->cardKind])
+                                : isPiece              ? TextFormat("%s", exodiaPieceShort[card->cardKind])
                                                        : TextFormat("%s %d", cardKindNames[card->cardKind], (int)card->cardLevel);
         Color valueColor = (card->huskTurns > 0) ? GRAY
                            : isPiece             ? (Color){255, 220, 60, 255}
@@ -4375,11 +4386,36 @@ static void UpdateDrawFrame(void)
                 DrawTextOutlined(lines[li], screenWidth / 2 - MeasureText(lines[li], 20) / 2, screenHeight / 2 - 8 + li * 28, 20, RAYWHITE);
             }
         }
+        else if (gameState == GAME_STATE_WIN)
+        {
+            const char *ranText = TextFormat("all four pieces assembled in %d turns", gameTurn);
+            DrawTextOutlined(ranText, screenWidth / 2 - MeasureText(ranText, 24) / 2, screenHeight / 2 - 36, 24, RAYWHITE);
+
+            // The four exodia pieces in a row, bobbing: gold-pipped mini
+            // cards, one per kind (winning means all four are in the hand)
+            const float pieceW = 74.0f;
+            const float pieceH = 86.0f;
+            const float pieceGap = 18.0f;
+            float rowX = (float)screenWidth / 2.0f - (4.0f * pieceW + 3.0f * pieceGap) / 2.0f;
+            for (int k = CARD_LEYLINE; k < NUM_CARD_KINDS; k++)
+            {
+                float bob = sinf((float)GetTime() * 2.0f + (float)k * 0.9f) * 3.0f;
+                float px = rowX + (float)(k - CARD_LEYLINE) * (pieceW + pieceGap);
+                float py = (float)screenHeight / 2.0f - 4.0f + bob;
+                // Tinted border as a slightly larger rounded rect under the body
+                DrawRectangleRounded((Rectangle){px - 3, py - 3, pieceW + 6, pieceH + 6}, 0.2f, 6, cardKindTints[k]);
+                DrawRectangleRounded((Rectangle){px, py, pieceW, pieceH}, 0.2f, 6, (Color){24, 18, 28, 255});
+                // Piece name in exodia gold, the kind that forged it beneath
+                const char *pieceName = exodiaPieceShort[k];
+                DrawTextOutlined(pieceName, (int)(px + pieceW / 2.0f) - MeasureText(pieceName, 16) / 2,
+                                 (int)(py + 24), 16, (Color){255, 220, 60, 255});
+                DrawTextOutlined(cardKindNames[k], (int)(px + pieceW / 2.0f) - MeasureText(cardKindNames[k], 16) / 2,
+                                 (int)(py + 54), 16, cardKindTints[k]);
+            }
+        }
         else
         {
-            const char *ranText = (gameState == GAME_STATE_WIN)
-                                      ? TextFormat("all four pieces assembled in %d turns", gameTurn)
-                                      : TextFormat("you lasted %d turns", gameTurn);
+            const char *ranText = TextFormat("you lasted %d turns", gameTurn);
             DrawTextOutlined(ranText, screenWidth / 2 - MeasureText(ranText, 24) / 2, screenHeight / 2 - 4, 24, RAYWHITE);
         }
 
@@ -4456,6 +4492,8 @@ static void UpdateDrawFrame(void)
         }
 
         if (igButton("deal card", (ImVec2_c){0, 0})) SpawnCard();
+        igSameLine(0.0f, 8.0f);
+        if (igButton("test win screen", (ImVec2_c){0, 0})) gameState = GAME_STATE_WIN;
 
         if (igButton("save tweaks", (ImVec2_c){0, 0})) SaveTweaks();
         igSameLine(0.0f, 8.0f);
