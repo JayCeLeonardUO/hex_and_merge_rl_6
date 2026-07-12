@@ -1379,6 +1379,26 @@ typedef enum
 static GameState gameState = GAME_STATE_START;
 static bool tutorialOpen = false; // The "?" how-to-play window (ImGui)
 
+// Tutorial slideshow: one staged screenshot per rule, captured by running
+// the game with --tutorial-shots (each scene is built on the real board,
+// rendered, downscaled, and exported to tutorial_N.png)
+#define TUTORIAL_SLIDES 8
+static Texture2D tutorialTex[TUTORIAL_SLIDES] = {0};
+static int tutorialSlide = 0;
+static const char *tutorialCaptions[TUTORIAL_SLIDES] = {
+    "Drag cards from your hand onto empty tiles. Drop one onto a same kind + level card to merge it a level up.",
+    "Leylines conduct power from your tile. Spells only work while a live chain touches them.",
+    "A connected fireball banks a charge each turn. At 2 charges it detonates, hitting everything within 1 tile.",
+    "Wards bait enemy strikes: no heart lost. The used ward rests in your hand for one turn.",
+    "Hex is a trap. The enemy that smashes it turns purple and fights for you for 1-3 turns.",
+    "Red arch: the enemy will walk there. Pulsing dashes and a ! : it will hit that tile.",
+    "Stand on a pickup to take it. The crystal grows one every 2 turns; slain enemies drop them too.",
+    "Click the crystal to end your turn. Merge every kind to level 4 -- all four exodia pieces win.",
+};
+static int shotStage = -1;   // --tutorial-shots sequence position, -1 = off
+static int shotTimer = 0;    // Frames until the current scene is captured
+static bool shotQuit = false; // True once the last scene is exported
+
 // 2.5D camera: tilted orthographic view down at the board plane (y = 0);
 // no perspective foreshortening, so tiles read as a flat iso board
 static Camera3D camera = {
@@ -2706,6 +2726,107 @@ static void ResetGame(void)
 
     SpawnEnemy(2, -2);
     EnemyAIUpdate(); // first plan: the telegraph exists before any input event
+}
+
+// The board cell at (q, r), or NULL
+static Entity *FindCell(int q, int r)
+{
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *cell = &entities[i];
+        if ((cell->kind == ENTITY_HEX_CELL) && (cell->q == q) && (cell->r == r)) return cell;
+    }
+    return NULL;
+}
+
+// Tutorial staging: plant a placed card directly on a tile
+static void StageTutorialCard(int q, int r, CardKind kind, CardLevel level)
+{
+    Entity *cell = FindCell(q, r);
+    if (cell == NULL) return;
+    cell->cardKind = kind;
+    cell->cardLevel = level;
+    cell->value = (int)level;
+    cell->tint = cardKindTints[kind];
+    cell->modelIndex = (kindModelIndex[kind] >= 0) ? kindModelIndex[kind] : 0;
+    cell->isLeyline = (kind == CARD_LEYLINE);
+    cell->turnLifetime = cardKindLifetimes[kind];
+}
+
+// Tutorial staging: drop a card pickup on a tile
+static void StageTutorialPickup(int q, int r, CardKind kind)
+{
+    Entity *gift = EntitySpawn(ENTITY_PICKUP);
+    if (gift == NULL) return;
+    gift->q = q;
+    gift->r = r;
+    gift->position = HexAxialToWorld(q, r);
+    gift->cardKind = kind;
+    gift->tint = cardKindTints[kind];
+    gift->modelIndex = (kindModelIndex[kind] >= 0) ? kindModelIndex[kind] : 0;
+}
+
+// One staged scene per tutorial slide, built on the real board so the
+// screenshots can never drift from the actual look of the rules
+static void StageTutorialScene(int stage)
+{
+    ResetGame();
+    gameState = GAME_STATE_PLAYING;
+    tutorialOpen = false; // The window must never contaminate its own slides
+
+    Entity *player = NULL;
+    Entity *enemy = NULL;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_PLAYER) player = &entities[i];
+        if ((entities[i].kind == ENTITY_ENEMY) && (enemy == NULL)) enemy = &entities[i];
+    }
+
+    switch (stage)
+    {
+    case 0: // cards on tiles + a merged lvl 2
+        StageTutorialCard(-1, 0, CARD_WARD, CARD_LVL_1);
+        StageTutorialCard(1, -1, CARD_FIREBALL, CARD_LVL_2);
+        break;
+    case 1: // leyline chain from the player to a tapped fireball
+    case 2: // ...same scene, with a banked charge glowing
+        StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
+        StageTutorialCard(2, 0, CARD_LEYLINE, CARD_LVL_1);
+        StageTutorialCard(3, 0, CARD_FIREBALL, CARD_LVL_1);
+        if (stage == 2)
+        {
+            Entity *fb = FindCell(3, 0);
+            if (fb != NULL) fb->fireballCharge = 1;
+        }
+        break;
+    case 3: // ward baiting the enemy's strike telegraph
+        StageTutorialCard(1, -1, CARD_WARD, CARD_LVL_1);
+        break;
+    case 4: // hexed (purple) enemy turning on a fresh foe
+        if (enemy != NULL) enemy->hexedTurns = 2;
+        SpawnEnemy(3, -2);
+        break;
+    case 5: // both telegraphs: a far enemy arching in, a close one striking
+        if (enemy != NULL)
+        {
+            enemy->q = 3;
+            enemy->r = -4;
+            enemy->position = HexAxialToWorld(enemy->q, enemy->r);
+        }
+        SpawnEnemy(1, 1); // adjacent to the player: attack "!"
+        break;
+    case 6: // pickups: a crystal gift beside the crystal, an enemy drop afield
+        StageTutorialPickup(1, 0, CARD_LEYLINE);
+        StageTutorialPickup(-2, 1, CARD_FIREBALL);
+        break;
+    case 7: // the goal: an exodia piece resting in the hand
+        SpawnCardKind(CARD_WARD);
+        entities[entityCount - 1].cardLevel = CARD_LVL_4;
+        break;
+    default:
+        break;
+    }
+    EnemyAIUpdate(); // telegraphs and danger flags match the staged board
 }
 
 // enemy intent -- the telegraph for the next lever pull, drawing only the
@@ -4430,7 +4551,7 @@ static void UpdateDrawFrame(void)
         bool overHelp = CheckCollisionPointCircle(mouse, helpAt, 18.0f);
         Color helpColor = overHelp ? (Color){255, 240, 140, 255} : (Color){255, 220, 60, 255};
         DrawTextOutlined("?", (int)helpAt.x - MeasureText("?", 36) / 2, (int)helpAt.y - 18, 36, helpColor);
-        if (overHelp && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) tutorialOpen = !tutorialOpen;
+        if (overHelp && !uiWantsMouse && (shotStage < 0) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) tutorialOpen = !tutorialOpen;
     }
 
     DrawRectangleLinesEx((Rectangle){0, 0, screenWidth, screenHeight}, 16, BLACK);
@@ -4544,46 +4665,26 @@ static void UpdateDrawFrame(void)
 
     rlImGuiBegin();
 
-    // The "?" tutorial: a plain-text how-to-play window
+    // The "?" tutorial: a slideshow -- one staged screenshot per rule with a
+    // one-liner caption, paged with prev/next
     if (tutorialOpen)
     {
-        igSetNextWindowSize((ImVec2_c){430, 500}, ImGuiCond_FirstUseEver);
+        igSetNextWindowSize((ImVec2_c){420, 500}, ImGuiCond_FirstUseEver);
         igSetNextWindowPos((ImVec2_c){40, 90}, ImGuiCond_FirstUseEver, (ImVec2_c){0, 0});
         igBegin("how to play", &tutorialOpen, 0);
-        igTextWrapped("GOAL");
-        igTextWrapped("Reassemble the hex king: merge every card kind up to level 4. "
-                      "A level 4 card becomes one of his four sealed pieces -- hold all four and you win. "
-                      "Lose all your hearts and the run is over.");
-        igSeparator();
-        igTextWrapped("CARDS");
-        igTextWrapped("Drag a card from your hand onto an empty tile to play it. "
-                      "Dropping a card onto a placed card of the SAME kind and SAME level merges them into one card a level higher (2048 rules). "
-                      "Every placed card only stays on the field a few turns (the number on its tile), then returns to your hand.");
-        igSeparator();
-        igTextWrapped("LEYLINES");
-        igTextWrapped("Only leyline tiles conduct, starting from the tile you stand on. "
-                      "Spell cards work while a live leyline chain touches their tile -- they tap the network but never extend it.");
-        igSeparator();
-        igTextWrapped("THE SPELLS");
-        igTextWrapped("FIREBALL: while connected it banks one charge per turn, and at 2 charges it detonates, "
-                      "destroying every enemy within 1 tile. It fires BEFORE the enemies act. "
-                      "A level 1 fireball leaves a husk blocking its tile for a turn; higher levels skip the wait.");
-        igTextWrapped("WARD: enemies smash it before anything else in their reach, and it costs you no heart. "
-                      "A used ward comes back exhausted and rests in your hand for one turn.");
-        igTextWrapped("HEX: a curse trap. The enemy that strikes it fights for YOU for 1/2/3 turns (by level), "
-                      "hunting other enemies. Cursed enemies wear a purple hull.");
-        igSeparator();
-        igTextWrapped("ENEMIES");
-        igTextWrapped("Each enemy telegraphs its next action: a solid red arch is a move, a pulsing dashed arc "
-                      "with a \"!\" is an attack. They smash any card in reach (wards first) -- costing you a heart -- "
-                      "and hit YOU for 2 hearts when they reach you with no card to bait them. "
-                      "Every kill drops a card pickup where the enemy died.");
-        igSeparator();
-        igTextWrapped("THE TURN");
-        igTextWrapped("You may walk 1 tile per turn (drag yourself). The crystal's tile is solid -- walk around it. "
-                      "Click the big crystal button on the right to end the turn. "
-                      "The crystal grows a free card beside itself every 2 turns; a new enemy arrives every 3. "
-                      "Stand on a pickup to collect it.");
+
+        igTextWrapped("%s", tutorialCaptions[tutorialSlide]);
+        igSpacing();
+        if (tutorialTex[tutorialSlide].id != 0) rlImGuiImageSize(&tutorialTex[tutorialSlide], 380, 380);
+        else igTextWrapped("(slide image missing -- run the game with --tutorial-shots to regenerate)");
+        igSpacing();
+
+        if (igButton("< prev", (ImVec2_c){0, 0}) && (tutorialSlide > 0)) tutorialSlide--;
+        igSameLine(0.0f, 12.0f);
+        igText("%d / %d", tutorialSlide + 1, TUTORIAL_SLIDES);
+        igSameLine(0.0f, 12.0f);
+        if (igButton("next >", (ImVec2_c){0, 0}) && (tutorialSlide < TUTORIAL_SLIDES - 1)) tutorialSlide++;
+
         igEnd();
     }
 
@@ -4698,13 +4799,38 @@ static void UpdateDrawFrame(void)
         static int shotFrame = 0;
         if (++shotFrame == 95) TakeScreenshot("det_check.png");
     }
+
+    // --tutorial-shots: let each staged scene settle a beat, capture it
+    // downscaled, stage the next, and quit after the last
+    if (shotStage >= 0)
+    {
+        shotTimer--;
+        if (shotTimer <= 0)
+        {
+            Image shot = LoadImageFromScreen();
+            ImageResize(&shot, 360, 360);
+            ExportImage(shot, TextFormat("tutorial_%d.png", shotStage));
+            UnloadImage(shot);
+            shotStage++;
+            if (shotStage >= TUTORIAL_SLIDES)
+            {
+                shotStage = -1;
+                shotQuit = true;
+            }
+            else
+            {
+                StageTutorialScene(shotStage);
+                shotTimer = 45;
+            }
+        }
+    }
     //----------------------------------------------------------------------------------
 }
 
 //------------------------------------------------------------------------------------
 // Program main entry point
 //------------------------------------------------------------------------------------
-int main(void)
+int main(int argc, char *argv[])
 {
 #if !defined(_DEBUG)
     SetTraceLogLevel(LOG_NONE); // Disable raylib trace log messages
@@ -4906,6 +5032,20 @@ int main(void)
     SpawnHexGrid();
     ResetGame(); // Starting cast: hearts, hand, player, first enemy, first plan
 
+    // Tutorial slide textures (missing files just skip the image in the window)
+    for (int n = 0; n < TUTORIAL_SLIDES; n++)
+    {
+        tutorialTex[n] = LoadTexture(TextFormat("resources/tutorial/tutorial_%d.png", n));
+    }
+
+    // --tutorial-shots: stage scene 0 and let the frame hook walk the rest
+    if ((argc > 1) && TextIsEqual(argv[1], "--tutorial-shots"))
+    {
+        StageTutorialScene(0);
+        shotStage = 0;
+        shotTimer = 45;
+    }
+
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
 #else
@@ -4913,7 +5053,7 @@ int main(void)
     //--------------------------------------------------------------------------------------
 
     // Main game loop
-    while (!WindowShouldClose()) // Detect window close button
+    while (!WindowShouldClose() && !shotQuit) // Close button, or the shot run finishing
     {
         UpdateDrawFrame();
     }
@@ -4972,6 +5112,7 @@ int main(void)
     UnloadSound(sndHit);
     UnloadSound(sndLever);
     UnloadSound(sndBoom);
+    for (int n = 0; n < TUTORIAL_SLIDES; n++) UnloadTexture(tutorialTex[n]);
     UnloadMusicStream(bgNoise);
     CloseAudioDevice();
 
