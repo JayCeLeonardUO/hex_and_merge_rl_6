@@ -49,6 +49,9 @@
 #define FIREBALL_CHARGE_NEEDED 2 // Connected lever pulls before a fireball detonates
 #define FIREBALL_AOE_RADIUS 1    // Detonation reach in tiles
 
+#define CRYSTAL_GIFT_PERIOD 2 // Turns between the center crystal's card gifts
+#define ENEMY_SPAWN_PERIOD 3  // Turns between enemy reinforcements
+
 #define HEX_CELL_OFFBOARD 999 // Axial coord that can never be on the board
 
 // Cards: blank rectangles fanned along the bottom edge until placed on the board
@@ -93,6 +96,7 @@ typedef enum EntityKind
     ENTITY_CARD,
     ENTITY_PLAYER,
     ENTITY_ENEMY,
+    ENTITY_PICKUP, // A card gift from the center crystal, collected by standing on it
     NUM_ENTITY_KINDS
 } EntityKind;
 
@@ -121,6 +125,7 @@ typedef enum
     CARD_LVL_1 = 1,
     CARD_LVL_2,
     CARD_LVL_3,
+    CARD_LVL_4, // Exodia piece: flies to the hand as an inert trophy; all four kinds at 4 wins
     NUM_CARD_LEVELS
 } CardLevel;
 
@@ -131,8 +136,8 @@ static const char *cardKindTooltips[NUM_CARD_KINDS] = {
     "",
     "conduit: its tile joins the leyline network",
     "leyline-charged: detonates at 2 charges, hits all within 1 tile",
-    "curse spell (logic TBD)",
-    "baits enemy strikes in range, absorbs the hit for no heart",
+    "curse trap: the enemy that strikes it fights for you 1/2/3 turns",
+    "baits enemy strikes, absorbs the hit for no heart, rests 1 turn after",
 };
 static const Color cardKindTints[NUM_CARD_KINDS] = {
     {255, 255, 255, 255}, // CARD_NONE
@@ -229,7 +234,9 @@ typedef struct Entity
 
     // Hex cell: committed turns a spent lvl 1 fireball husk keeps blocking
     // this tile (cardKind/cardLevel stay set so the husk can hand the card
-    // back when it cools); 0 = no husk
+    // back when it cools); 0 = no husk.
+    // Card: committed turns this card is DEAD in the hand (ungrabbable,
+    // grayed) -- a used ward comes home exhausted for one turn
     int huskTurns;
 
     // Enemy Shader params
@@ -244,6 +251,11 @@ typedef struct Entity
     int enemyIntentKind; // ENEMY_INTENT_*
     int enemyIntentQ;    // Target tile of the plan
     int enemyIntentR;
+
+    // Enemy: committed turns left fighting for the player after striking a
+    // hex card (0 = normal). While set the AI hunts other enemies instead of
+    // cards/player and the outline hull renders curse-purple
+    int hexedTurns;
 
     bool IsDraggable;
 
@@ -271,15 +283,6 @@ typedef struct HoverReticle
     float bobPhase;   // Radians, integrated for the float bob
     bool active;      // False while nothing is hovered; the next hover re-snaps in place
 } HoverReticle;
-
-// Turn lever: slide-to-commit widget on the right edge; a full pull ends the turn
-typedef struct TurnLeverState
-{
-    float pull;     // 0..1 knob position along the track (0 = resting at the top)
-    float velocity; // Pull units per second, integrated for the spring back
-    bool dragging;  // True while the knob is grabbed
-    bool fired;     // True once this pull has committed the turn; resets on the next grab
-} TurnLeverState;
 
 // One-shot impact effect at the tile where a card just landed
 typedef struct ImpactFx
@@ -312,10 +315,9 @@ static Texture2D leverTrackTexture = {0}; // Turn lever track (resources/lever_t
 static Texture2D leverFillTexture = {0};  // Turn lever pull fill (resources/lever_fill_120x8.png)
 static Texture2D leverKnobTexture = {0};  // Turn lever grab point (resources/lever_knob_16x18.png)
 
-static TurnLeverState turnLever = {0};
-static bool leverWantsMouse = false;     // True when the lever owns the mouse; board ignores it
-static Vector2 leverKnobScreenPos = {0}; // Knob center this frame; the 3D gem knob draws here
-                                         // (set during the lever step, so it lags one frame like ImGui)
+static bool leverWantsMouse = false;     // True when the turn button owns the mouse; board ignores it
+static Vector2 leverKnobScreenPos = {0}; // Button center this frame; the 3D gem crystal draws here
+                                         // (set during the button step, so it lags one frame like ImGui)
 
 static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
 
@@ -718,10 +720,12 @@ static const char *enemyOutlineFS =
     // programs whose shared uniforms differ in precision between stages
     "uniform highp float time;\n"
     "uniform float alpha;\n"
+    "uniform float hexed;\n"
     "void main()\n"
     "{\n"
     "    float pulse = 0.85 + 0.15*sin(time*2.6);\n"
-    "    gl_FragColor = vec4(vec3(1.0, 0.08, 0.06)*pulse, alpha);\n"
+    "    vec3 hull = mix(vec3(1.0, 0.08, 0.06), vec3(0.72, 0.39, 0.92), hexed);\n"
+    "    gl_FragColor = vec4(hull*pulse, alpha);\n"
     "}\n";
 #else
 static const char *enemyVS =
@@ -789,11 +793,13 @@ static const char *enemyOutlineFS =
     "in vec3 fragBary;\n"
     "uniform float time;\n"
     "uniform float alpha;\n"
+    "uniform float hexed;\n"
     "out vec4 finalColor;\n"
     "void main()\n"
     "{\n"
     "    float pulse = 0.85 + 0.15*sin(time*2.6);\n"
-    "    finalColor = vec4(vec3(1.0, 0.08, 0.06)*pulse, alpha);\n"
+    "    vec3 hull = mix(vec3(1.0, 0.08, 0.06), vec3(0.72, 0.39, 0.92), hexed);\n"
+    "    finalColor = vec4(hull*pulse, alpha);\n"
     "}\n";
 #endif
 
@@ -811,6 +817,7 @@ typedef struct EnemyShaderLocs
     int lineWidth;
     int expand;
     int alpha;
+    int hexed;
 } EnemyShaderLocs;
 
 static Shader enemyShader = {0};
@@ -985,6 +992,7 @@ static EnemyShaderLocs GetEnemyShaderLocs(Shader shader)
         .lineWidth = GetShaderLocation(shader, "lineWidth"),
         .expand = GetShaderLocation(shader, "expand"),
         .alpha = GetShaderLocation(shader, "alpha"),
+        .hexed = GetShaderLocation(shader, "hexed"),
     };
     return locs;
 }
@@ -1132,7 +1140,8 @@ static float gemIor = 1.45f;
 static float gemStrength = 0.35f;
 static float gemChromatic = 0.05f;
 static float gemMilkiness = 0.15f;      // Inverse gem (tile) milkiness, 0 = clear
-static float leverGemMilkiness = 0.35f; // Lever knob crystal milkiness
+static float leverGemMilkiness = 0.35f; // Turn button crystal milkiness at rest
+static float leverGemMilkyNow = 0.35f;  // Eased milkiness this frame: clouds up while hovered
 
 static float tileArtScale = 1.0f; // Tile-top art size, relative to the tile (debug tweakable)
 
@@ -1340,6 +1349,19 @@ static bool mouseOnPlane = false; // False when the mouse ray misses the board p
 static bool uiWantsMouse = false; // True when ImGui is using the mouse; board ignores clicks
 
 static int gameTurn = 0;
+static int lastCommittedTurn = 0; // gameTurn the turn-commit pass last ran for
+static int playerMovedTurn = -1;  // gameTurn of the player's last committed step
+
+// Game flow: the board simulates (and animates) in every state, but input
+// only reaches it while playing; start and game over draw as modal overlays
+typedef enum
+{
+    GAME_STATE_START = 0,
+    GAME_STATE_PLAYING,
+    GAME_STATE_OVER,
+    GAME_STATE_WIN, // All four exodia pieces assembled
+} GameState;
+static GameState gameState = GAME_STATE_START;
 
 // 2.5D camera: tilted orthographic view down at the board plane (y = 0);
 // no perspective foreshortening, so tiles read as a flat iso board
@@ -1405,6 +1427,13 @@ static int HexDistance(int q1, int r1, int q2, int r2)
 static bool HexOnBoard(int q, int r)
 {
     return (abs(q) <= GRID_RADIUS) && (abs(r) <= GRID_RADIUS) && (abs(q + r) <= GRID_RADIUS);
+}
+
+// The center crystal owns its tile: solid to the player, enemies, and card
+// placement alike (its gifts drop on the surrounding tiles)
+static bool HexTileSolid(int q, int r)
+{
+    return (q == 0) && (r == 0);
 }
 
 // Leyline network, indexed [q + GRID_RADIUS][r + GRID_RADIUS]. ONLY leyline
@@ -1759,101 +1788,65 @@ static void AdvanceTurn(void)
 {
 }
 
-// Turn lever step: a slide-and-drag knob on a vertical track at the right
-// edge. Pulling it all the way down commits the turn -- screen shake, turn
-// counter increments -- and the knob springs back to the top. The turn change
-// logic lives here. Update + draw in one step (screen space, itch pixel art)
+// Screen text with a black border, readable over any backdrop: an 8-way
+// black ring (thicker for big type) under the colored fill
+static void DrawTextOutlined(const char *text, int x, int y, int size, Color color)
+{
+    int o = (size >= 40) ? 3 : 2;
+    for (int oy = -o; oy <= o; oy += o)
+    {
+        for (int ox = -o; ox <= o; ox += o)
+        {
+            if ((ox != 0) || (oy != 0)) DrawText(text, x + ox, y + oy, size, Fade(BLACK, (float)color.a / 255.0f));
+        }
+    }
+    DrawText(text, x, y, size, color);
+}
+
+// Turn button: the crystal on the right edge commits the turn on click. It
+// stays a crystal -- the spinning 3D gem draws at leverKnobScreenPos in its
+// own pass -- and hovering it clouds the crystal up (milkiness eases toward
+// milky, back to the tweakable base when the mouse leaves)
 static void TurnLever(void)
 {
-    const float cx = 664.0f;               // Track center x, screen px
-    const float top = 212.0f;              // Track top y
-    float trackLen = 128.0f * leverScale;  // Track art is 128px long at 1x (debug tweakable)
-    float trackWidth = 16.0f * leverScale; // Track art is 16px wide
-    float knobHalfW = 12.0f * leverScale;  // Grab point: 16x18 coin art at 1.5x the track scale
-    float knobHalfH = 13.5f * leverScale;
-    float travelTop = top + 10.0f * leverScale; // Knob travel range, inset from the track ends
-    float travelLen = trackLen - 20.0f * leverScale;
-    const float triggerPull = 0.95f; // Pull fraction that commits the turn
+    const float cx = 650.0f; // Button center, screen px
+    const float cy = 276.0f;
+    float hitRadius = 26.0f * leverScale;
 
     float dt = GetFrameTime();
     if (dt > 0.05f) dt = 0.05f;
 
     Vector2 mouse = GetMousePosition();
-    float knobY = travelTop + turnLever.pull * travelLen;
+    bool hovered = CheckCollisionPointCircle(mouse, (Vector2){cx, cy}, hitRadius);
+    leverWantsMouse = hovered;
 
-    // Bounds of the lever: the knob owns the mouse while hovered or held
-    Rectangle knobRect = {cx - knobHalfW, knobY - knobHalfH, knobHalfW * 2.0f, knobHalfH * 2.0f};
-    bool overKnob = CheckCollisionPointRec(mouse, knobRect);
-    leverWantsMouse = (overKnob || turnLever.dragging);
-
-    // Standard slide and drag: grab on press, knob sticks to the cursor and
-    // stays in hand until the mouse lifts (even after the turn commits)
-    if (overKnob && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    if (hovered && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
     {
-        turnLever.dragging = true;
-        turnLever.fired = false;
-    }
-    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) turnLever.dragging = false;
-
-    if (turnLever.dragging)
-    {
-        float pullTarget = (mouse.y - travelTop) / travelLen;
-        if (pullTarget < 0.0f) pullTarget = 0.0f;
-        if (pullTarget > 1.0f) pullTarget = 1.0f;
-        turnLever.pull = pullTarget;
-        turnLever.velocity = 0.0f; // Spring starts from rest when the knob is released
-
-        // Pulled all the way: the turn changes here, once per grab; the knob
-        // is NOT released -- it springs home when the mouse lifts
-        if (!turnLever.fired && (turnLever.pull >= triggerPull))
-        {
-            gameTurn++;
-            shakeTimeLeft = SHAKE_DURATION;
-            turnLever.fired = true;
-            PlaySound(sndLever);
-            LOG("INFO: TURN: lever pulled, turn is now %d\n", gameTurn);
-        }
-    }
-    else if ((turnLever.pull > 0.0f) || (turnLever.velocity != 0.0f))
-    {
-        // Under-damped spring back to the top; hitting the top rebounds with
-        // some energy left, so the knob visibly bounces before settling
-        const float stiffness = 320.0f;
-        const float damping = 16.0f;
-        const float restitution = 0.45f;
-        turnLever.velocity += (-turnLever.pull * stiffness - turnLever.velocity * damping) * dt;
-        turnLever.pull += turnLever.velocity * dt;
-        if (turnLever.pull < 0.0f)
-        {
-            turnLever.pull = 0.0f;
-            turnLever.velocity = -turnLever.velocity * restitution; // The bounce
-            if (fabsf(turnLever.velocity) < 0.08f) turnLever.velocity = 0.0f;
-        }
+        gameTurn++;
+        shakeTimeLeft = SHAKE_DURATION;
+        PlaySound(sndLever);
+        LOG("INFO: TURN: button pressed, turn is now %d\n", gameTurn);
     }
 
-    knobY = travelTop + turnLever.pull * travelLen;
+    // The hover read: the crystal clouds up, eased both ways
+    float milkyTarget = hovered ? (leverGemMilkiness + 0.5f) : leverGemMilkiness;
+    if (milkyTarget > 1.0f) milkyTarget = 1.0f;
+    leverGemMilkyNow += (milkyTarget - leverGemMilkyNow) * (1.0f - expf(-12.0f * dt));
 
-    // Draw: track and fill are horizontal art rotated 90 degrees to stand
-    // vertical (origin at the left-center makes them hang down from `top`)
-    DrawTexturePro(leverTrackTexture, (Rectangle){0, 0, 128, 16},
-                   (Rectangle){cx, top, trackLen, trackWidth}, (Vector2){0, trackWidth / 2.0f}, 90.0f, WHITE);
-    if (turnLever.pull > 0.02f)
-    {
-        DrawTexturePro(leverFillTexture, (Rectangle){0, 0, 120.0f * turnLever.pull, 8},
-                       (Rectangle){cx, top + 4.0f * leverScale, (trackLen - 8.0f * leverScale) * turnLever.pull, trackWidth / 2.0f},
-                       (Vector2){0, trackWidth / 4.0f}, 90.0f, WHITE);
-    }
-    // Knob: a spinning 3D gem drawn in its own pass after this one; the flat
-    // coin art only shows when the gem model is missing
-    leverKnobScreenPos = (Vector2){cx, knobY};
+    // The crystal itself is the spinning 3D gem drawn in its own pass after
+    // this one; the flat coin art only shows when the gem model is missing
+    leverKnobScreenPos = (Vector2){cx, cy};
     if (!centerGemLoaded)
     {
         DrawTexturePro(leverKnobTexture, (Rectangle){0, 0, 16, 18},
-                       (Rectangle){cx, knobY, knobHalfW * 2.0f, knobHalfH * 2.0f}, (Vector2){knobHalfW, knobHalfH}, 0.0f, WHITE);
+                       (Rectangle){cx, cy, 24.0f * leverScale, 27.0f * leverScale},
+                       (Vector2){12.0f * leverScale, 13.5f * leverScale}, 0.0f, WHITE);
     }
 
+    // "next turn" label: yellow with a black outline so it reads on any sky
+    DrawTextOutlined("next turn", (int)cx - MeasureText("next turn", 22) / 2, (int)(cy + hitRadius) + 8, 22, (Color){255, 220, 60, 255});
     const char *turnText = TextFormat("turn %d", gameTurn);
-    DrawText(turnText, (int)cx - MeasureText(turnText, 20) / 2, (int)(top + trackLen) + 12, 20, LIGHTGRAY);
+    DrawTextOutlined(turnText, (int)cx - MeasureText(turnText, 20) / 2, (int)(cy + hitRadius) + 36, 20, LIGHTGRAY);
 }
 
 // Spawn one ENTITY_HEX_CELL per cell of the hexagonal board
@@ -2120,8 +2113,9 @@ static void SpawnEnemy(int q, int r)
 
 // Lift a placed card off its tile and back into the hand, kind and level
 // intact, springing into the fan from the tile it left. Shared by the
-// default turn return and by enemies striking cards off the board
-static void ReturnPlacedCard(Entity *cell)
+// default turn return and by enemies striking cards off the board. Returns
+// the hand card (NULL if the pool is full) so callers can mark it exhausted
+static Entity *ReturnPlacedCard(Entity *cell)
 {
     Entity *back = EntitySpawn(ENTITY_CARD);
     if (back != NULL)
@@ -2132,8 +2126,11 @@ static void ReturnPlacedCard(Entity *cell)
         back->tint = cardKindTints[cell->cardKind];
         back->cardMode = CARD_REC_FORM;
         back->modelIndex = cell->modelIndex;
-        snprintf(back->tooltip, sizeof(back->tooltip), "%s -- stays %d turns on the field",
-                 cardKindTooltips[back->cardKind], cardKindLifetimes[back->cardKind]);
+        if (back->cardLevel >= CARD_LVL_4)
+            snprintf(back->tooltip, sizeof(back->tooltip), "exodia piece! collect all four kinds at lvl 4 to win");
+        else
+            snprintf(back->tooltip, sizeof(back->tooltip), "%s -- stays %d turns on the field",
+                     cardKindTooltips[back->cardKind], cardKindLifetimes[back->cardKind]);
         Vector2 lift = GetWorldToScreen(cell->position, camera);
         back->position = (Vector3){lift.x, lift.y, 0.0f};
     }
@@ -2146,6 +2143,23 @@ static void ReturnPlacedCard(Entity *cell)
     cell->turnLifetime = 0;
     cell->fireballCharge = 0;
     cell->huskTurns = 0;
+    return back;
+}
+
+// Every slain enemy sheds a card: a pickup left on the tile it died on,
+// collected like the crystal's gifts by standing on it. Enemies die to a
+// single hit, so every kill site pairs this with the despawn
+static void SpawnEnemyDrop(int q, int r)
+{
+    Entity *drop = EntitySpawn(ENTITY_PICKUP);
+    if (drop == NULL) return;
+    drop->q = q;
+    drop->r = r;
+    drop->position = HexAxialToWorld(q, r);
+    drop->cardKind = (CardKind)GetRandomValue(CARD_LEYLINE, CARD_WARD);
+    drop->tint = cardKindTints[drop->cardKind];
+    drop->modelIndex = (kindModelIndex[drop->cardKind] >= 0) ? kindModelIndex[drop->cardKind] : 0;
+    LOG("INFO: PICKUP: slain enemy dropped a %s card at (q=%d, r=%d)\n", cardKindNames[drop->cardKind], q, r);
 }
 
 // Fireball detonation: a radius-FIREBALL_AOE_RADIUS blast that destroys
@@ -2166,6 +2180,7 @@ static void DetonateFireball(Entity *cell)
         if (enemy->kind != ENTITY_ENEMY) continue;
         if (HexDistance(cell->q, cell->r, enemy->q, enemy->r) > FIREBALL_AOE_RADIUS) continue;
         LOG("INFO: FIREBALL: enemy at (q=%d, r=%d) destroyed\n", enemy->q, enemy->r);
+        SpawnEnemyDrop(enemy->q, enemy->r); // the drop appends at the tail, then the despawn swaps it into this slot
         EntityDespawn(i);
     }
 
@@ -2279,13 +2294,16 @@ static void DrawEnemyInstance(const Entity *enemy, float airTime)
     enemyPos.y = HEX_TILE_HEIGHT + enemySize + 0.5f + sinf(airTime * 1.3f + phase) * 0.08f;
     if (enemy->selected) enemyPos.y += 0.25f; // Lifted while grabbed
 
-    // L4D red outline: inverted hulls under the body -- a solid ring plus a
-    // fainter, fatter additive glow ring, tracking the spikes
+    // L4D outline: inverted hulls under the body -- a solid ring plus a
+    // fainter, fatter additive glow ring, tracking the spikes. Danger red
+    // normally, curse purple while this enemy is hexed
     if (enemyOutline > 0.002f)
     {
         float glowExpand = enemyOutline * 2.6f;
         float solidAlpha = 1.0f;
         float glowAlpha = 0.28f;
+        float hexed = (enemy->hexedTurns > 0) ? 1.0f : 0.0f;
+        SetShaderValue(enemyOutlineShader, enemyOutlineLocs.hexed, &hexed, SHADER_UNIFORM_FLOAT);
         SetShaderValue(enemyOutlineShader, enemyOutlineLocs.yaw, &enemyYaw, SHADER_UNIFORM_FLOAT);
         SetShaderValue(enemyOutlineShader, enemyOutlineLocs.pulseSpeed, &enemy->enemyPulseSpeed, SHADER_UNIFORM_FLOAT);
         SetShaderValue(enemyOutlineShader, enemyOutlineLocs.breatheAmp, &enemy->enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
@@ -2333,11 +2351,54 @@ static Entity *EnemyStrikeTarget(const Entity *enemy)
     return firstCard;
 }
 
-// Where this enemy would stand after its chase steps toward the player:
-// greedy neighbor steps, stopping once adjacent, never onto another enemy
+// Where this enemy would stand after its chase steps toward the target: a
+// BFS distance field flooded from the target over walkable tiles (the
+// crystal's solid tile and tiles held by other enemies block), walked
+// downhill up to moveRange steps. Routing, not greed: the enemy goes AROUND
+// the crystal instead of stalling behind it
 static void EnemyChaseDestination(const Entity *enemy, const Entity *player, int *outQ, int *outR)
 {
     static const int dirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+
+    bool blocked[LEY_W][LEY_W] = {0};
+    for (int j = 0; j < entityCount; j++)
+    {
+        const Entity *other = &entities[j];
+        if ((other->kind != ENTITY_ENEMY) || (other == enemy)) continue;
+        if (HexOnBoard(other->q, other->r)) blocked[other->q + GRID_RADIUS][other->r + GRID_RADIUS] = true;
+    }
+
+    // Flood from the target: field = walking distance to it, -1 unreachable
+    int field[LEY_W][LEY_W];
+    memset(field, -1, sizeof(field));
+    int queueQ[LEY_W * LEY_W];
+    int queueR[LEY_W * LEY_W];
+    int head = 0;
+    int tail = 0;
+    field[player->q + GRID_RADIUS][player->r + GRID_RADIUS] = 0;
+    queueQ[tail] = player->q;
+    queueR[tail] = player->r;
+    tail++;
+    while (head < tail)
+    {
+        int q = queueQ[head];
+        int r = queueR[head];
+        head++;
+        for (int d = 0; d < 6; d++)
+        {
+            int nq = q + dirs[d][0];
+            int nr = r + dirs[d][1];
+            if (!HexOnBoard(nq, nr) || HexTileSolid(nq, nr)) continue;
+            if (blocked[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
+            if (field[nq + GRID_RADIUS][nr + GRID_RADIUS] >= 0) continue;
+            field[nq + GRID_RADIUS][nr + GRID_RADIUS] = field[q + GRID_RADIUS][r + GRID_RADIUS] + 1;
+            queueQ[tail] = nq;
+            queueR[tail] = nr;
+            tail++;
+        }
+    }
+
+    // Walk the field downhill, stopping once adjacent to the target
     int q = enemy->q;
     int r = enemy->r;
     for (int step = 0; step < enemy->enemyMoveRange; step++)
@@ -2346,26 +2407,18 @@ static void EnemyChaseDestination(const Entity *enemy, const Entity *player, int
 
         int bestQ = q;
         int bestR = r;
-        int bestDist = HexDistance(q, r, player->q, player->r);
+        int bestField = field[q + GRID_RADIUS][r + GRID_RADIUS];
+        if (bestField < 0) break; // sealed off entirely: hold
         for (int d = 0; d < 6; d++)
         {
             int nq = q + dirs[d][0];
             int nr = r + dirs[d][1];
-            if (!HexOnBoard(nq, nr)) continue;
-
-            bool occupied = false;
-            for (int j = 0; j < entityCount; j++)
+            if (!HexOnBoard(nq, nr) || HexTileSolid(nq, nr)) continue;
+            if (blocked[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
+            int f = field[nq + GRID_RADIUS][nr + GRID_RADIUS];
+            if ((f >= 0) && (f < bestField))
             {
-                const Entity *other = &entities[j];
-                if ((other->kind != ENTITY_ENEMY) || (other == enemy)) continue;
-                if ((other->q == nq) && (other->r == nr)) occupied = true;
-            }
-            if (occupied) continue;
-
-            int dist = HexDistance(nq, nr, player->q, player->r);
-            if (dist < bestDist)
-            {
-                bestDist = dist;
+                bestField = f;
                 bestQ = nq;
                 bestR = nr;
             }
@@ -2402,32 +2455,64 @@ static void EnemyAIExecuteIntents(void)
                 shakeTimeLeft = SHAKE_DURATION;
                 PlaySound(sndHit);
                 bool warded = (cell->cardKind == CARD_WARD); // Wards soak the hit for free
-                ReturnPlacedCard(cell);                      // forced back to the hand...
-                for (int h = 0; !warded && (h < entityCount); h++)
+                bool hexTrap = (cell->cardKind == CARD_HEX); // Hexes curse the striker
+                if (hexTrap)
+                {
+                    // +1 because this turn's wear-off pass (right after the
+                    // execute) eats a stack before the curse ever fights
+                    enemy->hexedTurns = (int)cell->cardLevel + 1;
+                    LOG("INFO: HEX: enemy at (q=%d, r=%d) cursed, fights for you %d turns\n",
+                        enemy->q, enemy->r, (int)cell->cardLevel);
+                }
+                Entity *back = ReturnPlacedCard(cell); // forced back to the hand...
+                if (warded && (back != NULL)) back->huskTurns = 1; // used wards come home exhausted for a turn
+                for (int h = 0; !warded && !hexTrap && (h < entityCount); h++)
                 {
                     if ((entities[h].kind == ENTITY_HEALTH_BAR) && (entities[h].health > 0)) entities[h].health--;
-                } // ...and every unwarded forced return costs the player a heart
+                } // ...an unwarded, unhexed forced return costs the player a heart
                 break;
             }
         }
         else if (enemy->enemyIntentKind == ENEMY_INTENT_ATTACK)
         {
-            // Every board change re-plans, so the intent tile still holds the
-            // player: land the hit for 2 hearts
-            for (int j = 0; j < entityCount; j++)
+            if (enemy->hexedTurns > 0)
             {
-                Entity *hit = &entities[j];
-                if (hit->kind == ENTITY_PLAYER)
+                // Hexed: the attack lands on the enemy standing on the
+                // intent tile (whiffs if it stepped away this same commit)
+                for (int j = entityCount - 1; j >= 0; j--)
                 {
-                    impact = (ImpactFx){.position = hit->position, .tint = (Color){235, 70, 60, 255}, .age = 0.0f, .active = true};
+                    Entity *foe = &entities[j];
+                    if ((foe->kind != ENTITY_ENEMY) || (foe == enemy) || (foe->hexedTurns > 0)) continue;
+                    if ((foe->q != enemy->enemyIntentQ) || (foe->r != enemy->enemyIntentR)) continue;
+
+                    LOG("INFO: HEX: cursed enemy destroyed foe at (q=%d, r=%d)\n", foe->q, foe->r);
+                    impact = (ImpactFx){.position = foe->position, .tint = (Color){185, 100, 235, 255}, .age = 0.0f, .active = true};
+                    shakeTimeLeft = SHAKE_DURATION;
+                    PlaySound(sndHit);
+                    SpawnEnemyDrop(foe->q, foe->r);
+                    EntityDespawn(j); // swap-back: only already-visited or skippable slots move
+                    break;
                 }
-                if (hit->kind != ENTITY_HEALTH_BAR) continue;
-                hit->health -= 2;
-                if (hit->health < 0) hit->health = 0;
             }
-            shakeTimeLeft = SHAKE_DURATION;
-            PlaySound(sndHit);
-            LOG("INFO: ENEMY: hit the player for 2 at (q=%d, r=%d)\n", enemy->enemyIntentQ, enemy->enemyIntentR);
+            else
+            {
+                // Every board change re-plans, so the intent tile still holds
+                // the player: land the hit for 2 hearts
+                for (int j = 0; j < entityCount; j++)
+                {
+                    Entity *hit = &entities[j];
+                    if (hit->kind == ENTITY_PLAYER)
+                    {
+                        impact = (ImpactFx){.position = hit->position, .tint = (Color){235, 70, 60, 255}, .age = 0.0f, .active = true};
+                    }
+                    if (hit->kind != ENTITY_HEALTH_BAR) continue;
+                    hit->health -= 2;
+                    if (hit->health < 0) hit->health = 0;
+                }
+                shakeTimeLeft = SHAKE_DURATION;
+                PlaySound(sndHit);
+                LOG("INFO: ENEMY: hit the player for 2 at (q=%d, r=%d)\n", enemy->enemyIntentQ, enemy->enemyIntentR);
+            }
         }
         else if (enemy->enemyIntentKind == ENEMY_INTENT_MOVE)
         {
@@ -2480,6 +2565,46 @@ static void EnemyAIUpdate(void)
 
         enemy->enemyIntentKind = ENEMY_INTENT_NONE;
 
+        // Hexed: fights for the player -- hunts the nearest unhexed enemy
+        // (attack when adjacent, chase otherwise), ignoring cards and the
+        // player entirely until the curse wears off
+        if (enemy->hexedTurns > 0)
+        {
+            Entity *prey = NULL;
+            int preyDist = 0;
+            for (int j = 0; j < entityCount; j++)
+            {
+                Entity *other = &entities[j];
+                if ((other->kind != ENTITY_ENEMY) || (other == enemy) || (other->hexedTurns > 0)) continue;
+                int dist = HexDistance(enemy->q, enemy->r, other->q, other->r);
+                if ((prey == NULL) || (dist < preyDist))
+                {
+                    prey = other;
+                    preyDist = dist;
+                }
+            }
+            if (prey == NULL) continue; // no foes left: hold
+
+            if (preyDist <= 1)
+            {
+                enemy->enemyIntentKind = ENEMY_INTENT_ATTACK;
+                enemy->enemyIntentQ = prey->q;
+                enemy->enemyIntentR = prey->r;
+            }
+            else
+            {
+                int destQ, destR;
+                EnemyChaseDestination(enemy, prey, &destQ, &destR);
+                if ((destQ != enemy->q) || (destR != enemy->r))
+                {
+                    enemy->enemyIntentKind = ENEMY_INTENT_MOVE;
+                    enemy->enemyIntentQ = destQ;
+                    enemy->enemyIntentR = destR;
+                }
+            }
+            continue;
+        }
+
         Entity *strike = EnemyStrikeTarget(enemy);
         if (strike != NULL)
         {
@@ -2510,6 +2635,60 @@ static void EnemyAIUpdate(void)
             enemy->enemyIntentR = destR;
         }
     }
+}
+
+// Fresh run: sweep every non-cell entity, wipe the board state off the
+// cells (their generated shell meshes survive), and rebuild the starting
+// cast. Used at boot and by the game over screen's restart
+static void ResetGame(void)
+{
+    for (int i = entityCount - 1; i >= 0; i--)
+    {
+        if (entities[i].kind != ENTITY_HEX_CELL) EntityDespawn(i);
+    }
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *cell = &entities[i];
+        cell->value = 0;
+        cell->cardKind = CARD_NONE;
+        cell->cardLevel = 0;
+        cell->isLeyline = false;
+        cell->inDanger = false;
+        cell->turnLifetime = 0;
+        cell->fireballCharge = 0;
+        cell->huskTurns = 0;
+        cell->hovered = false;
+    }
+    gameTurn = 0;
+    lastCommittedTurn = 0;
+    playerMovedTurn = -1;
+
+    Entity *healthBar = EntitySpawn(ENTITY_HEALTH_BAR);
+    if (healthBar != NULL)
+    {
+        healthBar->position = (Vector3){24.0f, 64.0f, 0.0f}; // Screen pixels for UI kinds
+        healthBar->health = 3;
+        healthBar->maxHealth = 5;
+    }
+
+    // Starting hand: always two leylines, a hex, a ward, and a fireball
+    SpawnCardKind(CARD_LEYLINE);
+    SpawnCardKind(CARD_LEYLINE);
+    SpawnCardKind(CARD_HEX);
+    SpawnCardKind(CARD_WARD);
+    SpawnCardKind(CARD_FIREBALL);
+
+    Entity *playerSpawn = EntitySpawn(ENTITY_PLAYER);
+    if (playerSpawn != NULL)
+    {
+        playerSpawn->q = 0; // Starts beside the crystal (the center tile is solid)
+        playerSpawn->r = 1;
+        playerSpawn->position = HexAxialToWorld(0, 1);
+        playerSpawn->moveRange = 1; // Tiles the player may walk per committed turn
+    }
+
+    SpawnEnemy(2, -2);
+    EnemyAIUpdate(); // first plan: the telegraph exists before any input event
 }
 
 // enemy intent -- the telegraph for the next lever pull, drawing only the
@@ -2665,10 +2844,8 @@ static void DrawIntent(float airTime)
         Vector2 shout = GetWorldToScreen(above, camera);
         float bob = sinf(airTime * 4.0f) * 4.0f;
         const int shoutSize = 90;
-        // Centered on the enemy, drop shadow scaled up with the glyph
         int shoutX = (int)shout.x - MeasureText("!", shoutSize) / 2;
-        DrawText("!", shoutX + 4, (int)(shout.y + bob) + 4, shoutSize, BLACK);
-        DrawText("!", shoutX, (int)(shout.y + bob), shoutSize, (Color){235, 70, 60, 255});
+        DrawTextOutlined("!", shoutX, (int)(shout.y + bob), shoutSize, (Color){235, 70, 60, 255});
     }
 }
 
@@ -2681,6 +2858,45 @@ static void UpdateDrawFrame(void)
     // When ImGui wants the mouse (hovering/dragging a UI window), the board
     // must not see clicks; WantCaptureMouse lags one frame, which is fine
     uiWantsMouse = igGetIO_Nil()->WantCaptureMouse;
+
+    // Modal screens: while not playing the world still animates as the
+    // backdrop, but claiming the mouse here freezes every board interaction
+    // (grabs, drops, the turn button). The overlays late in the draw pass
+    // read the clicks and flip the state
+    if (gameState != GAME_STATE_PLAYING) uiWantsMouse = true;
+
+    // Losing the last heart ends the run
+    if (gameState == GAME_STATE_PLAYING)
+    {
+        for (int i = 0; i < entityCount; i++)
+        {
+            if ((entities[i].kind != ENTITY_HEALTH_BAR) || (entities[i].health > 0)) continue;
+            gameState = GAME_STATE_OVER;
+            LOG("INFO: GAME: over at turn %d\n", gameTurn);
+        }
+    }
+
+    // Exodia: holding a lvl 4 piece of every kind wins the run
+    if (gameState == GAME_STATE_PLAYING)
+    {
+        bool pieceOfKind[NUM_CARD_KINDS] = {0};
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *card = &entities[i];
+            if ((card->kind != ENTITY_CARD) || (card->cardLevel < CARD_LVL_4)) continue;
+            pieceOfKind[card->cardKind] = true;
+        }
+        bool all = true;
+        for (int k = CARD_LEYLINE; k < NUM_CARD_KINDS; k++)
+        {
+            if (!pieceOfKind[k]) all = false;
+        }
+        if (all)
+        {
+            gameState = GAME_STATE_WIN;
+            LOG("INFO: GAME: exodia assembled, won at turn %d\n", gameTurn);
+        }
+    }
 
     //
     // camera -- WASD pan, right-drag orbit, wheel zoom
@@ -2775,6 +2991,8 @@ static void UpdateDrawFrame(void)
         {
             Entity *card = &entities[i];
             if (card->kind != ENTITY_CARD) continue;
+            if (card->huskTurns > 0) continue;            // Dead in the hand: ungrabbable until it wakes
+            if (card->cardLevel >= CARD_LVL_4) continue; // Exodia pieces are inert trophies
 
             Rectangle rect = {card->position.x - CARD_WIDTH * cardScale / 2.0f, card->position.y - CARD_HEIGHT * cardScale / 2.0f,
                               CARD_WIDTH * cardScale, CARD_HEIGHT * cardScale};
@@ -2815,7 +3033,7 @@ static void UpdateDrawFrame(void)
             {
                 // 2048 rule: dropping onto a placed card of the SAME kind
                 // and SAME level merges them into one of the next level
-                bool canMerge = (hoveredCell->value > 0) && (hoveredCell->cardKind == card->cardKind) && (hoveredCell->cardLevel == card->cardLevel) && (hoveredCell->cardLevel < CARD_LVL_3);
+                bool canMerge = (hoveredCell->value > 0) && (hoveredCell->cardKind == card->cardKind) && (hoveredCell->cardLevel == card->cardLevel) && (hoveredCell->cardLevel < CARD_LVL_4);
                 if (canMerge)
                 {
                     hoveredCell->cardLevel++;
@@ -2827,9 +3045,17 @@ static void UpdateDrawFrame(void)
                         cardKindNames[card->cardKind], (int)hoveredCell->cardLevel, hoveredCell->q, hoveredCell->r);
                     PlaySound(sndMerge);
                     EntityDespawn(i);
+                    // Lvl 4 = an exodia piece: it leaves the board at once and
+                    // lives in the hand as an inert trophy
+                    if (hoveredCell->cardLevel >= CARD_LVL_4)
+                    {
+                        LOG("INFO: EXODIA: %s piece assembled!\n", cardKindNames[hoveredCell->cardKind]);
+                        ReturnPlacedCard(hoveredCell);
+                    }
                     EnemyAIUpdate(); // card played: re-plan
                 }
-                else if ((hoveredCell->value == 0) && (hoveredCell->huskTurns == 0)) // husks block their tile
+                else if ((hoveredCell->value == 0) && (hoveredCell->huskTurns == 0) &&
+                         !HexTileSolid(hoveredCell->q, hoveredCell->r)) // husks and the crystal tile block placement
                 {
                     // The ghost commits: the tile takes the card's kind,
                     // level, color, and hex model
@@ -2942,11 +3168,25 @@ static void UpdateDrawFrame(void)
             player->selected = false;
             if (hoveredCell != NULL)
             {
-                player->q = hoveredCell->q;
-                player->r = hoveredCell->r;
-                LOG("INFO: PLAYER: placed at (q=%d, r=%d)\n", player->q, player->r);
-                PlaySound(sndPlace);
-                EnemyAIUpdate(); // player moved: re-plan
+                // One step of moveRange tiles per committed turn; anything
+                // else springs him home (dropping back on his own tile is
+                // free and spends nothing)
+                int stepDist = HexDistance(player->q, player->r, hoveredCell->q, hoveredCell->r);
+                if ((stepDist > 0) && (stepDist <= player->moveRange) && (playerMovedTurn != gameTurn) &&
+                    !HexTileSolid(hoveredCell->q, hoveredCell->r))
+                {
+                    playerMovedTurn = gameTurn;
+                    player->q = hoveredCell->q;
+                    player->r = hoveredCell->r;
+                    LOG("INFO: PLAYER: placed at (q=%d, r=%d)\n", player->q, player->r);
+                    PlaySound(sndPlace);
+                    EnemyAIUpdate(); // player moved: re-plan
+                }
+                else if (stepDist > 0)
+                {
+                    LOG("INFO: PLAYER: move refused (dist %d, moved this turn: %s)\n",
+                        stepDist, (playerMovedTurn == gameTurn) ? "yes" : "no");
+                }
             }
         }
 
@@ -2981,6 +3221,27 @@ static void UpdateDrawFrame(void)
     }
 
     //
+    // pickup collection -- standing on a crystal gift adds its card to the
+    // hand
+    //
+
+    if (player != NULL)
+    {
+        for (int i = entityCount - 1; i >= 0; i--) // backwards: despawn swaps from the tail
+        {
+            const Entity *gift = &entities[i];
+            if (gift->kind != ENTITY_PICKUP) continue;
+            if ((gift->q != player->q) || (gift->r != player->r)) continue;
+
+            CardKind kind = gift->cardKind;
+            LOG("INFO: PICKUP: collected the crystal's %s card\n", cardKindNames[kind]);
+            PlaySound(sndPickup);
+            EntityDespawn(i);
+            SpawnCardKind(kind);
+        }
+    }
+
+    //
     // enemy drag/drop -- same behavior as the player: grabbed it rides the
     // reticle, released it takes the hovered cell (or springs back home)
     //
@@ -2993,7 +3254,7 @@ static void UpdateDrawFrame(void)
         if (enemy->selected && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
         {
             enemy->selected = false;
-            if (hoveredCell != NULL)
+            if ((hoveredCell != NULL) && !HexTileSolid(hoveredCell->q, hoveredCell->r))
             {
                 enemy->q = hoveredCell->q;
                 enemy->r = hoveredCell->r;
@@ -3060,20 +3321,28 @@ static void UpdateDrawFrame(void)
     }
 
     //
-    // turn commit -- when the lever fires: enemies execute their telegraphed
-    // intents, spent fireball husks cool and hand their card back, connected
-    // fireballs bank a charge (detonating at full), then every placed card
-    // burns one turn of its field lifetime and returns to the hand when the
-    // clock runs out, and finally the AI re-plans against the new board
+    // turn commit -- when the lever fires: exhausted hand cards wake, husks
+    // cool, connected fireballs bank a charge and detonate at full (BEFORE
+    // any enemy acts), THEN enemies execute their telegraphed intents, hex
+    // curses tick down, every placed card burns one turn of field lifetime,
+    // the timed spawns fire (crystal gift every 5 turns, enemy reinforcement
+    // every 7), and finally the AI re-plans against the new board
     //
 
     {
-        static int lastCommittedTurn = 0;
         if (gameTurn != lastCommittedTurn)
         {
             lastCommittedTurn = gameTurn;
 
-            EnemyAIExecuteIntents();
+            // exhausted hand cards wake up FIRST, so a ward used during this
+            // commit's execute below stays dead for one full turn
+            for (int i = 0; i < entityCount; i++)
+            {
+                Entity *card = &entities[i];
+                if ((card->kind != ENTITY_CARD) || (card->huskTurns == 0)) continue;
+                card->huskTurns--;
+                if (card->huskTurns == 0) LOG("INFO: CARD: %s awake in the hand again\n", cardKindNames[card->cardKind]);
+            }
 
             // spent fireball husks finish cooling: the card comes home
             // (before charging, so a husk born this turn survives one full turn)
@@ -3090,8 +3359,10 @@ static void UpdateDrawFrame(void)
                 ReturnPlacedCard(cell);
             }
 
-            // fireballs bank one charge per turn while a live leyline chain
-            // taps their tile, and detonate at full charge
+            // fireballs resolve BEFORE the enemies act: a full-charge blast
+            // kills the enemy that was about to smash it, and an enemy
+            // moving toward the blast zone is judged where it stands NOW --
+            // it walks into the crater, not into the explosion
             {
                 bool conductive[LEY_W][LEY_W];
                 bool live[LEY_W][LEY_W];
@@ -3109,6 +3380,18 @@ static void UpdateDrawFrame(void)
                 }
             }
 
+            EnemyAIExecuteIntents();
+
+            // hex curses wear off one stack per committed turn (fresh hexes
+            // were set with +1 so this tick never eats their first fight)
+            for (int i = 0; i < entityCount; i++)
+            {
+                Entity *cursed = &entities[i];
+                if ((cursed->kind != ENTITY_ENEMY) || (cursed->hexedTurns == 0)) continue;
+                cursed->hexedTurns--;
+                if (cursed->hexedTurns == 0) LOG("INFO: HEX: curse wore off enemy at (q=%d, r=%d)\n", cursed->q, cursed->r);
+            }
+
             // every remaining placed card burns one turn of field lifetime
             for (int i = 0; i < cellCount; i++)
             {
@@ -3122,6 +3405,75 @@ static void UpdateDrawFrame(void)
                     cardKindNames[cell->cardKind], (int)cell->cardLevel, cell->q, cell->r);
                 PlaySound(sndReturn);
                 ReturnPlacedCard(cell);
+            }
+
+            // every 5th turn the center crystal drops a card gift on a free
+            // tile AROUND itself -- its own tile is solid (one gift at a
+            // time: uncollected gifts don't stack)
+            if ((gameTurn % CRYSTAL_GIFT_PERIOD) == 0)
+            {
+                static const int giftDirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+                bool taken = false;
+                for (int i = 0; i < entityCount; i++)
+                {
+                    if (entities[i].kind == ENTITY_PICKUP) taken = true;
+                }
+                int start = GetRandomValue(0, 5);
+                for (int d = 0; !taken && (d < 6); d++)
+                {
+                    int gq = giftDirs[(start + d) % 6][0];
+                    int gr = giftDirs[(start + d) % 6][1];
+
+                    bool tileFree = true;
+                    for (int i = 0; i < entityCount; i++)
+                    {
+                        const Entity *other = &entities[i];
+                        if (((other->kind == ENTITY_ENEMY) || (other->kind == ENTITY_PLAYER)) && (other->q == gq) && (other->r == gr)) tileFree = false;
+                        if ((other->kind == ENTITY_HEX_CELL) && (other->q == gq) && (other->r == gr) &&
+                            ((other->value > 0) || (other->huskTurns > 0))) tileFree = false;
+                    }
+                    if (!tileFree) continue;
+
+                    Entity *gift = EntitySpawn(ENTITY_PICKUP);
+                    if (gift != NULL)
+                    {
+                        gift->q = gq;
+                        gift->r = gr;
+                        gift->position = HexAxialToWorld(gq, gr);
+                        gift->cardKind = (CardKind)GetRandomValue(CARD_LEYLINE, CARD_WARD);
+                        gift->tint = cardKindTints[gift->cardKind];
+                        gift->modelIndex = (kindModelIndex[gift->cardKind] >= 0) ? kindModelIndex[gift->cardKind] : 0;
+                        LOG("INFO: PICKUP: crystal dropped a %s card at (q=%d, r=%d)\n", cardKindNames[gift->cardKind], gq, gr);
+                    }
+                    break;
+                }
+            }
+
+            // every 7th turn another enemy crawls onto the board, on a free
+            // tile kept off the player's back
+            if ((gameTurn % ENEMY_SPAWN_PERIOD) == 0)
+            {
+                for (int attempt = 0; attempt < 40; attempt++)
+                {
+                    int q = GetRandomValue(-GRID_RADIUS, GRID_RADIUS);
+                    int r = GetRandomValue(-GRID_RADIUS, GRID_RADIUS);
+                    if (!HexOnBoard(q, r) || HexTileSolid(q, r)) continue;
+                    if ((player != NULL) && (HexDistance(q, r, player->q, player->r) < 3)) continue;
+
+                    bool tileFree = true;
+                    for (int i = 0; i < entityCount; i++)
+                    {
+                        const Entity *other = &entities[i];
+                        if ((other->kind == ENTITY_ENEMY) && (other->q == q) && (other->r == r)) tileFree = false;
+                        if ((other->kind == ENTITY_HEX_CELL) && (other->q == q) && (other->r == r) &&
+                            ((other->value > 0) || (other->huskTurns > 0))) tileFree = false;
+                    }
+                    if (!tileFree) continue;
+
+                    LOG("INFO: ENEMY: reinforcement spawned at (q=%d, r=%d)\n", q, r);
+                    SpawnEnemy(q, r);
+                    break;
+                }
             }
 
             EnemyAIUpdate(); // new turn started: re-plan
@@ -3372,6 +3724,31 @@ static void UpdateDrawFrame(void)
     }
 
     //
+    // card pickups -- the center crystal's gifts: the card's hex form
+    // spinning and bobbing over the tile until the player steps on it
+    //
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *gift = &entities[i];
+        if (gift->kind != ENTITY_PICKUP) continue;
+
+        DrawCylinder(gift->position, HEX_SIZE * 0.5f, HEX_SIZE * 0.5f, HEX_TILE_HEIGHT + 0.015f, 6,
+                     Fade(gift->tint, 0.25f + 0.1f * sinf(auroraTime * 3.0f)));
+        if (cardModelCount > 0)
+        {
+            rlDisableBackfaceCulling();
+            rlPushMatrix();
+            rlTranslatef(gift->position.x, HEX_TILE_HEIGHT + 0.55f + sinf(auroraTime * 2.0f) * 0.1f, gift->position.z);
+            rlRotatef(auroraTime * 40.0f, 0.0f, 1.0f, 0.0f);
+            DrawModel(hexModels[gift->modelIndex % cardModelCount], (Vector3){0},
+                      hexModelScale * HEX_SIZE / HEX_MODEL_R * 0.6f, WHITE);
+            rlPopMatrix();
+            rlEnableBackfaceCulling();
+        }
+    }
+
+    //
     // landing ghost -- the grabbed card projected onto the hovered tile, riding
     // the reticle's sprung position rather than the raw cursor
     //
@@ -3383,8 +3760,10 @@ static void UpdateDrawFrame(void)
             const Entity *card = &entities[i];
             if ((card->kind != ENTITY_CARD) || !card->selected || (card->cardMode != CARD_HEX_FORM)) continue;
 
-            bool ghostMerge = (hoveredCell->value > 0) && (hoveredCell->cardKind == card->cardKind) && (hoveredCell->cardLevel == card->cardLevel) && (hoveredCell->cardLevel < CARD_LVL_3);
-            bool ghostValid = ((hoveredCell->value == 0) && (hoveredCell->huskTurns == 0)) || ghostMerge;
+            bool ghostMerge = (hoveredCell->value > 0) && (hoveredCell->cardKind == card->cardKind) && (hoveredCell->cardLevel == card->cardLevel) && (hoveredCell->cardLevel < CARD_LVL_4);
+            bool ghostValid = ((hoveredCell->value == 0) && (hoveredCell->huskTurns == 0) &&
+                               !HexTileSolid(hoveredCell->q, hoveredCell->r)) ||
+                              ghostMerge;
             if (cardModelCount > 0)
             {
                 // Translucent hex-form model, red-tinted over an invalid target
@@ -3754,25 +4133,31 @@ static void UpdateDrawFrame(void)
             rlRotatef(card->pressTilt.x * cardPressTiltDeg, 0.0f, 1.0f, 0.0f);
 
             // With depth testing off the model's mesh order is the paint
-            // order; the exporter adds layers back-to-front, so this holds
-            DrawModel(model, (Vector3){0}, scale, Fade(WHITE, card->alpha));
+            // order; the exporter adds layers back-to-front, so this holds.
+            // Dead-in-hand cards read as gray stone, and skip the foil shine
+            bool cardDead = (card->huskTurns > 0);
+            Color bodyTint = cardDead ? (Color){105, 105, 115, 255} : WHITE;
+            DrawModel(model, (Vector3){0}, scale, Fade(bodyTint, card->alpha));
 
             // Foil shine: the same model again through the shine shader
-            float phase = (float)i * 0.19f;
-            SetShaderValue(shineShader, shineTimeLoc, &shineTime, SHADER_UNIFORM_FLOAT);
-            SetShaderValue(shineShader, shinePhaseLoc, &phase, SHADER_UNIFORM_FLOAT);
-            Shader saved[MAX_CARD_MODELS * 2] = {0};
-            for (int m = 0; m < model.materialCount && m < (int)(sizeof(saved) / sizeof(saved[0])); m++)
+            if (!cardDead)
             {
-                saved[m] = model.materials[m].shader;
-                model.materials[m].shader = shineShader;
-            }
-            BeginBlendMode(BLEND_ADDITIVE);
-            DrawModel(model, (Vector3){0}, scale, WHITE);
-            EndBlendMode();
-            for (int m = 0; m < model.materialCount && m < (int)(sizeof(saved) / sizeof(saved[0])); m++)
-            {
-                model.materials[m].shader = saved[m];
+                float phase = (float)i * 0.19f;
+                SetShaderValue(shineShader, shineTimeLoc, &shineTime, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(shineShader, shinePhaseLoc, &phase, SHADER_UNIFORM_FLOAT);
+                Shader saved[MAX_CARD_MODELS * 2] = {0};
+                for (int m = 0; m < model.materialCount && m < (int)(sizeof(saved) / sizeof(saved[0])); m++)
+                {
+                    saved[m] = model.materials[m].shader;
+                    model.materials[m].shader = shineShader;
+                }
+                BeginBlendMode(BLEND_ADDITIVE);
+                DrawModel(model, (Vector3){0}, scale, WHITE);
+                EndBlendMode();
+                for (int m = 0; m < model.materialCount && m < (int)(sizeof(saved) / sizeof(saved[0])); m++)
+                {
+                    model.materials[m].shader = saved[m];
+                }
             }
 
             rlPopMatrix();
@@ -3809,11 +4194,16 @@ static void UpdateDrawFrame(void)
         if ((card->kind != ENTITY_CARD) || (card->alpha < 0.01f)) continue;
         if (card->selected && (card->cardMode == CARD_HEX_FORM)) continue;
 
-        const char *valueText = TextFormat("%s %d", cardKindNames[card->cardKind], (int)card->cardLevel);
+        bool isPiece = (card->cardLevel >= CARD_LVL_4);
+        const char *valueText = (card->huskTurns > 0)  ? TextFormat("%s zzz", cardKindNames[card->cardKind])
+                                : isPiece              ? TextFormat("%s exodia", cardKindNames[card->cardKind])
+                                                       : TextFormat("%s %d", cardKindNames[card->cardKind], (int)card->cardLevel);
+        Color valueColor = (card->huskTurns > 0) ? GRAY
+                           : isPiece             ? (Color){255, 220, 60, 255}
+                                                 : card->tint;
         int vx = (int)card->position.x - MeasureText(valueText, 24) / 2;
         int vy = (int)(card->position.y + CARD_HEIGHT * cardScale * 0.18f);
-        DrawText(valueText, vx + 2, vy + 2, 24, Fade(BLACK, card->alpha));
-        DrawText(valueText, vx, vy, 24, Fade(card->tint, card->alpha));
+        DrawTextOutlined(valueText, vx, vy, 24, Fade(valueColor, card->alpha));
     }
 
     for (int i = 0; i < entityCount && cardModelCount == 0; i++)
@@ -3876,8 +4266,7 @@ static void UpdateDrawFrame(void)
         const int turnsSize = 22;
         int tx2 = (int)at.x - MeasureText(turnsText, turnsSize) / 2;
         Color turnsColor = (cell->turnLifetime <= 1) ? (Color){235, 70, 60, 255} : RAYWHITE;
-        DrawText(turnsText, tx2 + 2, (int)at.y + 2, turnsSize, BLACK);
-        DrawText(turnsText, tx2, (int)at.y, turnsSize, turnsColor);
+        DrawTextOutlined(turnsText, tx2, (int)at.y, turnsSize, turnsColor);
     }
 
     //
@@ -3914,7 +4303,7 @@ static void UpdateDrawFrame(void)
     if (centerGemLoaded)
     {
         // Constant screen size: world scale tracks the ortho zoom (fovy)
-        float knobGemScale = 7.5f * leverScale * camera.fovy / (float)screenHeight;
+        float knobGemScale = 12.0f * leverScale * camera.fovy / (float)screenHeight;
         Vector3 knobWorld = ScreenToHandPlane(leverKnobScreenPos);
         BeginMode3D(camera);
         rlDisableBackfaceCulling();
@@ -3922,9 +4311,10 @@ static void UpdateDrawFrame(void)
         rlPushMatrix();
         rlTranslatef(knobWorld.x, knobWorld.y, knobWorld.z);
         rlRotatef(airTime * 30.0f, 0.0f, 1.0f, 0.0f);
-        // The knob crystal gets its own milkiness; the frame-start uniform
-        // update restores the shared gem shader for everyone else next frame
-        SetShaderValue(gemShader, gemLocs.milkiness, &leverGemMilkiness, SHADER_UNIFORM_FLOAT);
+        // The button crystal gets its own milkiness (eased up while hovered);
+        // the frame-start uniform update restores the shared gem shader for
+        // everyone else next frame
+        SetShaderValue(gemShader, gemLocs.milkiness, &leverGemMilkyNow, SHADER_UNIFORM_FLOAT);
         DrawModel(centerGemModel, (Vector3){0}, knobGemScale, WHITE);
         rlPopMatrix();
         rlEnableDepthTest();
@@ -3933,7 +4323,7 @@ static void UpdateDrawFrame(void)
 
         // Bloom over the crystal itself: the half-res mask halo only survives
         // around the silhouette, so the shine on top is drawn here directly
-        float shineR = 15.0f * leverScale * (0.9f + 0.1f * sinf(airTime * 2.2f));
+        float shineR = 24.0f * leverScale * (0.9f + 0.1f * sinf(airTime * 2.2f));
         BeginBlendMode(BLEND_ADDITIVE);
         DrawCircleGradient(leverKnobScreenPos, shineR, (Color){70, 110, 200, 255}, BLANK);
         DrawCircleGradient(leverKnobScreenPos, shineR * 0.4f, (Color){120, 150, 220, 255}, BLANK);
@@ -3944,9 +4334,70 @@ static void UpdateDrawFrame(void)
 
     if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, LIGHTGRAY);
 
-    if ((frameCounter / 20) % 2) DrawText("hex merge time!", screenWidth / 2 - MeasureText("hex merge time!", 30) / 2, 28, 30, MAROON);
+    if ((frameCounter / 20) % 2) DrawTextOutlined("hex merge time!", screenWidth / 2 - MeasureText("hex merge time!", 30) / 2, 28, 30, MAROON);
+
+    // Spawn countdowns: turns until the crystal's next card gift and the
+    // next enemy reinforcement (both fire on the lever pull they hit 0 on)
+    {
+        int nextCard = CRYSTAL_GIFT_PERIOD - (gameTurn % CRYSTAL_GIFT_PERIOD);
+        int nextEnemy = ENEMY_SPAWN_PERIOD - (gameTurn % ENEMY_SPAWN_PERIOD);
+        const char *spawnText = TextFormat("next card %d   next enemy %d", nextCard, nextEnemy);
+        DrawTextOutlined(spawnText, screenWidth / 2 - MeasureText(spawnText, 20) / 2, 64, 20, LIGHTGRAY);
+    }
 
     DrawRectangleLinesEx((Rectangle){0, 0, screenWidth, screenHeight}, 16, BLACK);
+
+    //
+    // modal screens -- start and game over: a dark veil over the live board
+    // with outlined title text; a click flips the state (and the click that
+    // dismisses them never reaches the board, uiWantsMouse is held all frame)
+    //
+
+    if (gameState != GAME_STATE_PLAYING)
+    {
+        DrawRectangle(0, 0, screenWidth, screenHeight, Fade(BLACK, 0.62f));
+
+        const char *title = (gameState == GAME_STATE_START) ? "HEX MERGE"
+                            : (gameState == GAME_STATE_WIN) ? "EXODIA!"
+                                                            : "GAME OVER";
+        Color titleColor = (gameState == GAME_STATE_OVER) ? (Color){235, 70, 60, 255} : (Color){255, 220, 60, 255};
+        DrawTextOutlined(title, screenWidth / 2 - MeasureText(title, 64) / 2, screenHeight / 2 - 110, 64, titleColor);
+
+        if (gameState == GAME_STATE_START)
+        {
+            const char *lines[] = {
+                "place cards, merge equals to level them up",
+                "leylines power your spells -- keep them connected",
+                "click the crystal to end the turn",
+            };
+            for (int li = 0; li < 3; li++)
+            {
+                DrawTextOutlined(lines[li], screenWidth / 2 - MeasureText(lines[li], 20) / 2, screenHeight / 2 - 8 + li * 28, 20, RAYWHITE);
+            }
+        }
+        else
+        {
+            const char *ranText = (gameState == GAME_STATE_WIN)
+                                      ? TextFormat("all four pieces assembled in %d turns", gameTurn)
+                                      : TextFormat("you lasted %d turns", gameTurn);
+            DrawTextOutlined(ranText, screenWidth / 2 - MeasureText(ranText, 24) / 2, screenHeight / 2 - 4, 24, RAYWHITE);
+        }
+
+        // The pulsing prompt, and the click that acts on it
+        const char *prompt = (gameState == GAME_STATE_START) ? "click to start"
+                             : (gameState == GAME_STATE_WIN) ? "click to play again"
+                                                             : "click to try again";
+        float promptPulse = 0.65f + 0.35f * sinf((float)GetTime() * 3.0f);
+        DrawTextOutlined(prompt, screenWidth / 2 - MeasureText(prompt, 26) / 2, screenHeight / 2 + 96, 26,
+                         Fade((Color){255, 220, 60, 255}, promptPulse));
+
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !igGetIO_Nil()->WantCaptureMouse)
+        {
+            if (gameState != GAME_STATE_START) ResetGame();
+            gameState = GAME_STATE_PLAYING;
+            PlaySound(sndLever);
+        }
+    }
 
     EndTextureMode();
 
@@ -3973,103 +4424,111 @@ static void UpdateDrawFrame(void)
                    (Rectangle){(float)screenWidth / 2.0f + shakeOffset.x, (float)screenHeight / 2.0f + shakeOffset.y, (float)target.texture.width, (float)target.texture.height},
                    (Vector2){(float)target.texture.width / 2.0f, (float)target.texture.height / 2.0f}, shakeRoll, WHITE);
 
-    // ImGui UI, drawn on top of the scaled game texture
+    // ImGui UI, drawn on top of the scaled game texture. The dev menu ships
+    // hidden; the backquote key toggles it
+    static bool devMenuOpen = false;
+    if (IsKeyPressed(KEY_GRAVE)) devMenuOpen = !devMenuOpen;
+
     rlImGuiBegin();
 
-    igBegin("hex debug", NULL, 0);
+    if (devMenuOpen)
+    {
+        igBegin("hex debug", NULL, 0);
 #if !defined(BUILD_GIT_HASH)
 #define BUILD_GIT_HASH "dev"
 #endif
-    // Which build is this? Commit at configure time + compile timestamp --
-    // compare against git to tell whether a Pages deploy actually updated
-    igText("build %s  (%s %s)", BUILD_GIT_HASH, __DATE__, __TIME__);
-    igText("entities: %d/%d", entityCount, MAX_ENTITIES);
-    igText("mouse cell: (q=%d, r=%d)", mouseHexQ, mouseHexR);
-    for (int i = 0; i < entityCount; i++)
-    {
-        const Entity *enemy = &entities[i];
-        if (enemy->kind != ENTITY_ENEMY) continue;
-        const char *what = (enemy->enemyIntentKind == ENEMY_INTENT_STRIKE)    ? "STRIKE"
-                           : (enemy->enemyIntentKind == ENEMY_INTENT_ATTACK) ? "ATTACK"
-                           : (enemy->enemyIntentKind == ENEMY_INTENT_MOVE)   ? "move"
-                                                                             : "hold";
-        igText("enemy (%d,%d): %s -> (%d,%d)", enemy->q, enemy->r, what,
-               enemy->enemyIntentQ, enemy->enemyIntentR);
-    }
-
-    if (igButton("deal card", (ImVec2_c){0, 0})) SpawnCard();
-
-    if (igButton("save tweaks", (ImVec2_c){0, 0})) SaveTweaks();
-    igSameLine(0.0f, 8.0f);
-    if (igButton("reload tweaks", (ImVec2_c){0, 0})) LoadTweaks();
-
-    // Impact burst tweakers; the button replays the effect at the board center
-    igSliderFloat("impact size", &impactLightSize, 0.5f, 4.0f, "%.2f", 0);
-    igSliderFloat("impact height", &impactLightHeight, 0.0f, 2.0f, "%.2f", 0);
-    igSliderFloat("impact anim speed", &impactAnimSpeed, 0.1f, 3.0f, "%.2f", 0);
-
-    // Size tweakers for the visual elements
-    igSliderFloat("player size", &playerSpriteSize, 0.5f, 3.0f, "%.2f", 0);
-    igSliderFloat("card size", &cardScale, 0.5f, 1.5f, "%.2f", 0);
-    igSliderFloat("reticle size", &reticleScale, 0.4f, 1.6f, "%.2f", 0);
-    igSliderFloat("lever scale", &leverScale, 1.0f, 4.0f, "%.2f", 0);
-    igSliderFloat("aurora", &auroraIntensity, 0.0f, 2.0f, "%.2f", 0);
-    igSliderFloat("water wave amp", &waterWaveAmp, 0.0f, 1.2f, "%.2f", 0);
-    igSliderFloat("water wave scale", &waterWaveScale, 0.3f, 4.0f, "%.2f", 0);
-    igSliderFloat("enemy size", &enemySize, 0.2f, 2.0f, "%.2f", 0);
-    igSliderFloat("enemy spikes", &enemySpikeLen, 0.0f, 1.2f, "%.2f", 0);
-    igSliderFloat("enemy spike density", &enemySpikeDensity, 0.05f, 1.0f, "%.2f", 0);
-    igSliderFloat("enemy rim", &enemyRim, 0.0f, 1.5f, "%.2f", 0);
-    igSliderFloat("enemy line width", &enemyLineWidth, 1.0f, 6.0f, "%.1f", 0);
-    igSliderFloat("enemy red outline", &enemyOutline, 0.0f, 0.15f, "%.3f", 0);
-    igSliderFloat("ley hue", &leyHue, 0.0f, 1.0f, "%.2f", 0);
-    igSliderFloat("ley iridescence", &leyIrid, 0.0f, 1.0f, "%.2f", 0);
-    igSliderFloat("ley ink", &leyInk, 0.0f, 5.0f, "%.1f", 0);
-    igSliderFloat("ley arc", &leyArc, 0.0f, 0.8f, "%.2f", 0);
-    igSliderFloat("ley width", &leyWidth, 1.0f, 8.0f, "%.1f", 0);
-
-    // Gem tile optics
-    igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
-    igSliderFloat("gem strength", &gemStrength, 0.0f, 1.0f, "%.2f", 0);
-    igSliderFloat("gem dispersion", &gemChromatic, 0.0f, 0.15f, "%.3f", 0);
-    igSliderFloat("gem milkiness", &gemMilkiness, 0.0f, 1.0f, "%.2f", 0);
-    igSliderFloat("lever gem milkiness", &leverGemMilkiness, 0.0f, 1.0f, "%.2f", 0);
-    igSliderFloat("tile art size", &tileArtScale, 0.3f, 1.4f, "%.2f", 0);
-    igSliderFloat("mouse sway", &mouseSwayAmount, 0.0f, 3.0f, "%.2f", 0);
-
-    // Air particle tweakers
-    igSliderFloat("air shards", &airShardCount, 0.0f, (float)MAX_AIR_SHARDS, "%.0f", 0);
-    igSliderFloat("air triangles", &airTriCount, 0.0f, (float)MAX_AIR_TRIS, "%.0f", 0);
-    igSliderFloat("air particle scale", &airParticleScale, 0.3f, 3.0f, "%.2f", 0);
-    igSliderFloat("tri glow", &triGlowStrength, 0.0f, 1.0f, "%.2f", 0);
-    igSliderFloat("center gem scale", &centerGemScale, 0.0f, 3.0f, "%.2f", 0);
-
-    if (igButton("reset camera", (ImVec2_c){0, 0}))
-    {
-        camera.position = (Vector3){0.0f, 14.0f, 12.0f};
-        camera.target = (Vector3){0.0f, 0.0f, 0.0f};
-        camera.fovy = 16.0f;
-    }
-
-    // Card model tweakers
-    igText("card models: %d", cardModelCount);
-    igSliderFloat("card model scale", &cardModelScale, 0.3f, 2.0f, "%.2f", 0);
-    igSliderFloat("hex model scale", &hexModelScale, 0.5f, 1.5f, "%.2f", 0);
-    igSliderFloat("press tilt", &cardPressTiltDeg, 0.0f, 45.0f, "%.0f", 0);
-    if (igButton("test impact", (ImVec2_c){0, 0}))
-    {
-        impact = (ImpactFx){.position = HexAxialToWorld(0, 0), .tint = (Color){255, 203, 0, 255}, .age = 0.0f, .active = true};
-    }
-
-    for (int i = 0; i < entityCount; i++)
-    {
-        if (entities[i].kind == ENTITY_HEALTH_BAR)
+        // Which build is this? Commit at configure time + compile timestamp --
+        // compare against git to tell whether a Pages deploy actually updated
+        igText("build %s  (%s %s)", BUILD_GIT_HASH, __DATE__, __TIME__);
+        igText("entities: %d/%d", entityCount, MAX_ENTITIES);
+        igText("mouse cell: (q=%d, r=%d)", mouseHexQ, mouseHexR);
+        for (int i = 0; i < entityCount; i++)
         {
-            igSliderInt("health", &entities[i].health, 0, entities[i].maxHealth, "%d", 0);
-            break;
+            const Entity *enemy = &entities[i];
+            if (enemy->kind != ENTITY_ENEMY) continue;
+            const char *what = (enemy->enemyIntentKind == ENEMY_INTENT_STRIKE)   ? "STRIKE"
+                               : (enemy->enemyIntentKind == ENEMY_INTENT_ATTACK) ? "ATTACK"
+                               : (enemy->enemyIntentKind == ENEMY_INTENT_MOVE)   ? "move"
+                                                                                 : "hold";
+            igText("enemy (%d,%d)%s: %s -> (%d,%d)", enemy->q, enemy->r,
+                   (enemy->hexedTurns > 0) ? TextFormat(" HEXED %d", enemy->hexedTurns) : "", what,
+                   enemy->enemyIntentQ, enemy->enemyIntentR);
         }
+
+        if (igButton("deal card", (ImVec2_c){0, 0})) SpawnCard();
+
+        if (igButton("save tweaks", (ImVec2_c){0, 0})) SaveTweaks();
+        igSameLine(0.0f, 8.0f);
+        if (igButton("reload tweaks", (ImVec2_c){0, 0})) LoadTweaks();
+
+        // Impact burst tweakers; the button replays the effect at the board center
+        igSliderFloat("impact size", &impactLightSize, 0.5f, 4.0f, "%.2f", 0);
+        igSliderFloat("impact height", &impactLightHeight, 0.0f, 2.0f, "%.2f", 0);
+        igSliderFloat("impact anim speed", &impactAnimSpeed, 0.1f, 3.0f, "%.2f", 0);
+
+        // Size tweakers for the visual elements
+        igSliderFloat("player size", &playerSpriteSize, 0.5f, 3.0f, "%.2f", 0);
+        igSliderFloat("card size", &cardScale, 0.5f, 1.5f, "%.2f", 0);
+        igSliderFloat("reticle size", &reticleScale, 0.4f, 1.6f, "%.2f", 0);
+        igSliderFloat("lever scale", &leverScale, 1.0f, 4.0f, "%.2f", 0);
+        igSliderFloat("aurora", &auroraIntensity, 0.0f, 2.0f, "%.2f", 0);
+        igSliderFloat("water wave amp", &waterWaveAmp, 0.0f, 1.2f, "%.2f", 0);
+        igSliderFloat("water wave scale", &waterWaveScale, 0.3f, 4.0f, "%.2f", 0);
+        igSliderFloat("enemy size", &enemySize, 0.2f, 2.0f, "%.2f", 0);
+        igSliderFloat("enemy spikes", &enemySpikeLen, 0.0f, 1.2f, "%.2f", 0);
+        igSliderFloat("enemy spike density", &enemySpikeDensity, 0.05f, 1.0f, "%.2f", 0);
+        igSliderFloat("enemy rim", &enemyRim, 0.0f, 1.5f, "%.2f", 0);
+        igSliderFloat("enemy line width", &enemyLineWidth, 1.0f, 6.0f, "%.1f", 0);
+        igSliderFloat("enemy red outline", &enemyOutline, 0.0f, 0.15f, "%.3f", 0);
+        igSliderFloat("ley hue", &leyHue, 0.0f, 1.0f, "%.2f", 0);
+        igSliderFloat("ley iridescence", &leyIrid, 0.0f, 1.0f, "%.2f", 0);
+        igSliderFloat("ley ink", &leyInk, 0.0f, 5.0f, "%.1f", 0);
+        igSliderFloat("ley arc", &leyArc, 0.0f, 0.8f, "%.2f", 0);
+        igSliderFloat("ley width", &leyWidth, 1.0f, 8.0f, "%.1f", 0);
+
+        // Gem tile optics
+        igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
+        igSliderFloat("gem strength", &gemStrength, 0.0f, 1.0f, "%.2f", 0);
+        igSliderFloat("gem dispersion", &gemChromatic, 0.0f, 0.15f, "%.3f", 0);
+        igSliderFloat("gem milkiness", &gemMilkiness, 0.0f, 1.0f, "%.2f", 0);
+        igSliderFloat("lever gem milkiness", &leverGemMilkiness, 0.0f, 1.0f, "%.2f", 0);
+        igSliderFloat("tile art size", &tileArtScale, 0.3f, 1.4f, "%.2f", 0);
+        igSliderFloat("mouse sway", &mouseSwayAmount, 0.0f, 3.0f, "%.2f", 0);
+
+        // Air particle tweakers
+        igSliderFloat("air shards", &airShardCount, 0.0f, (float)MAX_AIR_SHARDS, "%.0f", 0);
+        igSliderFloat("air triangles", &airTriCount, 0.0f, (float)MAX_AIR_TRIS, "%.0f", 0);
+        igSliderFloat("air particle scale", &airParticleScale, 0.3f, 3.0f, "%.2f", 0);
+        igSliderFloat("tri glow", &triGlowStrength, 0.0f, 1.0f, "%.2f", 0);
+        igSliderFloat("center gem scale", &centerGemScale, 0.0f, 3.0f, "%.2f", 0);
+
+        if (igButton("reset camera", (ImVec2_c){0, 0}))
+        {
+            camera.position = (Vector3){0.0f, 14.0f, 12.0f};
+            camera.target = (Vector3){0.0f, 0.0f, 0.0f};
+            camera.fovy = 16.0f;
+        }
+
+        // Card model tweakers
+        igText("card models: %d", cardModelCount);
+        igSliderFloat("card model scale", &cardModelScale, 0.3f, 2.0f, "%.2f", 0);
+        igSliderFloat("hex model scale", &hexModelScale, 0.5f, 1.5f, "%.2f", 0);
+        igSliderFloat("press tilt", &cardPressTiltDeg, 0.0f, 45.0f, "%.0f", 0);
+        if (igButton("test impact", (ImVec2_c){0, 0}))
+        {
+            impact = (ImpactFx){.position = HexAxialToWorld(0, 0), .tint = (Color){255, 203, 0, 255}, .age = 0.0f, .active = true};
+        }
+
+        for (int i = 0; i < entityCount; i++)
+        {
+            if (entities[i].kind == ENTITY_HEALTH_BAR)
+            {
+                igSliderInt("health", &entities[i].health, 0, entities[i].maxHealth, "%d", 0);
+                break;
+            }
+        }
+        igEnd();
     }
-    igEnd();
 
     rlImGuiEnd();
 
@@ -4278,44 +4737,7 @@ int main(void)
     entityCount = 0;
 
     SpawnHexGrid();
-
-    Entity *healthBar = EntitySpawn(ENTITY_HEALTH_BAR);
-    if (healthBar != NULL)
-    {
-        healthBar->position = (Vector3){24.0f, 64.0f, 0.0f}; // Screen pixels for UI kinds
-        healthBar->health = 3;
-        healthBar->maxHealth = 5;
-    }
-
-    // Starting hand: always two leylines, a hex, a ward, and a fireball
-    SpawnCardKind(CARD_LEYLINE);
-    SpawnCardKind(CARD_LEYLINE);
-    SpawnCardKind(CARD_HEX);
-    SpawnCardKind(CARD_WARD);
-    SpawnCardKind(CARD_FIREBALL);
-
-    Entity *playerSpawn = EntitySpawn(ENTITY_PLAYER);
-    if (playerSpawn != NULL)
-    {
-        playerSpawn->q = 0; // Starts on the center tile
-        playerSpawn->r = 0;
-        playerSpawn->position = HexAxialToWorld(0, 0);
-    }
-
-    SpawnEnemy(2, -2);
-    { // TEMP adjacency
-        for (int i = 0; i < entityCount; i++)
-        {
-            Entity *cell = &entities[i];
-            if ((cell->kind != ENTITY_HEX_CELL) || (cell->q != 3) || (cell->r != -2)) continue;
-            cell->cardKind = CARD_WARD;
-            cell->cardLevel = CARD_LVL_1;
-            cell->value = 1;
-            cell->modelIndex = 0;
-            cell->turnLifetime = cardKindLifetimes[CARD_WARD];
-        }
-    }
-    EnemyAIUpdate(); // first plan: the telegraph exists before any input event
+    ResetGame(); // Starting cast: hearts, hand, player, first enemy, first plan
 
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
