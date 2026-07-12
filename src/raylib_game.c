@@ -46,6 +46,9 @@
 #define HEX_TILE_HEIGHT 0.2f       // Resting tile thickness
 #define HEX_TILE_HEIGHT_HOVER 0.4f // Tile thickness while hovered
 
+#define FIREBALL_CHARGE_NEEDED 2 // Connected lever pulls before a fireball detonates
+#define FIREBALL_AOE_RADIUS 1    // Detonation reach in tiles
+
 #define HEX_CELL_OFFBOARD 999 // Axial coord that can never be on the board
 
 // Cards: blank rectangles fanned along the bottom edge until placed on the board
@@ -127,7 +130,7 @@ static const char *cardKindNames[NUM_CARD_KINDS] = {"", "ley", "fire", "hex", "w
 static const char *cardKindTooltips[NUM_CARD_KINDS] = {
     "",
     "conduit: its tile joins the leyline network",
-    "AOE spell (logic TBD)",
+    "leyline-charged: detonates at 2 charges, hits all within 1 tile",
     "curse spell (logic TBD)",
     "baits enemy strikes in range, absorbs the hit for no heart",
 };
@@ -218,6 +221,16 @@ typedef struct Entity
     // Hex cell: an enemy telegraphed a strike on this card. Set/cleared only
     // by EnemyAIUpdate; the shell draws with the danger look while true
     bool inDanger;
+
+    // Hex cell, fireball emplacement: charges banked so far (+1 per
+    // committed turn while a live leyline taps the tile); detonates at
+    // FIREBALL_CHARGE_NEEDED with a radius-1 AOE
+    int fireballCharge;
+
+    // Hex cell: committed turns a spent lvl 1 fireball husk keeps blocking
+    // this tile (cardKind/cardLevel stay set so the husk can hand the card
+    // back when it cools); 0 = no husk
+    int huskTurns;
 
     // Enemy Shader params
 
@@ -917,6 +930,7 @@ static Sound sndMerge = {0};  // 2048 merge: rising chime
 static Sound sndReturn = {0}; // A card's field lifetime expiring
 static Sound sndHit = {0};    // Enemy smashes a card / hits the player
 static Sound sndLever = {0};  // The turn lever firing
+static Sound sndBoom = {0};   // Fireball detonation
 
 static Sound SynthSound(float startFreq, float endFreq, float duration, float noiseMix, float volume)
 {
@@ -1391,6 +1405,75 @@ static int HexDistance(int q1, int r1, int q2, int r2)
 static bool HexOnBoard(int q, int r)
 {
     return (abs(q) <= GRID_RADIUS) && (abs(r) <= GRID_RADIUS) && (abs(q + r) <= GRID_RADIUS);
+}
+
+// Leyline network, indexed [q + GRID_RADIUS][r + GRID_RADIUS]. ONLY leyline
+// tiles conduct (plus the player's tile as the source); placed spell cards
+// are endpoints that tap an adjacent live tile but never extend the chain.
+// The leyline layer draws from this and the fireball logic charges from it,
+// so the picture and the rules cannot disagree
+enum
+{
+    LEY_W = 2 * GRID_RADIUS + 1
+};
+
+static void ComputeLeylineNetwork(const Entity *player, bool conductive[LEY_W][LEY_W], bool live[LEY_W][LEY_W])
+{
+    static const int dirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+
+    memset(conductive, 0, sizeof(bool) * LEY_W * LEY_W);
+    memset(live, 0, sizeof(bool) * LEY_W * LEY_W);
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *cell = &entities[i];
+        if ((cell->kind != ENTITY_HEX_CELL) || !cell->isLeyline) continue;
+        conductive[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS] = true;
+    }
+    if (player == NULL) return;
+    conductive[player->q + GRID_RADIUS][player->r + GRID_RADIUS] = true;
+
+    // flood from the player: everything reachable is energized
+    int stackQ[LEY_W * LEY_W];
+    int stackR[LEY_W * LEY_W];
+    int top = 0;
+    live[player->q + GRID_RADIUS][player->r + GRID_RADIUS] = true;
+    stackQ[top] = player->q;
+    stackR[top] = player->r;
+    top++;
+    while (top > 0)
+    {
+        top--;
+        int q = stackQ[top];
+        int r = stackR[top];
+        for (int d = 0; d < 6; d++)
+        {
+            int nq = q + dirs[d][0];
+            int nr = r + dirs[d][1];
+            if (!HexOnBoard(nq, nr)) continue;
+            if (!conductive[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
+            if (live[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
+            live[nq + GRID_RADIUS][nr + GRID_RADIUS] = true;
+            stackQ[top] = nq;
+            stackR[top] = nr;
+            top++;
+        }
+    }
+}
+
+// True when any neighbour of (q, r) is a live conducting tile: how a placed
+// spell card taps the network by adjacency
+static bool LeylineTapped(const bool live[LEY_W][LEY_W], int q, int r)
+{
+    static const int dirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+    for (int d = 0; d < 6; d++)
+    {
+        int nq = q + dirs[d][0];
+        int nr = r + dirs[d][1];
+        if (!HexOnBoard(nq, nr)) continue;
+        if (live[nq + GRID_RADIUS][nr + GRID_RADIUS]) return true;
+    }
+    return false;
 }
 
 // Convert a screen point to the world position where hand cards stand: along
@@ -2061,16 +2144,55 @@ static void ReturnPlacedCard(Entity *cell)
     cell->isLeyline = false;
     cell->inDanger = false; // No card, nothing to strike
     cell->turnLifetime = 0;
+    cell->fireballCharge = 0;
+    cell->huskTurns = 0;
 }
 
-static void SpawnCard(void)
+// Fireball detonation: a radius-FIREBALL_AOE_RADIUS blast that destroys
+// every enemy in reach. The spent emplacement follows the level rule: lvl 1
+// leaves a husk blocking the tile for one committed turn before the card
+// returns to the hand, lvl 2+ returns immediately
+static void DetonateFireball(Entity *cell)
+{
+    LOG("INFO: FIREBALL: lvl %d detonated at (q=%d, r=%d)\n", (int)cell->cardLevel, cell->q, cell->r);
+    impact = (ImpactFx){.position = cell->position, .tint = (Color){255, 160, 70, 255}, .age = 0.0f, .active = true};
+    shakeTimeLeft = SHAKE_DURATION;
+    PlaySound(sndBoom);
+
+    // Backwards so the swap-back despawn only moves already-visited slots
+    for (int i = entityCount - 1; i >= 0; i--)
+    {
+        const Entity *enemy = &entities[i];
+        if (enemy->kind != ENTITY_ENEMY) continue;
+        if (HexDistance(cell->q, cell->r, enemy->q, enemy->r) > FIREBALL_AOE_RADIUS) continue;
+        LOG("INFO: FIREBALL: enemy at (q=%d, r=%d) destroyed\n", enemy->q, enemy->r);
+        EntityDespawn(i);
+    }
+
+    if (cell->cardLevel >= CARD_LVL_2)
+    {
+        ReturnPlacedCard(cell); // spent, straight back to the hand
+    }
+    else
+    {
+        // lvl 1: dead on the field for a turn. Kind/level stay on the cell
+        // so the cooled husk can hand the card back; value drops to 0 so the
+        // husk is no card (unstrikeable, unmergeable, no gem)
+        cell->value = 0;
+        cell->fireballCharge = 0;
+        cell->inDanger = false;
+        cell->turnLifetime = 0;
+        cell->huskTurns = 1;
+    }
+}
+
+static void SpawnCardKind(CardKind kind)
 {
     Entity *card = EntitySpawn(ENTITY_CARD);
     if (card == NULL) return;
 
-    // Every deal is one of the four kinds at level 1; higher levels exist
-    // only through merging on the board
-    card->cardKind = (CardKind)GetRandomValue(CARD_LEYLINE, CARD_WARD);
+    // Every deal is level 1; higher levels exist only through merging on the board
+    card->cardKind = kind;
     card->cardLevel = CARD_LVL_1;
     card->value = (int)card->cardLevel;
     card->tint = cardKindTints[card->cardKind];
@@ -2081,6 +2203,12 @@ static void SpawnCard(void)
              cardKindTooltips[card->cardKind], cardKindLifetimes[card->cardKind]);
     // Starts below the screen edge and springs up into its fan slot
     card->position = (Vector3){(float)screenWidth / 2.0f, (float)screenHeight + CARD_HEIGHT, 0.0f};
+}
+
+// A random-kind deal (the debug button; the starting hand is fixed)
+static void SpawnCard(void)
+{
+    SpawnCardKind((CardKind)GetRandomValue(CARD_LEYLINE, CARD_WARD));
 }
 
 // Update and draw frame: a flat sequence of system steps, each its own pass
@@ -2693,6 +2821,7 @@ static void UpdateDrawFrame(void)
                     hoveredCell->cardLevel++;
                     hoveredCell->value = (int)hoveredCell->cardLevel;
                     hoveredCell->turnLifetime = cardKindLifetimes[hoveredCell->cardKind]; // merge refreshes the clock
+                    hoveredCell->fireballCharge = 0;                                      // merged fireballs charge from scratch
                     impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
                     LOG("INFO: CARD: merged %s to lvl %d at (q=%d, r=%d)\n",
                         cardKindNames[card->cardKind], (int)hoveredCell->cardLevel, hoveredCell->q, hoveredCell->r);
@@ -2700,7 +2829,7 @@ static void UpdateDrawFrame(void)
                     EntityDespawn(i);
                     EnemyAIUpdate(); // card played: re-plan
                 }
-                else if (hoveredCell->value == 0)
+                else if ((hoveredCell->value == 0) && (hoveredCell->huskTurns == 0)) // husks block their tile
                 {
                     // The ghost commits: the tile takes the card's kind,
                     // level, color, and hex model
@@ -2708,6 +2837,7 @@ static void UpdateDrawFrame(void)
                     hoveredCell->cardLevel = card->cardLevel;
                     hoveredCell->value = (int)card->cardLevel;
                     hoveredCell->turnLifetime = cardKindLifetimes[card->cardKind];
+                    hoveredCell->fireballCharge = 0;
                     hoveredCell->tint = card->tint;
                     hoveredCell->modelIndex = card->modelIndex;
                     hoveredCell->isLeyline = hoveredCell->isLeyline || (card->cardKind == CARD_LEYLINE);
@@ -2898,10 +3028,43 @@ static void UpdateDrawFrame(void)
     }
 
     //
+    // fireball no-cast-time -- lvl 3 skips the charge cycle entirely: it
+    // detonates the instant a live leyline chain taps its tile, checked
+    // every frame so placing the connecting leyline (or stepping the player
+    // into the chain) sets it off immediately
+    //
+
+    {
+        bool anyLvl3 = false;
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *cell = &entities[i];
+            if ((cell->kind == ENTITY_HEX_CELL) && (cell->value > 0) && (cell->cardKind == CARD_FIREBALL) && (cell->cardLevel >= CARD_LVL_3)) anyLvl3 = true;
+        }
+        if (anyLvl3)
+        {
+            bool conductive[LEY_W][LEY_W];
+            bool live[LEY_W][LEY_W];
+            ComputeLeylineNetwork(player, conductive, live);
+            bool boomed = false;
+            for (int i = 0; i < entityCount; i++)
+            {
+                Entity *cell = &entities[i];
+                if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0) || (cell->cardKind != CARD_FIREBALL) || (cell->cardLevel < CARD_LVL_3)) continue;
+                if (!LeylineTapped(live, cell->q, cell->r)) continue;
+                DetonateFireball(cell);
+                boomed = true;
+            }
+            if (boomed) EnemyAIUpdate(); // enemies died / the card left: re-plan
+        }
+    }
+
+    //
     // turn commit -- when the lever fires: enemies execute their telegraphed
-    // intents, then every placed card burns one turn of its field lifetime
-    // and returns to the hand when the clock runs out, and finally the AI
-    // re-plans against the new board
+    // intents, spent fireball husks cool and hand their card back, connected
+    // fireballs bank a charge (detonating at full), then every placed card
+    // burns one turn of its field lifetime and returns to the hand when the
+    // clock runs out, and finally the AI re-plans against the new board
     //
 
     {
@@ -2912,7 +3075,41 @@ static void UpdateDrawFrame(void)
 
             EnemyAIExecuteIntents();
 
+            // spent fireball husks finish cooling: the card comes home
+            // (before charging, so a husk born this turn survives one full turn)
             int cellCount = entityCount; // spawns below append to the pool
+            for (int i = 0; i < cellCount; i++)
+            {
+                Entity *cell = &entities[i];
+                if ((cell->kind != ENTITY_HEX_CELL) || (cell->huskTurns == 0)) continue;
+
+                cell->huskTurns--;
+                if (cell->huskTurns > 0) continue;
+                LOG("INFO: FIREBALL: husk at (q=%d, r=%d) cooled, card returned to hand\n", cell->q, cell->r);
+                PlaySound(sndReturn);
+                ReturnPlacedCard(cell);
+            }
+
+            // fireballs bank one charge per turn while a live leyline chain
+            // taps their tile, and detonate at full charge
+            {
+                bool conductive[LEY_W][LEY_W];
+                bool live[LEY_W][LEY_W];
+                ComputeLeylineNetwork(player, conductive, live);
+                for (int i = 0; i < cellCount; i++)
+                {
+                    Entity *cell = &entities[i];
+                    if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0) || (cell->cardKind != CARD_FIREBALL)) continue;
+                    if (!LeylineTapped(live, cell->q, cell->r)) continue; // disconnected: no charge
+
+                    cell->fireballCharge++;
+                    LOG("INFO: FIREBALL: charged %d/%d at (q=%d, r=%d)\n",
+                        cell->fireballCharge, FIREBALL_CHARGE_NEEDED, cell->q, cell->r);
+                    if (cell->fireballCharge >= FIREBALL_CHARGE_NEEDED) DetonateFireball(cell);
+                }
+            }
+
+            // every remaining placed card burns one turn of field lifetime
             for (int i = 0; i < cellCount; i++)
             {
                 Entity *cell = &entities[i];
@@ -3040,6 +3237,26 @@ static void UpdateDrawFrame(void)
         SetShaderValue(cardShellShader, cardShellTimeLoc, &auroraTime, SHADER_UNIFORM_FLOAT);
     }
 
+    // Fireball AOE preview heat, per tile: every tile a placed fireball will
+    // hit glows ember-orange, rising as the charge banks (gentle pulse)
+    float fireballHeat[LEY_W][LEY_W] = {0};
+    {
+        static const int aoeDirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *fb = &entities[i];
+            if ((fb->kind != ENTITY_HEX_CELL) || (fb->value == 0) || (fb->cardKind != CARD_FIREBALL)) continue;
+            float heat = (0.35f + 0.65f * (float)fb->fireballCharge / FIREBALL_CHARGE_NEEDED) * (0.75f + 0.25f * sinf(auroraTime * 3.0f + (float)fb->q));
+            for (int d = -1; d < 6; d++) // -1 = the fireball's own tile
+            {
+                int nq = fb->q + ((d < 0) ? 0 : aoeDirs[d][0]);
+                int nr = fb->r + ((d < 0) ? 0 : aoeDirs[d][1]);
+                if (!HexOnBoard(nq, nr)) continue;
+                if (heat > fireballHeat[nq + GRID_RADIUS][nr + GRID_RADIUS]) fireballHeat[nq + GRID_RADIUS][nr + GRID_RADIUS] = heat;
+            }
+        }
+    }
+
     for (int i = 0; i < entityCount; i++)
     {
         const Entity *cell = &entities[i];
@@ -3095,6 +3312,22 @@ static void UpdateDrawFrame(void)
             DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(cell->tint, 0.30f));
         DrawCylinderWires(cell->position, drawSize, drawSize, height, 6, DARKGRAY);
 
+        // Fireball blast preview: in-range tiles wear an ember wash
+        float heat = fireballHeat[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS];
+        if (heat > 0.0f)
+            DrawCylinder(cell->position, drawSize, drawSize, height + 0.012f, 6, Fade((Color){255, 120, 50, 255}, 0.30f * heat));
+
+        // Spent fireball husk: charred mounds and a breathing ember squat on
+        // the tile until the cooldown hands the card back
+        if (cell->huskTurns > 0)
+        {
+            DrawSphere((Vector3){cell->position.x, height + 0.10f, cell->position.z}, 0.24f, (Color){28, 24, 26, 255});
+            DrawSphere((Vector3){cell->position.x + 0.14f, height + 0.07f, cell->position.z - 0.08f}, 0.13f, (Color){24, 20, 22, 255});
+            float ember = 0.5f + 0.5f * sinf(auroraTime * 2.2f + (float)cell->q);
+            DrawSphere((Vector3){cell->position.x - 0.08f, height + 0.14f, cell->position.z + 0.1f}, 0.045f,
+                       (Color){255, (unsigned char)(90 + 60 * ember), 30, (unsigned char)(120 + 100 * ember)});
+        }
+
         // Placed card: the cell wears its hex-form model on the prism top
         if ((cell->value > 0) && (cardModelCount > 0))
         {
@@ -3122,6 +3355,20 @@ static void UpdateDrawFrame(void)
             }
             rlEnableBackfaceCulling();
         }
+
+        // Fireball emplacement: one golden ember orbits per banked charge
+        if ((cell->value > 0) && (cell->cardKind == CARD_FIREBALL))
+        {
+            for (int k = 0; k < cell->fireballCharge; k++)
+            {
+                float ang = auroraTime * 1.8f + (float)k * (2.0f * PI / (float)FIREBALL_CHARGE_NEEDED);
+                Vector3 ep = {cell->position.x + cosf(ang) * 0.55f,
+                              height + 0.32f + sinf(auroraTime * 2.6f + (float)k) * 0.06f,
+                              cell->position.z + sinf(ang) * 0.55f};
+                DrawSphere(ep, 0.07f, (Color){255, 230, 150, 230});
+                DrawSphere(ep, 0.13f, (Color){255, 120, 40, 80});
+            }
+        }
     }
 
     //
@@ -3137,7 +3384,7 @@ static void UpdateDrawFrame(void)
             if ((card->kind != ENTITY_CARD) || !card->selected || (card->cardMode != CARD_HEX_FORM)) continue;
 
             bool ghostMerge = (hoveredCell->value > 0) && (hoveredCell->cardKind == card->cardKind) && (hoveredCell->cardLevel == card->cardLevel) && (hoveredCell->cardLevel < CARD_LVL_3);
-            bool ghostValid = (hoveredCell->value == 0) || ghostMerge;
+            bool ghostValid = ((hoveredCell->value == 0) && (hoveredCell->huskTurns == 0)) || ghostMerge;
             if (cardModelCount > 0)
             {
                 // Translucent hex-form model, red-tinted over an invalid target
@@ -3216,57 +3463,19 @@ static void UpdateDrawFrame(void)
     //
 
     {
-        enum
-        {
-            LEY_W = 2 * GRID_RADIUS + 1
-        };
         static const int leyDirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
-        bool conductive[LEY_W][LEY_W] = {0};
+        bool conductive[LEY_W][LEY_W];
         bool endpoint[LEY_W][LEY_W] = {0};
-        bool live[LEY_W][LEY_W] = {0};
+        bool live[LEY_W][LEY_W];
+        ComputeLeylineNetwork(player, conductive, live);
 
-        // conductivity: ONLY leyline tiles conduct (plus the player's tile as
-        // the source). Placed non-leyline cards are endpoints: they tap into
-        // an adjacent live leyline but never extend the chain themselves
+        // placed non-leyline cards are endpoints: they tap into an adjacent
+        // live leyline but never extend the chain themselves
         for (int i = 0; i < entityCount; i++)
         {
             const Entity *cell = &entities[i];
             if (cell->kind != ENTITY_HEX_CELL) continue;
-            int qi = cell->q + GRID_RADIUS;
-            int ri = cell->r + GRID_RADIUS;
-            if (cell->isLeyline) conductive[qi][ri] = true;
-            if ((cell->value > 0) && !cell->isLeyline) endpoint[qi][ri] = true;
-        }
-        if (player != NULL) conductive[player->q + GRID_RADIUS][player->r + GRID_RADIUS] = true;
-
-        // flood from the player: everything reachable is energized
-        if (player != NULL)
-        {
-            int stackQ[MAX_ENTITIES];
-            int stackR[MAX_ENTITIES];
-            int top = 0;
-            live[player->q + GRID_RADIUS][player->r + GRID_RADIUS] = true;
-            stackQ[top] = player->q;
-            stackR[top] = player->r;
-            top++;
-            while (top > 0)
-            {
-                top--;
-                int q = stackQ[top];
-                int r = stackR[top];
-                for (int d = 0; d < 6; d++)
-                {
-                    int nq = q + leyDirs[d][0];
-                    int nr = r + leyDirs[d][1];
-                    if (!HexOnBoard(nq, nr)) continue;
-                    if (!conductive[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
-                    if (live[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
-                    live[nq + GRID_RADIUS][nr + GRID_RADIUS] = true;
-                    stackQ[top] = nq;
-                    stackR[top] = nr;
-                    top++;
-                }
-            }
+            if ((cell->value > 0) && !cell->isLeyline) endpoint[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS] = true;
         }
 
         BeginTextureMode(leylineTexture);
@@ -3897,6 +4106,7 @@ int main(void)
     sndReturn = SynthSound(700.0f, 280.0f, 0.16f, 0.0f, 0.35f);
     sndHit = SynthSound(150.0f, 55.0f, 0.24f, 0.55f, 0.8f);
     sndLever = SynthSound(320.0f, 70.0f, 0.14f, 0.35f, 0.55f);
+    sndBoom = SynthSound(110.0f, 38.0f, 0.45f, 0.7f, 0.9f);
 
     // Render texture to draw, enables screen scaling
     // NOTE: If screen is scaled, mouse input should be scaled proportionally
@@ -4077,7 +4287,12 @@ int main(void)
         healthBar->maxHealth = 5;
     }
 
-    for (int i = 0; i < 4; i++) SpawnCard(); // Starting hand
+    // Starting hand: always two leylines, a hex, a ward, and a fireball
+    SpawnCardKind(CARD_LEYLINE);
+    SpawnCardKind(CARD_LEYLINE);
+    SpawnCardKind(CARD_HEX);
+    SpawnCardKind(CARD_WARD);
+    SpawnCardKind(CARD_FIREBALL);
 
     Entity *playerSpawn = EntitySpawn(ENTITY_PLAYER);
     if (playerSpawn != NULL)
@@ -4167,6 +4382,7 @@ int main(void)
     UnloadSound(sndReturn);
     UnloadSound(sndHit);
     UnloadSound(sndLever);
+    UnloadSound(sndBoom);
     CloseAudioDevice();
 
     CloseWindow(); // Close window and OpenGL context
