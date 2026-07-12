@@ -908,6 +908,45 @@ static int cardShellTimeLoc = -1;
 static float cardShellRadius = 0.98f; // Shell outer radius, fraction of HEX_SIZE
 static float cardShellHeight = 0.6f;  // Shell height above the tile top
 
+// Sound effects: tiny synthesized blips, no audio assets. Each SFX is a sine
+// sweep with a percussive decay, optionally crossfaded with white noise for
+// hits, rendered once into a Sound at startup by SynthSound
+static Sound sndPickup = {0}; // Grabbing a card or the player
+static Sound sndPlace = {0};  // Committing a card/player onto a tile
+static Sound sndMerge = {0};  // 2048 merge: rising chime
+static Sound sndReturn = {0}; // A card's field lifetime expiring
+static Sound sndHit = {0};    // Enemy smashes a card / hits the player
+static Sound sndLever = {0};  // The turn lever firing
+
+static Sound SynthSound(float startFreq, float endFreq, float duration, float noiseMix, float volume)
+{
+    const int sampleRate = 22050;
+    int frameCount = (int)(duration * (float)sampleRate);
+    short *samples = (short *)MemAlloc((unsigned int)((size_t)frameCount * sizeof(short)));
+
+    float phase = 0.0f;
+    unsigned int rng = 0x9E3779B9u;
+    for (int i = 0; i < frameCount; i++)
+    {
+        float t = (float)i / (float)frameCount;
+        float freq = startFreq + (endFreq - startFreq) * t;
+        phase += 2.0f * PI * freq / (float)sampleRate;
+        rng = rng * 1664525u + 1013904223u; // LCG white noise
+        float noise = ((float)(rng >> 16) / 32767.5f) - 1.0f;
+        float env = expf(-5.0f * t) * (1.0f - t);                            // Percussive decay, clickless end
+        float attack = fminf(1.0f, (float)i / (0.002f * (float)sampleRate)); // ~2ms ramp, clickless start
+        float s = (sinf(phase) * (1.0f - noiseMix) + noise * noiseMix) * env * attack * volume;
+        if (s > 1.0f) s = 1.0f;
+        if (s < -1.0f) s = -1.0f;
+        samples[i] = (short)(s * 32767.0f);
+    }
+
+    Wave wave = {.frameCount = (unsigned int)frameCount, .sampleRate = sampleRate, .sampleSize = 16, .channels = 1, .data = samples};
+    Sound sound = LoadSoundFromWave(wave); // Copies the samples into the audio buffer
+    MemFree(samples);
+    return sound;
+}
+
 // Leyline tweakables + the layer the network renders on (see the leyline
 // helpers further down for the color/arc math)
 static RenderTexture2D leylineTexture = {0};
@@ -1688,6 +1727,7 @@ static void TurnLever(void)
             gameTurn++;
             shakeTimeLeft = SHAKE_DURATION;
             turnLever.fired = true;
+            PlaySound(sndLever);
             LOG("INFO: TURN: lever pulled, turn is now %d\n", gameTurn);
         }
     }
@@ -2232,6 +2272,7 @@ static void EnemyAIExecuteIntents(void)
                     cardKindNames[cell->cardKind], (int)cell->cardLevel, cell->q, cell->r);
                 impact = (ImpactFx){.position = cell->position, .tint = (Color){235, 70, 60, 255}, .age = 0.0f, .active = true};
                 shakeTimeLeft = SHAKE_DURATION;
+                PlaySound(sndHit);
                 bool warded = (cell->cardKind == CARD_WARD); // Wards soak the hit for free
                 ReturnPlacedCard(cell);                      // forced back to the hand...
                 for (int h = 0; !warded && (h < entityCount); h++)
@@ -2257,6 +2298,7 @@ static void EnemyAIExecuteIntents(void)
                 if (hit->health < 0) hit->health = 0;
             }
             shakeTimeLeft = SHAKE_DURATION;
+            PlaySound(sndHit);
             LOG("INFO: ENEMY: hit the player for 2 at (q=%d, r=%d)\n", enemy->enemyIntentQ, enemy->enemyIntentR);
         }
         else if (enemy->enemyIntentKind == ENEMY_INTENT_MOVE)
@@ -2576,6 +2618,7 @@ static void UpdateDrawFrame(void)
     if ((player != NULL) && (hoveredCell != NULL) && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && (player->q == hoveredCell->q) && (player->r == hoveredCell->r))
     {
         player->selected = true;
+        PlaySound(sndPickup);
     }
 
     //
@@ -2610,6 +2653,7 @@ static void UpdateDrawFrame(void)
             if (CheckCollisionPointRec(mouse, rect))
             {
                 card->selected = true;
+                PlaySound(sndPickup);
                 break; // Only one card can be grabbed
             }
         }
@@ -2652,6 +2696,7 @@ static void UpdateDrawFrame(void)
                     impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
                     LOG("INFO: CARD: merged %s to lvl %d at (q=%d, r=%d)\n",
                         cardKindNames[card->cardKind], (int)hoveredCell->cardLevel, hoveredCell->q, hoveredCell->r);
+                    PlaySound(sndMerge);
                     EntityDespawn(i);
                     EnemyAIUpdate(); // card played: re-plan
                 }
@@ -2669,6 +2714,7 @@ static void UpdateDrawFrame(void)
                     impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
                     LOG("INFO: CARD: placed %s lvl %d at (q=%d, r=%d)\n",
                         cardKindNames[card->cardKind], (int)card->cardLevel, hoveredCell->q, hoveredCell->r);
+                    PlaySound(sndPlace);
                     EntityDespawn(i);
                     EnemyAIUpdate(); // card played: re-plan
                 }
@@ -2769,6 +2815,7 @@ static void UpdateDrawFrame(void)
                 player->q = hoveredCell->q;
                 player->r = hoveredCell->r;
                 LOG("INFO: PLAYER: placed at (q=%d, r=%d)\n", player->q, player->r);
+                PlaySound(sndPlace);
                 EnemyAIUpdate(); // player moved: re-plan
             }
         }
@@ -2876,6 +2923,7 @@ static void UpdateDrawFrame(void)
 
                 LOG("INFO: CARD: %s lvl %d expired, returned to hand from (q=%d, r=%d)\n",
                     cardKindNames[cell->cardKind], (int)cell->cardLevel, cell->q, cell->r);
+                PlaySound(sndReturn);
                 ReturnPlacedCard(cell);
             }
 
@@ -3840,6 +3888,16 @@ int main(void)
     //--------------------------------------------------------------------------------------
     InitWindow(screenWidth, screenHeight, "raylib gamejam template");
 
+    // All SFX are synthesized at startup, no audio assets (web: the browser
+    // holds audio until the first input, then it just starts working)
+    InitAudioDevice();
+    sndPickup = SynthSound(500.0f, 750.0f, 0.07f, 0.0f, 0.35f);
+    sndPlace = SynthSound(240.0f, 130.0f, 0.12f, 0.25f, 0.55f);
+    sndMerge = SynthSound(520.0f, 1180.0f, 0.22f, 0.0f, 0.45f);
+    sndReturn = SynthSound(700.0f, 280.0f, 0.16f, 0.0f, 0.35f);
+    sndHit = SynthSound(150.0f, 55.0f, 0.24f, 0.55f, 0.8f);
+    sndLever = SynthSound(320.0f, 70.0f, 0.14f, 0.35f, 0.55f);
+
     // Render texture to draw, enables screen scaling
     // NOTE: If screen is scaled, mouse input should be scaled proportionally
     target = LoadRenderTexture(screenWidth, screenHeight);
@@ -4102,6 +4160,14 @@ int main(void)
     UnloadTexture(whiteTexture);
     UnloadRenderTexture(target);
     free(entities);
+
+    UnloadSound(sndPickup);
+    UnloadSound(sndPlace);
+    UnloadSound(sndMerge);
+    UnloadSound(sndReturn);
+    UnloadSound(sndHit);
+    UnloadSound(sndLever);
+    CloseAudioDevice();
 
     CloseWindow(); // Close window and OpenGL context
     //--------------------------------------------------------------------------------------
