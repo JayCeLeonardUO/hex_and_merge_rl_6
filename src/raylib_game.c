@@ -95,9 +95,10 @@ typedef enum EntityKind
 
 typedef enum
 {
-    ENEMY_INTENT_NONE = 0, // Staying put (adjacent to the player or boxed in)
+    ENEMY_INTENT_NONE = 0, // Staying put (boxed in)
     ENEMY_INTENT_MOVE,     // Will walk to the intent tile
     ENEMY_INTENT_STRIKE,   // Will smash the placed card on the intent tile
+    ENEMY_INTENT_ATTACK,   // No card in range: will hit the player on the intent tile for 2 hearts
 } EnemyIntent;
 
 typedef enum
@@ -128,7 +129,7 @@ static const char *cardKindTooltips[NUM_CARD_KINDS] = {
     "conduit: its tile joins the leyline network",
     "AOE spell (logic TBD)",
     "curse spell (logic TBD)",
-    "protection spell (logic TBD)",
+    "baits enemy strikes in range, absorbs the hit for no heart",
 };
 static const Color cardKindTints[NUM_CARD_KINDS] = {
     {255, 255, 255, 255}, // CARD_NONE
@@ -2146,19 +2147,22 @@ static void DrawEnemyInstance(const Entity *enemy, float airTime)
     DrawModel(enemyModel, enemyPos, enemySize, WHITE);
 }
 
-// The placed card this enemy would strike on the next turn (first one in
-// attack range), or NULL. The turn pass and the intent display both call
-// this, so the telegraph always matches the action
+// The placed card this enemy would strike on the next turn, or NULL. Wards
+// bait: any ward in attack range takes priority over every other card, so a
+// well-placed ward soaks the hit. The turn pass and the intent display both
+// call this, so the telegraph always matches the action
 static Entity *EnemyStrikeTarget(const Entity *enemy)
 {
+    Entity *firstCard = NULL;
     for (int j = 0; j < entityCount; j++)
     {
         Entity *cell = &entities[j];
         if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0)) continue;
         if (HexDistance(enemy->q, enemy->r, cell->q, cell->r) > 1) continue;
-        return cell;
+        if (cell->cardKind == CARD_WARD) return cell;
+        if (firstCard == NULL) firstCard = cell;
     }
-    return NULL;
+    return firstCard;
 }
 
 // Where this enemy would stand after its chase steps toward the player:
@@ -2228,13 +2232,32 @@ static void EnemyAIExecuteIntents(void)
                     cardKindNames[cell->cardKind], (int)cell->cardLevel, cell->q, cell->r);
                 impact = (ImpactFx){.position = cell->position, .tint = (Color){235, 70, 60, 255}, .age = 0.0f, .active = true};
                 shakeTimeLeft = SHAKE_DURATION;
-                ReturnPlacedCard(cell); // forced back to the hand...
-                for (int h = 0; h < entityCount; h++)
+                bool warded = (cell->cardKind == CARD_WARD); // Wards soak the hit for free
+                ReturnPlacedCard(cell);                      // forced back to the hand...
+                for (int h = 0; !warded && (h < entityCount); h++)
                 {
                     if ((entities[h].kind == ENTITY_HEALTH_BAR) && (entities[h].health > 0)) entities[h].health--;
-                } // ...and every forced return costs the player a heart
+                } // ...and every unwarded forced return costs the player a heart
                 break;
             }
+        }
+        else if (enemy->enemyIntentKind == ENEMY_INTENT_ATTACK)
+        {
+            // Every board change re-plans, so the intent tile still holds the
+            // player: land the hit for 2 hearts
+            for (int j = 0; j < entityCount; j++)
+            {
+                Entity *hit = &entities[j];
+                if (hit->kind == ENTITY_PLAYER)
+                {
+                    impact = (ImpactFx){.position = hit->position, .tint = (Color){235, 70, 60, 255}, .age = 0.0f, .active = true};
+                }
+                if (hit->kind != ENTITY_HEALTH_BAR) continue;
+                hit->health -= 2;
+                if (hit->health < 0) hit->health = 0;
+            }
+            shakeTimeLeft = SHAKE_DURATION;
+            LOG("INFO: ENEMY: hit the player for 2 at (q=%d, r=%d)\n", enemy->enemyIntentQ, enemy->enemyIntentR);
         }
         else if (enemy->enemyIntentKind == ENEMY_INTENT_MOVE)
         {
@@ -2298,6 +2321,16 @@ static void EnemyAIUpdate(void)
         }
 
         if (player == NULL) continue;
+
+        // No card to smash: the player himself is fair game when in reach
+        if (HexDistance(enemy->q, enemy->r, player->q, player->r) <= 1)
+        {
+            enemy->enemyIntentKind = ENEMY_INTENT_ATTACK;
+            enemy->enemyIntentQ = player->q;
+            enemy->enemyIntentR = player->r;
+            continue;
+        }
+
         int destQ, destR;
         EnemyChaseDestination(enemy, player, &destQ, &destR);
         if ((destQ != enemy->q) || (destR != enemy->r))
@@ -2327,16 +2360,17 @@ static void DrawIntent(float airTime)
 
         if (enemy->enemyIntentKind == ENEMY_INTENT_NONE) continue;
         bool willStrike = (enemy->enemyIntentKind == ENEMY_INTENT_STRIKE);
+        bool willAttack = (enemy->enemyIntentKind == ENEMY_INTENT_ATTACK);
         Vector3 to = HexAxialToWorld(enemy->enemyIntentQ, enemy->enemyIntentR);
         Color intentColor;
-        if (willStrike)
+        if (willStrike || willAttack)
         {
             float pulse = 0.6f + 0.4f * sinf(airTime * 5.0f);
             intentColor = (Color){250, 45, 35, (unsigned char)(195 + 60 * pulse)};
         }
         else
         {
-            intentColor = (Color){235, 70, 60, 220}; // steady red; strikes pulse
+            intentColor = (Color){235, 70, 60, 220}; // steady red; hits pulse
         }
 
         // dashed arc from the enemy to the intended tile, built from
@@ -2375,7 +2409,7 @@ static void DrawIntent(float airTime)
         // walk to on the next lever pull -- fat cylinder segments along the
         // bezier (real geometry, reads from any camera angle), with the same
         // dark underlay treatment so it pops on bright tiles
-        if (!willStrike)
+        if (enemy->enemyIntentKind == ENEMY_INTENT_MOVE)
         {
             Vector3 tileFrom = HexAxialToWorld(enemy->q, enemy->r);
             const int archSteps = 16;
@@ -2407,7 +2441,7 @@ static void DrawIntent(float airTime)
 
             rlBegin(RL_QUADS);
             rlColor4ub(pc.r, pc.g, pc.b, pc.a);
-            for (int k = 0; willStrike && (k < intentSteps); k += 2) // dashes: strike telegraphs only, moves get the solid arch
+            for (int k = 0; (willStrike || willAttack) && (k < intentSteps); k += 2) // dashes: strikes and player hits, moves get the solid arch
             {
                 float t0 = (float)k / intentSteps;
                 float t1 = (float)(k + 1) / intentSteps;
@@ -2449,12 +2483,13 @@ static void DrawIntent(float airTime)
     rlEnableDepthTest();
     EndMode3D();
 
-    // strike intent shouts: a bobbing red "!" over any enemy about to hit a card
+    // strike intent shouts: a bobbing red "!" over any enemy about to hit a
+    // card or the player
     for (int i = 0; i < entityCount; i++)
     {
         const Entity *enemy = &entities[i];
         if ((enemy->kind != ENTITY_ENEMY) || enemy->selected) continue;
-        if (enemy->enemyIntentKind != ENEMY_INTENT_STRIKE) continue;
+        if ((enemy->enemyIntentKind != ENEMY_INTENT_STRIKE) && (enemy->enemyIntentKind != ENEMY_INTENT_ATTACK)) continue;
         Vector3 above = enemy->position;
         above.y = HEX_TILE_HEIGHT + enemySize * 2.0f + 1.9f;
         Vector2 shout = GetWorldToScreen(above, camera);
@@ -3697,9 +3732,10 @@ static void UpdateDrawFrame(void)
     {
         const Entity *enemy = &entities[i];
         if (enemy->kind != ENTITY_ENEMY) continue;
-        const char *what = (enemy->enemyIntentKind == ENEMY_INTENT_STRIKE) ? "STRIKE"
-                           : (enemy->enemyIntentKind == ENEMY_INTENT_MOVE) ? "move"
-                                                                           : "hold";
+        const char *what = (enemy->enemyIntentKind == ENEMY_INTENT_STRIKE)    ? "STRIKE"
+                           : (enemy->enemyIntentKind == ENEMY_INTENT_ATTACK) ? "ATTACK"
+                           : (enemy->enemyIntentKind == ENEMY_INTENT_MOVE)   ? "move"
+                                                                             : "hold";
         igText("enemy (%d,%d): %s -> (%d,%d)", enemy->q, enemy->r, what,
                enemy->enemyIntentQ, enemy->enemyIntentR);
     }
