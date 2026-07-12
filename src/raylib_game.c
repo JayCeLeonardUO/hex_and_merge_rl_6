@@ -949,6 +949,11 @@ static Sound sndHit = {0};    // Enemy smashes a card / hits the player
 static Sound sndLever = {0};  // The turn lever firing
 static Sound sndBoom = {0};   // Fireball detonation
 
+// Background ambience: the floating-bowls recording over a pink noise bed,
+// loop-softened and mixed offline by sandbox/gen_ambience.py (streamed, so
+// it costs no load-time decode)
+static Music bgNoise = {0};
+
 static Sound SynthSound(float startFreq, float endFreq, float duration, float noiseMix, float volume)
 {
     const int sampleRate = 22050;
@@ -1372,6 +1377,7 @@ typedef enum
     GAME_STATE_WIN, // All four exodia pieces assembled
 } GameState;
 static GameState gameState = GAME_STATE_START;
+static bool tutorialOpen = false; // The "?" how-to-play window (ImGui)
 
 // 2.5D camera: tilted orthographic view down at the board plane (y = 0);
 // no perspective foreshortening, so tiles read as a flat iso board
@@ -2866,6 +2872,9 @@ static void UpdateDrawFrame(void)
     //----------------------------------------------------------------------------------
     frameCounter++;
 
+    // Feed the streamed pink noise bed (a no-op if the wav failed to load)
+    if (bgNoise.frameCount > 0) UpdateMusicStream(bgNoise);
+
     // When ImGui wants the mouse (hovering/dragging a UI window), the board
     // must not see clicks; WantCaptureMouse lags one frame, which is fine
     uiWantsMouse = igGetIO_Nil()->WantCaptureMouse;
@@ -4237,8 +4246,9 @@ static void UpdateDrawFrame(void)
     }
 
     //
-    // card tooltip -- the hovered card's tooltip buffer in a dark strip above
-    // the fan; grabbed cards keep quiet
+    // card tooltip -- the hovered card's tooltip buffer in a dark panel
+    // above the fan, word-wrapped to a readable width and clamped on screen;
+    // grabbed cards keep quiet
     //
 
     for (int i = 0; i < entityCount; i++)
@@ -4247,15 +4257,73 @@ static void UpdateDrawFrame(void)
         if ((card->kind != ENTITY_CARD) || !card->hovered || card->selected) continue;
         if (card->tooltip[0] == '\0') continue;
 
-        const int tipSize = 20;
-        int tw = MeasureText(card->tooltip, tipSize);
-        int tx = (int)card->position.x - tw / 2;
-        int ty = (int)(card->position.y - CARD_HEIGHT * cardScale / 2.0f) - tipSize - 16;
-        // Keep the strip on screen when an edge card is hovered
-        if (tx < 8) tx = 8;
-        if (tx + tw > screenWidth - 8) tx = screenWidth - 8 - tw;
-        DrawRectangle(tx - 8, ty - 6, tw + 16, tipSize + 12, Fade(BLACK, 0.72f));
-        DrawText(card->tooltip, tx, ty, tipSize, RAYWHITE);
+        const int tipSize = 18;
+        const int tipMaxW = 300;  // Wrap width, keeps long descriptions on screen
+        const int tipLineH = tipSize + 5;
+
+        // Word wrap: greedy fill over index slices of the tooltip buffer,
+        // flushing a line when the next word would overflow the wrap width
+        char lines[6][160];
+        int lineCount = 0;
+        {
+            const char *text = card->tooltip;
+            int lineStart = 0; // First char of the line being built
+            int lineEnd = 0;   // One past its last committed word
+            int at = 0;
+            while ((lineCount < 6) && (text[at] != '\0'))
+            {
+                int wordStart = at;
+                while ((text[at] != '\0') && (text[at] != ' ')) at++;
+                int wordEnd = at;
+                while (text[at] == ' ') at++;
+
+                char candidate[160];
+                int len = wordEnd - lineStart;
+                if (len > 159) len = 159;
+                memcpy(candidate, &text[lineStart], (size_t)len);
+                candidate[len] = '\0';
+
+                if ((lineEnd > lineStart) && (MeasureText(candidate, tipSize) > tipMaxW))
+                {
+                    int ll = lineEnd - lineStart;
+                    if (ll > 159) ll = 159;
+                    memcpy(lines[lineCount], &text[lineStart], (size_t)ll);
+                    lines[lineCount][ll] = '\0';
+                    lineCount++;
+                    lineStart = wordStart;
+                }
+                lineEnd = wordEnd;
+            }
+            if ((lineCount < 6) && (lineEnd > lineStart))
+            {
+                int ll = lineEnd - lineStart;
+                if (ll > 159) ll = 159;
+                memcpy(lines[lineCount], &text[lineStart], (size_t)ll);
+                lines[lineCount][ll] = '\0';
+                lineCount++;
+            }
+        }
+
+        int panelW = 0;
+        for (int li = 0; li < lineCount; li++)
+        {
+            int lw = MeasureText(lines[li], tipSize);
+            if (lw > panelW) panelW = lw;
+        }
+        int panelH = lineCount * tipLineH;
+
+        int tx = (int)card->position.x - panelW / 2;
+        int ty = (int)(card->position.y - CARD_HEIGHT * cardScale / 2.0f) - panelH - 18;
+        if (tx < 12) tx = 12;
+        if (tx + panelW > screenWidth - 12) tx = screenWidth - 12 - panelW;
+        if (ty < 12) ty = 12;
+
+        DrawRectangle(tx - 10, ty - 8, panelW + 20, panelH + 14, Fade(BLACK, 0.78f));
+        DrawRectangleLines(tx - 10, ty - 8, panelW + 20, panelH + 14, Fade(card->tint, 0.8f));
+        for (int li = 0; li < lineCount; li++)
+        {
+            DrawText(lines[li], tx, ty + li * tipLineH, tipSize, RAYWHITE);
+        }
         break; // Fan cards overlap: only the frontmost hovered one speaks
     }
 
@@ -4354,6 +4422,15 @@ static void UpdateDrawFrame(void)
         int nextEnemy = ENEMY_SPAWN_PERIOD - (gameTurn % ENEMY_SPAWN_PERIOD);
         const char *spawnText = TextFormat("next card %d   next enemy %d", nextCard, nextEnemy);
         DrawTextOutlined(spawnText, screenWidth / 2 - MeasureText(spawnText, 20) / 2, 64, 20, LIGHTGRAY);
+    }
+
+    // help -- a "?" in the top right corner toggles the how-to-play window
+    {
+        Vector2 helpAt = {(float)screenWidth - 40.0f, 44.0f};
+        bool overHelp = CheckCollisionPointCircle(mouse, helpAt, 18.0f);
+        Color helpColor = overHelp ? (Color){255, 240, 140, 255} : (Color){255, 220, 60, 255};
+        DrawTextOutlined("?", (int)helpAt.x - MeasureText("?", 36) / 2, (int)helpAt.y - 18, 36, helpColor);
+        if (overHelp && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) tutorialOpen = !tutorialOpen;
     }
 
     DrawRectangleLinesEx((Rectangle){0, 0, screenWidth, screenHeight}, 16, BLACK);
@@ -4466,6 +4543,49 @@ static void UpdateDrawFrame(void)
     if (IsKeyPressed(KEY_GRAVE)) devMenuOpen = !devMenuOpen;
 
     rlImGuiBegin();
+
+    // The "?" tutorial: a plain-text how-to-play window
+    if (tutorialOpen)
+    {
+        igSetNextWindowSize((ImVec2_c){430, 500}, ImGuiCond_FirstUseEver);
+        igSetNextWindowPos((ImVec2_c){40, 90}, ImGuiCond_FirstUseEver, (ImVec2_c){0, 0});
+        igBegin("how to play", &tutorialOpen, 0);
+        igTextWrapped("GOAL");
+        igTextWrapped("Reassemble the hex king: merge every card kind up to level 4. "
+                      "A level 4 card becomes one of his four sealed pieces -- hold all four and you win. "
+                      "Lose all your hearts and the run is over.");
+        igSeparator();
+        igTextWrapped("CARDS");
+        igTextWrapped("Drag a card from your hand onto an empty tile to play it. "
+                      "Dropping a card onto a placed card of the SAME kind and SAME level merges them into one card a level higher (2048 rules). "
+                      "Every placed card only stays on the field a few turns (the number on its tile), then returns to your hand.");
+        igSeparator();
+        igTextWrapped("LEYLINES");
+        igTextWrapped("Only leyline tiles conduct, starting from the tile you stand on. "
+                      "Spell cards work while a live leyline chain touches their tile -- they tap the network but never extend it.");
+        igSeparator();
+        igTextWrapped("THE SPELLS");
+        igTextWrapped("FIREBALL: while connected it banks one charge per turn, and at 2 charges it detonates, "
+                      "destroying every enemy within 1 tile. It fires BEFORE the enemies act. "
+                      "A level 1 fireball leaves a husk blocking its tile for a turn; higher levels skip the wait.");
+        igTextWrapped("WARD: enemies smash it before anything else in their reach, and it costs you no heart. "
+                      "A used ward comes back exhausted and rests in your hand for one turn.");
+        igTextWrapped("HEX: a curse trap. The enemy that strikes it fights for YOU for 1/2/3 turns (by level), "
+                      "hunting other enemies. Cursed enemies wear a purple hull.");
+        igSeparator();
+        igTextWrapped("ENEMIES");
+        igTextWrapped("Each enemy telegraphs its next action: a solid red arch is a move, a pulsing dashed arc "
+                      "with a \"!\" is an attack. They smash any card in reach (wards first) -- costing you a heart -- "
+                      "and hit YOU for 2 hearts when they reach you with no card to bait them. "
+                      "Every kill drops a card pickup where the enemy died.");
+        igSeparator();
+        igTextWrapped("THE TURN");
+        igTextWrapped("You may walk 1 tile per turn (drag yourself). The crystal's tile is solid -- walk around it. "
+                      "Click the big crystal button on the right to end the turn. "
+                      "The crystal grows a free card beside itself every 2 turns; a new enemy arrives every 3. "
+                      "Stand on a pickup to collect it.");
+        igEnd();
+    }
 
     if (devMenuOpen)
     {
@@ -4604,6 +4724,15 @@ int main(void)
     sndHit = SynthSound(150.0f, 55.0f, 0.24f, 0.55f, 0.8f);
     sndLever = SynthSound(320.0f, 70.0f, 0.14f, 0.35f, 0.55f);
     sndBoom = SynthSound(110.0f, 38.0f, 0.45f, 0.7f, 0.9f);
+
+    // The ambience bed under everything, quiet enough to sit behind the SFX
+    bgNoise = LoadMusicStream("resources/ambience.wav");
+    if (bgNoise.frameCount > 0)
+    {
+        bgNoise.looping = true;
+        SetMusicVolume(bgNoise, 0.08f);
+        PlayMusicStream(bgNoise);
+    }
 
     // Render texture to draw, enables screen scaling
     // NOTE: If screen is scaled, mouse input should be scaled proportionally
@@ -4843,6 +4972,7 @@ int main(void)
     UnloadSound(sndHit);
     UnloadSound(sndLever);
     UnloadSound(sndBoom);
+    UnloadMusicStream(bgNoise);
     CloseAudioDevice();
 
     CloseWindow(); // Close window and OpenGL context
