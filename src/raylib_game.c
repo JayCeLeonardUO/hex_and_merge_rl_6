@@ -95,6 +95,13 @@ typedef enum EntityKind
 
 typedef enum
 {
+    ENEMY_INTENT_NONE = 0, // Staying put (adjacent to the player or boxed in)
+    ENEMY_INTENT_MOVE,     // Will walk to the intent tile
+    ENEMY_INTENT_STRIKE,   // Will smash the placed card on the intent tile
+} EnemyIntent;
+
+typedef enum
+{
     CARD_NONE = 0,
     CARD_LEYLINE,  // Conduit: its tile joins the leyline network
     CARD_FIREBALL, // AOE spell (logic TBD)
@@ -115,6 +122,14 @@ typedef enum
 
 // Hand label + deal tint per kind (index by CardKind)
 static const char *cardKindNames[NUM_CARD_KINDS] = {"", "ley", "fire", "hex", "ward"};
+// Hover tooltip per kind, copied into the card's tooltip buffer at deal
+static const char *cardKindTooltips[NUM_CARD_KINDS] = {
+    "",
+    "conduit: its tile joins the leyline network",
+    "AOE spell (logic TBD)",
+    "curse spell (logic TBD)",
+    "protection spell (logic TBD)",
+};
 static const Color cardKindTints[NUM_CARD_KINDS] = {
     {255, 255, 255, 255}, // CARD_NONE
     {140, 225, 255, 255}, // leyline: conduit cyan
@@ -122,6 +137,9 @@ static const Color cardKindTints[NUM_CARD_KINDS] = {
     {185, 100, 235, 255}, // hex: curse violet
     {255, 215, 120, 255}, // ward: warding gold
 };
+// Committed turns a played card stays on the field before returning to the
+// hand (index by CardKind); a merge refreshes the clock
+static const int cardKindLifetimes[NUM_CARD_KINDS] = {0, 3, 2, 2, 3};
 
 // Mode Of Card
 typedef enum CardMode
@@ -192,6 +210,14 @@ typedef struct Entity
     // level of the card placed on them so merges can match against it
     CardLevel cardLevel;
 
+    // Hex cell: procedurally generated crystal shell worn while a card sits
+    // on the tile (built once per cell at grid spawn, unloaded at shutdown)
+    Mesh cardShellMesh;
+
+    // Hex cell: an enemy telegraphed a strike on this card. Set/cleared only
+    // by EnemyAIUpdate; the shell draws with the danger look while true
+    bool inDanger;
+
     // Enemy Shader params
 
     float enemyPulseSpeed;
@@ -199,10 +225,24 @@ typedef struct Entity
     float enemyBreatheSpeed;
     int enemyMoveRange; // Tiles walked toward the player per committed turn
 
+    // The enemy's telegraphed plan for the next lever pull, recomputed by
+    // EnemyAIUpdate on every board change and read verbatim by DrawIntent
+    int enemyIntentKind; // ENEMY_INTENT_*
+    int enemyIntentQ;    // Target tile of the plan
+    int enemyIntentR;
+
     bool IsDraggable;
 
     // Movement Range
     int moveRange;
+
+    // Hex cell: committed turns the placed card has left on the field. Set
+    // from the kind's lifetime when the card is played (a merge refreshes
+    // it), counted down by the turn pass, card returns to the hand at 0
+    int turnLifetime;
+
+    // Tooltip text shown while hovering this entity; empty string = no tooltip
+    char tooltip[128];
 
 } Entity;
 
@@ -273,6 +313,16 @@ static float shakeTimeLeft = 0.0f; // Screen shake seconds remaining (kicked by 
 static Model cardModels[MAX_CARD_MODELS] = {0};
 static Model hexModels[MAX_CARD_MODELS] = {0};
 static int cardModelCount = 0;
+// Model pinning: every card kind wears one specific export, matched by
+// filename substring during the model scan (-1 = not found, random fallback)
+static int kindModelIndex[NUM_CARD_KINDS] = {-1, -1, -1, -1, -1};
+static const char *kindModelTags[NUM_CARD_KINDS] = {
+    "",       // CARD_NONE
+    "Icon85", // leyline: blue sparkles
+    "Icon16", // fireball: flames
+    "Icon38", // hex: the heart card
+    "Icon29", // ward: the shield card
+};
 
 // Foil shine for the card models: a diagonal iridescent band swept across the
 // face, drawn as an additive second pass. The fragment shader lives here as a
@@ -762,14 +812,109 @@ static float enemyRim = 0.8f;           // Pastel fresnel bleed on the fill
 static float enemyLineWidth = 2.0f;     // Wire line width, screen px
 static float enemyOutline = 0.05f;      // L4D red hull thickness, 0 = off
 
+// Card shell: the translucent crystal skin every placed card wears, drawn as
+// the cell's generated hex-frustum mesh. One fragment shader does both
+// looks: cardValue drives a level color ramp (1 cyan -> 2 violet -> 3 gold)
+// with a fresnel rim carrying most of the alpha, and the danger uniform
+// crossfades the whole skin to a red pulse when EnemyAIUpdate telegraphs a
+// strike on this card. Alpha blended over the gem, so both keep showing
+#if defined(PLATFORM_WEB)
+static const char *cardShellVS =
+    "#version 100\n"
+    "attribute vec3 vertexPosition;\n"
+    "attribute vec3 vertexNormal;\n"
+    "uniform mat4 mvp;\n"
+    "uniform mat4 matModel;\n"
+    "varying vec3 fragNormal;\n"
+    "varying vec3 fragWorldPos;\n"
+    "void main()\n"
+    "{\n"
+    "    fragNormal = normalize(vec3(matModel*vec4(vertexNormal, 0.0)));\n"
+    "    fragWorldPos = vec3(matModel*vec4(vertexPosition, 1.0));\n"
+    "    gl_Position = mvp*vec4(vertexPosition, 1.0);\n"
+    "}\n";
+static const char *cardShellFS =
+    "#version 100\n"
+    "precision mediump float;\n"
+    "varying vec3 fragNormal;\n"
+    "varying vec3 fragWorldPos;\n"
+    "uniform vec3 viewPos;\n"
+    "uniform float cardValue;\n"
+    "uniform float danger;\n"
+    "uniform float time;\n"
+    "void main()\n"
+    "{\n"
+    "    vec3 lvl1 = vec3(0.30, 0.75, 0.95);\n"
+    "    vec3 lvl2 = vec3(0.65, 0.40, 0.95);\n"
+    "    vec3 lvl3 = vec3(1.00, 0.80, 0.30);\n"
+    "    float t = clamp((cardValue - 1.0)*0.5, 0.0, 1.0);\n"
+    "    vec3 base = mix(mix(lvl1, lvl2, min(t*2.0, 1.0)), lvl3, max(t*2.0 - 1.0, 0.0));\n"
+    "    vec3 V = normalize(viewPos - fragWorldPos);\n"
+    "    float fres = pow(1.0 - clamp(dot(V, normalize(fragNormal)), 0.0, 1.0), 2.0);\n"
+    "    float alpha = 0.15 + 0.5*fres;\n"
+    "    float pulse = 0.5 + 0.5*sin(time*6.0);\n"
+    "    base = mix(base, vec3(1.0, 0.10, 0.07), danger);\n"
+    "    alpha = mix(alpha, 0.25 + 0.55*pulse, danger);\n"
+    "    gl_FragColor = vec4(base, alpha);\n"
+    "}\n";
+#else
+static const char *cardShellVS =
+    "#version 330\n"
+    "in vec3 vertexPosition;\n"
+    "in vec3 vertexNormal;\n"
+    "uniform mat4 mvp;\n"
+    "uniform mat4 matModel;\n"
+    "out vec3 fragNormal;\n"
+    "out vec3 fragWorldPos;\n"
+    "void main()\n"
+    "{\n"
+    "    fragNormal = normalize(vec3(matModel*vec4(vertexNormal, 0.0)));\n"
+    "    fragWorldPos = vec3(matModel*vec4(vertexPosition, 1.0));\n"
+    "    gl_Position = mvp*vec4(vertexPosition, 1.0);\n"
+    "}\n";
+static const char *cardShellFS =
+    "#version 330\n"
+    "in vec3 fragNormal;\n"
+    "in vec3 fragWorldPos;\n"
+    "uniform vec3 viewPos;\n"
+    "uniform float cardValue;\n"
+    "uniform float danger;\n"
+    "uniform float time;\n"
+    "out vec4 finalColor;\n"
+    "void main()\n"
+    "{\n"
+    "    vec3 lvl1 = vec3(0.30, 0.75, 0.95);\n"
+    "    vec3 lvl2 = vec3(0.65, 0.40, 0.95);\n"
+    "    vec3 lvl3 = vec3(1.00, 0.80, 0.30);\n"
+    "    float t = clamp((cardValue - 1.0)*0.5, 0.0, 1.0);\n"
+    "    vec3 base = mix(mix(lvl1, lvl2, min(t*2.0, 1.0)), lvl3, max(t*2.0 - 1.0, 0.0));\n"
+    "    vec3 V = normalize(viewPos - fragWorldPos);\n"
+    "    float fres = pow(1.0 - clamp(dot(V, normalize(fragNormal)), 0.0, 1.0), 2.0);\n"
+    "    float alpha = 0.15 + 0.5*fres;\n"
+    "    float pulse = 0.5 + 0.5*sin(time*6.0);\n"
+    "    base = mix(base, vec3(1.0, 0.10, 0.07), danger);\n"
+    "    alpha = mix(alpha, 0.25 + 0.55*pulse, danger);\n"
+    "    finalColor = vec4(base, alpha);\n"
+    "}\n";
+#endif
+
+static Shader cardShellShader = {0};
+static Material cardShellMaterial = {0};
+static int cardShellViewPosLoc = -1;
+static int cardShellValueLoc = -1;
+static int cardShellDangerLoc = -1;
+static int cardShellTimeLoc = -1;
+static float cardShellRadius = 0.98f; // Shell outer radius, fraction of HEX_SIZE
+static float cardShellHeight = 0.6f;  // Shell height above the tile top
+
 // Leyline tweakables + the layer the network renders on (see the leyline
 // helpers further down for the color/arc math)
 static RenderTexture2D leylineTexture = {0};
-static float leyHue = 0.52f;   // Film center on the color wheel, 0..1
-static float leyIrid = 0.35f;  // Hue spread along a beam, 0 = flat color
-static float leyInk = 2.0f;    // Pen outline width in screen px, 0 = off
-static float leyArc = 0.22f;   // Beam arc height
-static float leyWidth = 3.0f;  // Beam line width in px
+static float leyHue = 0.52f;  // Film center on the color wheel, 0..1
+static float leyIrid = 0.35f; // Hue spread along a beam, 0 = flat color
+static float leyInk = 2.0f;   // Pen outline width in screen px, 0 = off
+static float leyArc = 0.22f;  // Beam arc height
+static float leyWidth = 3.0f; // Beam line width in px
 
 static EnemyShaderLocs GetEnemyShaderLocs(Shader shader)
 {
@@ -1588,6 +1733,64 @@ static void TurnLever(void)
 }
 
 // Spawn one ENTITY_HEX_CELL per cell of the hexagonal board
+// Appends one triangle (positions + one hard face normal for all three
+// corners) to a mesh being built; *at is the running vertex index
+static void HexMeshPushTri(Mesh *mesh, int *at, Vector3 a, Vector3 b, Vector3 c, Vector3 n)
+{
+    Vector3 corners[3] = {a, b, c};
+    for (int v = 0; v < 3; v++)
+    {
+        mesh->vertices[(*at) * 3 + 0] = corners[v].x;
+        mesh->vertices[(*at) * 3 + 1] = corners[v].y;
+        mesh->vertices[(*at) * 3 + 2] = corners[v].z;
+        mesh->normals[(*at) * 3 + 0] = n.x;
+        mesh->normals[(*at) * 3 + 1] = n.y;
+        mesh->normals[(*at) * 3 + 2] = n.z;
+        (*at)++;
+    }
+}
+
+// Generates the card shell: a pointy-top hexagonal frustum (tapered sides,
+// flat top, open bottom) sitting on y=0, unwelded so every face keeps a hard
+// normal for the shell shader's fresnel. Every cell builds its own at grid
+// spawn and carries it in the fat struct
+static Mesh GenHexCardMesh(float radius, float height)
+{
+    const int sides = 6;
+    const float topScale = 0.78f; // Top hex narrower than the base
+
+    Mesh mesh = {0};
+    mesh.triangleCount = sides * 3; // 2 per side quad + 1 top fan slice
+    mesh.vertexCount = mesh.triangleCount * 3;
+    mesh.vertices = (float *)MemAlloc((unsigned int)(mesh.vertexCount * 3 * sizeof(float)));
+    mesh.normals = (float *)MemAlloc((unsigned int)(mesh.vertexCount * 3 * sizeof(float)));
+
+    int at = 0;
+    for (int k = 0; k < sides; k++)
+    {
+        // Same corner angles as the board hexes (pointy-top on XZ)
+        float a0 = DEG2RAD * (60.0f * (float)k + 30.0f);
+        float a1 = DEG2RAD * (60.0f * (float)(k + 1) + 30.0f);
+        Vector3 b0 = {cosf(a0) * radius, 0.0f, sinf(a0) * radius};
+        Vector3 b1 = {cosf(a1) * radius, 0.0f, sinf(a1) * radius};
+        Vector3 t0 = {cosf(a0) * radius * topScale, height, sinf(a0) * radius * topScale};
+        Vector3 t1 = {cosf(a1) * radius * topScale, height, sinf(a1) * radius * topScale};
+
+        // Side normal from the face itself, flipped outward if the winding
+        // put it inward (robust against angle-direction mistakes)
+        Vector3 n = Vector3Normalize(Vector3CrossProduct(Vector3Subtract(t0, b0), Vector3Subtract(b1, b0)));
+        Vector3 outward = {cosf((a0 + a1) / 2.0f), 0.0f, sinf((a0 + a1) / 2.0f)};
+        if (Vector3DotProduct(n, outward) < 0.0f) n = Vector3Negate(n);
+
+        HexMeshPushTri(&mesh, &at, b0, t0, t1, n);
+        HexMeshPushTri(&mesh, &at, b0, t1, b1, n);
+        HexMeshPushTri(&mesh, &at, (Vector3){0.0f, height, 0.0f}, t0, t1, (Vector3){0.0f, 1.0f, 0.0f});
+    }
+
+    UploadMesh(&mesh, false);
+    return mesh;
+}
+
 static void SpawnHexGrid(void)
 {
     for (int q = -GRID_RADIUS; q <= GRID_RADIUS; q++)
@@ -1604,6 +1807,7 @@ static void SpawnHexGrid(void)
             cell->position = HexAxialToWorld(q, r);
             cell->radius = HEX_SIZE;
             cell->tint = LIGHTGRAY;
+            cell->cardShellMesh = GenHexCardMesh(HEX_SIZE * cardShellRadius, cardShellHeight);
         }
     }
 }
@@ -1790,6 +1994,34 @@ static void SpawnEnemy(int q, int r)
     spawned++;
 }
 
+// Lift a placed card off its tile and back into the hand, kind and level
+// intact, springing into the fan from the tile it left. Shared by the
+// default turn return and by enemies striking cards off the board
+static void ReturnPlacedCard(Entity *cell)
+{
+    Entity *back = EntitySpawn(ENTITY_CARD);
+    if (back != NULL)
+    {
+        back->cardKind = cell->cardKind;
+        back->cardLevel = cell->cardLevel;
+        back->value = (int)cell->cardLevel;
+        back->tint = cardKindTints[cell->cardKind];
+        back->cardMode = CARD_REC_FORM;
+        back->modelIndex = cell->modelIndex;
+        snprintf(back->tooltip, sizeof(back->tooltip), "%s -- stays %d turns on the field",
+                 cardKindTooltips[back->cardKind], cardKindLifetimes[back->cardKind]);
+        Vector2 lift = GetWorldToScreen(cell->position, camera);
+        back->position = (Vector3){lift.x, lift.y, 0.0f};
+    }
+
+    cell->value = 0;
+    cell->cardKind = CARD_NONE;
+    cell->cardLevel = 0;
+    cell->isLeyline = false;
+    cell->inDanger = false; // No card, nothing to strike
+    cell->turnLifetime = 0;
+}
+
 static void SpawnCard(void)
 {
     Entity *card = EntitySpawn(ENTITY_CARD);
@@ -1803,6 +2035,9 @@ static void SpawnCard(void)
     card->tint = cardKindTints[card->cardKind];
     card->cardMode = CARD_REC_FORM;
     card->modelIndex = (cardModelCount > 0) ? GetRandomValue(0, cardModelCount - 1) : 0;
+    if (kindModelIndex[card->cardKind] >= 0) card->modelIndex = kindModelIndex[card->cardKind];
+    snprintf(card->tooltip, sizeof(card->tooltip), "%s -- stays %d turns on the field",
+             cardKindTooltips[card->cardKind], cardKindLifetimes[card->cardKind]);
     // Starts below the screen edge and springs up into its fan slot
     card->position = (Vector3){(float)screenWidth / 2.0f, (float)screenHeight + CARD_HEIGHT, 0.0f};
 }
@@ -1909,6 +2144,327 @@ static void DrawEnemyInstance(const Entity *enemy, float airTime)
     SetShaderValue(enemyShader, enemyLocs.breatheAmp, &enemy->enemyBreatheAmp, SHADER_UNIFORM_FLOAT);
     SetShaderValue(enemyShader, enemyLocs.breatheSpeed, &enemy->enemyBreatheSpeed, SHADER_UNIFORM_FLOAT);
     DrawModel(enemyModel, enemyPos, enemySize, WHITE);
+}
+
+// The placed card this enemy would strike on the next turn (first one in
+// attack range), or NULL. The turn pass and the intent display both call
+// this, so the telegraph always matches the action
+static Entity *EnemyStrikeTarget(const Entity *enemy)
+{
+    for (int j = 0; j < entityCount; j++)
+    {
+        Entity *cell = &entities[j];
+        if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0)) continue;
+        if (HexDistance(enemy->q, enemy->r, cell->q, cell->r) > 1) continue;
+        return cell;
+    }
+    return NULL;
+}
+
+// Where this enemy would stand after its chase steps toward the player:
+// greedy neighbor steps, stopping once adjacent, never onto another enemy
+static void EnemyChaseDestination(const Entity *enemy, const Entity *player, int *outQ, int *outR)
+{
+    static const int dirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+    int q = enemy->q;
+    int r = enemy->r;
+    for (int step = 0; step < enemy->enemyMoveRange; step++)
+    {
+        if (HexDistance(q, r, player->q, player->r) <= 1) break;
+
+        int bestQ = q;
+        int bestR = r;
+        int bestDist = HexDistance(q, r, player->q, player->r);
+        for (int d = 0; d < 6; d++)
+        {
+            int nq = q + dirs[d][0];
+            int nr = r + dirs[d][1];
+            if (!HexOnBoard(nq, nr)) continue;
+
+            bool occupied = false;
+            for (int j = 0; j < entityCount; j++)
+            {
+                const Entity *other = &entities[j];
+                if ((other->kind != ENTITY_ENEMY) || (other == enemy)) continue;
+                if ((other->q == nq) && (other->r == nr)) occupied = true;
+            }
+            if (occupied) continue;
+
+            int dist = HexDistance(nq, nr, player->q, player->r);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestQ = nq;
+                bestR = nr;
+            }
+        }
+        if ((bestQ == q) && (bestR == r)) break; // boxed in
+        q = bestQ;
+        r = bestR;
+    }
+    *outQ = q;
+    *outR = r;
+}
+
+// EXECUTES each enemy's stored intent verbatim on a committed turn (strike
+// the telegraphed card / walk to the telegraphed tile). Runs only from the
+// turn-commit pass; EnemyAIUpdate re-plans right after
+static void EnemyAIExecuteIntents(void)
+{
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *enemy = &entities[i];
+        if ((enemy->kind != ENTITY_ENEMY) || enemy->selected) continue;
+
+        if (enemy->enemyIntentKind == ENEMY_INTENT_STRIKE)
+        {
+            for (int j = 0; j < entityCount; j++)
+            {
+                Entity *cell = &entities[j];
+                if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0)) continue;
+                if ((cell->q != enemy->enemyIntentQ) || (cell->r != enemy->enemyIntentR)) continue;
+
+                LOG("INFO: ENEMY: struck %s lvl %d at (q=%d, r=%d)\n",
+                    cardKindNames[cell->cardKind], (int)cell->cardLevel, cell->q, cell->r);
+                impact = (ImpactFx){.position = cell->position, .tint = (Color){235, 70, 60, 255}, .age = 0.0f, .active = true};
+                shakeTimeLeft = SHAKE_DURATION;
+                ReturnPlacedCard(cell); // forced back to the hand...
+                for (int h = 0; h < entityCount; h++)
+                {
+                    if ((entities[h].kind == ENTITY_HEALTH_BAR) && (entities[h].health > 0)) entities[h].health--;
+                } // ...and every forced return costs the player a heart
+                break;
+            }
+        }
+        else if (enemy->enemyIntentKind == ENEMY_INTENT_MOVE)
+        {
+            bool taken = false;
+            for (int j = 0; j < entityCount; j++)
+            {
+                const Entity *other = &entities[j];
+                if ((other->kind != ENTITY_ENEMY) || (other == enemy)) continue;
+                if ((other->q == enemy->enemyIntentQ) && (other->r == enemy->enemyIntentR)) taken = true;
+            }
+            if (!taken)
+            {
+                enemy->q = enemy->enemyIntentQ;
+                enemy->r = enemy->enemyIntentR;
+                LOG("INFO: ENEMY: chased to (q=%d, r=%d)\n", enemy->q, enemy->r);
+            }
+        }
+    }
+}
+
+// The enemy decision pass: recomputes every telegraph from the live board.
+// Event-driven, not per-frame -- call it whenever the board changes in a way
+// the enemies care about: a card is played, the player moves, and a new turn
+// has started (after intents execute and placed cards return). The intent
+// display only reads the stored fields -- it cannot disagree with what
+// EnemyAIExecuteIntents will do
+static void EnemyAIUpdate(void)
+{
+    Entity *player = NULL;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_PLAYER)
+        {
+            player = &entities[i];
+            break;
+        }
+    }
+
+    // Every re-plan starts from a clean board: only cards a strike is
+    // telegraphed on below wear the danger shell
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_HEX_CELL) entities[i].inDanger = false;
+    }
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *enemy = &entities[i];
+        if (enemy->kind != ENTITY_ENEMY) continue;
+
+        enemy->enemyIntentKind = ENEMY_INTENT_NONE;
+
+        Entity *strike = EnemyStrikeTarget(enemy);
+        if (strike != NULL)
+        {
+            enemy->enemyIntentKind = ENEMY_INTENT_STRIKE;
+            enemy->enemyIntentQ = strike->q;
+            enemy->enemyIntentR = strike->r;
+            strike->inDanger = true;
+            continue;
+        }
+
+        if (player == NULL) continue;
+        int destQ, destR;
+        EnemyChaseDestination(enemy, player, &destQ, &destR);
+        if ((destQ != enemy->q) || (destR != enemy->r))
+        {
+            enemy->enemyIntentKind = ENEMY_INTENT_MOVE;
+            enemy->enemyIntentQ = destQ;
+            enemy->enemyIntentR = destR;
+        }
+    }
+}
+
+// enemy intent -- the telegraph for the next lever pull, drawing only the
+// stored intent fields EnemyAIUpdate computed so it can never lie. Strike: a
+// red dashed arc to the doomed card, a pulsing ring, the raised wash hex,
+// and a bobbing "!" shout. Move: a solid red arch from the enemy's tile to
+// the tile it will walk to, plus a steady ring there. Call it LAST in the
+// scene, with nothing drawn after: the 3D part runs depth-off so no crystal,
+// card, or particle can cover the warning
+static void DrawIntent(float airTime)
+{
+    BeginMode3D(camera);
+    rlDisableDepthTest();
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *enemy = &entities[i];
+        if ((enemy->kind != ENTITY_ENEMY) || enemy->selected) continue;
+
+        if (enemy->enemyIntentKind == ENEMY_INTENT_NONE) continue;
+        bool willStrike = (enemy->enemyIntentKind == ENEMY_INTENT_STRIKE);
+        Vector3 to = HexAxialToWorld(enemy->enemyIntentQ, enemy->enemyIntentR);
+        Color intentColor;
+        if (willStrike)
+        {
+            float pulse = 0.6f + 0.4f * sinf(airTime * 5.0f);
+            intentColor = (Color){250, 45, 35, (unsigned char)(195 + 60 * pulse)};
+        }
+        else
+        {
+            intentColor = (Color){235, 70, 60, 220}; // steady red; strikes pulse
+        }
+
+        // dashed arc from the enemy to the intended tile, built from
+        // camera-facing ribbon quads: glLineWidth is capped near 1px on core
+        // GL, so thickness has to be real geometry
+        Vector3 from = enemy->position;
+        Vector3 camFwd = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+        const float ribbonHalf = 0.07f;
+        float ringR = HEX_SIZE * (0.72f + 0.05f * sinf(airTime * 5.0f));
+        const float bandHalf = 0.07f;
+        const int intentSteps = 14;
+        rlDisableBackfaceCulling();
+
+        // strike target: a filled red hex RAISED above the doomed card (the
+        // gem slab sits on the tile and swallows anything drawn at tile
+        // level), bobbing and pulsing so it is hard to miss
+        if (willStrike)
+        {
+            float washPulse = 0.5f + 0.5f * sinf(airTime * 6.0f);
+            float washY = HEX_TILE_HEIGHT + 0.65f + 0.06f * sinf(airTime * 3.0f);
+            rlBegin(RL_TRIANGLES);
+            rlColor4ub(250, 25, 20, (unsigned char)(150 + 90 * washPulse));
+            for (int k = 0; k < 6; k++)
+            {
+                float a0 = DEG2RAD * (60.0f * (float)k + 30.0f);
+                float a1 = DEG2RAD * (60.0f * (float)(k + 1) + 30.0f);
+                float rr = HEX_SIZE * 0.96f;
+                rlVertex3f(to.x, washY, to.z);
+                rlVertex3f(to.x + cosf(a0) * rr, washY, to.z + sinf(a0) * rr);
+                rlVertex3f(to.x + cosf(a1) * rr, washY, to.z + sinf(a1) * rr);
+            }
+            rlEnd();
+        }
+
+        // move: a SOLID red arch from the enemy's tile to the tile it will
+        // walk to on the next lever pull -- fat cylinder segments along the
+        // bezier (real geometry, reads from any camera angle), with the same
+        // dark underlay treatment so it pops on bright tiles
+        if (!willStrike)
+        {
+            Vector3 tileFrom = HexAxialToWorld(enemy->q, enemy->r);
+            const int archSteps = 16;
+            for (int pass = 0; pass < 2; pass++)
+            {
+                float rad = (pass == 0) ? 0.15f : 0.10f;
+                Color pc = (pass == 0) ? (Color){16, 10, 14, 235} : intentColor;
+                Vector3 prev = {tileFrom.x, HEX_TILE_HEIGHT, tileFrom.z};
+                for (int k = 1; k <= archSteps; k++)
+                {
+                    float t = (float)k / archSteps;
+                    float mx = (tileFrom.x + to.x) / 2.0f;
+                    float mz = (tileFrom.z + to.z) / 2.0f;
+                    Vector3 p = {(1 - t) * (1 - t) * tileFrom.x + 2 * (1 - t) * t * mx + t * t * to.x,
+                                 HEX_TILE_HEIGHT + 3.2f * t * (1.0f - t),
+                                 (1 - t) * (1 - t) * tileFrom.z + 2 * (1 - t) * t * mz + t * t * to.z};
+                    DrawCylinderEx(prev, p, rad, rad, 6, pc);
+                    prev = p;
+                }
+            }
+        }
+
+        // two passes: a fat near-black underlay, then the red stroke on top,
+        // so the warning pops on bright tiles instead of washing out
+        for (int pass = 0; pass < 2; pass++)
+        {
+            float half = (pass == 0) ? ribbonHalf + 0.04f : ribbonHalf;
+            Color pc = (pass == 0) ? (Color){16, 10, 14, 235} : intentColor;
+
+            rlBegin(RL_QUADS);
+            rlColor4ub(pc.r, pc.g, pc.b, pc.a);
+            for (int k = 0; willStrike && (k < intentSteps); k += 2) // dashes: strike telegraphs only, moves get the solid arch
+            {
+                float t0 = (float)k / intentSteps;
+                float t1 = (float)(k + 1) / intentSteps;
+                float mx = (from.x + to.x) / 2.0f;
+                float mz = (from.z + to.z) / 2.0f;
+                Vector3 p0 = {(1 - t0) * (1 - t0) * from.x + 2 * (1 - t0) * t0 * mx + t0 * t0 * to.x,
+                              HEX_TILE_HEIGHT + 0.35f + 1.6f * t0 * (1.0f - t0),
+                              (1 - t0) * (1 - t0) * from.z + 2 * (1 - t0) * t0 * mz + t0 * t0 * to.z};
+                Vector3 p1 = {(1 - t1) * (1 - t1) * from.x + 2 * (1 - t1) * t1 * mx + t1 * t1 * to.x,
+                              HEX_TILE_HEIGHT + 0.35f + 1.6f * t1 * (1.0f - t1),
+                              (1 - t1) * (1 - t1) * from.z + 2 * (1 - t1) * t1 * mz + t1 * t1 * to.z};
+                Vector3 dir = Vector3Normalize(Vector3Subtract(p1, p0));
+                Vector3 side = Vector3Scale(Vector3Normalize(Vector3CrossProduct(dir, camFwd)), half);
+                rlVertex3f(p0.x - side.x, p0.y - side.y, p0.z - side.z);
+                rlVertex3f(p0.x + side.x, p0.y + side.y, p0.z + side.z);
+                rlVertex3f(p1.x + side.x, p1.y + side.y, p1.z + side.z);
+                rlVertex3f(p1.x - side.x, p1.y - side.y, p1.z - side.z);
+            }
+            // the target ring: a flat hex band, same underlay treatment
+            for (int k = 0; k < 6; k++)
+            {
+                float a0 = DEG2RAD * (60.0f * (float)k + 30.0f);
+                float a1 = DEG2RAD * (60.0f * (float)(k + 1) + 30.0f);
+                float ri = ringR - half;
+                float ro = ringR + half;
+                rlVertex3f(to.x + cosf(a0) * ri, HEX_TILE_HEIGHT + 0.04f, to.z + sinf(a0) * ri);
+                rlVertex3f(to.x + cosf(a0) * ro, HEX_TILE_HEIGHT + 0.04f, to.z + sinf(a0) * ro);
+                rlVertex3f(to.x + cosf(a1) * ro, HEX_TILE_HEIGHT + 0.04f, to.z + sinf(a1) * ro);
+                rlVertex3f(to.x + cosf(a1) * ri, HEX_TILE_HEIGHT + 0.04f, to.z + sinf(a1) * ri);
+            }
+            rlEnd();
+        }
+        rlEnableBackfaceCulling();
+        (void)bandHalf;
+    }
+    // Flush while the depth test is still off: the batch otherwise renders
+    // at EndMode3D with the test re-enabled and dies against the gem depths
+    rlDrawRenderBatchActive();
+    rlEnableDepthTest();
+    EndMode3D();
+
+    // strike intent shouts: a bobbing red "!" over any enemy about to hit a card
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *enemy = &entities[i];
+        if ((enemy->kind != ENTITY_ENEMY) || enemy->selected) continue;
+        if (enemy->enemyIntentKind != ENEMY_INTENT_STRIKE) continue;
+        Vector3 above = enemy->position;
+        above.y = HEX_TILE_HEIGHT + enemySize * 2.0f + 1.9f;
+        Vector2 shout = GetWorldToScreen(above, camera);
+        float bob = sinf(airTime * 4.0f) * 4.0f;
+        const int shoutSize = 90;
+        // Centered on the enemy, drop shadow scaled up with the glyph
+        int shoutX = (int)shout.x - MeasureText("!", shoutSize) / 2;
+        DrawText("!", shoutX + 4, (int)(shout.y + bob) + 4, shoutSize, BLACK);
+        DrawText("!", shoutX, (int)(shout.y + bob), shoutSize, (Color){235, 70, 60, 255});
+    }
 }
 
 static void UpdateDrawFrame(void)
@@ -2052,18 +2608,17 @@ static void UpdateDrawFrame(void)
             {
                 // 2048 rule: dropping onto a placed card of the SAME kind
                 // and SAME level merges them into one of the next level
-                bool canMerge = (hoveredCell->value > 0)
-                             && (hoveredCell->cardKind == card->cardKind)
-                             && (hoveredCell->cardLevel == card->cardLevel)
-                             && (hoveredCell->cardLevel < CARD_LVL_3);
+                bool canMerge = (hoveredCell->value > 0) && (hoveredCell->cardKind == card->cardKind) && (hoveredCell->cardLevel == card->cardLevel) && (hoveredCell->cardLevel < CARD_LVL_3);
                 if (canMerge)
                 {
                     hoveredCell->cardLevel++;
                     hoveredCell->value = (int)hoveredCell->cardLevel;
+                    hoveredCell->turnLifetime = cardKindLifetimes[hoveredCell->cardKind]; // merge refreshes the clock
                     impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
                     LOG("INFO: CARD: merged %s to lvl %d at (q=%d, r=%d)\n",
                         cardKindNames[card->cardKind], (int)hoveredCell->cardLevel, hoveredCell->q, hoveredCell->r);
                     EntityDespawn(i);
+                    EnemyAIUpdate(); // card played: re-plan
                 }
                 else if (hoveredCell->value == 0)
                 {
@@ -2072,6 +2627,7 @@ static void UpdateDrawFrame(void)
                     hoveredCell->cardKind = card->cardKind;
                     hoveredCell->cardLevel = card->cardLevel;
                     hoveredCell->value = (int)card->cardLevel;
+                    hoveredCell->turnLifetime = cardKindLifetimes[card->cardKind];
                     hoveredCell->tint = card->tint;
                     hoveredCell->modelIndex = card->modelIndex;
                     hoveredCell->isLeyline = hoveredCell->isLeyline || (card->cardKind == CARD_LEYLINE);
@@ -2079,6 +2635,7 @@ static void UpdateDrawFrame(void)
                     LOG("INFO: CARD: placed %s lvl %d at (q=%d, r=%d)\n",
                         cardKindNames[card->cardKind], (int)card->cardLevel, hoveredCell->q, hoveredCell->r);
                     EntityDespawn(i);
+                    EnemyAIUpdate(); // card played: re-plan
                 }
             }
             break; // Only one card can be grabbed
@@ -2177,6 +2734,7 @@ static void UpdateDrawFrame(void)
                 player->q = hoveredCell->q;
                 player->r = hoveredCell->r;
                 LOG("INFO: PLAYER: placed at (q=%d, r=%d)\n", player->q, player->r);
+                EnemyAIUpdate(); // player moved: re-plan
             }
         }
 
@@ -2258,100 +2816,35 @@ static void UpdateDrawFrame(void)
     }
 
     //
-    // enemy chase -- when the lever commits a turn, every enemy walks up to
-    // its move range toward the player: greedy neighbor steps, stopping once
-    // adjacent, never onto another enemy's tile. The drag/drop spring above
-    // animates the walk to the new home on the following frames
+    // turn commit -- when the lever fires: enemies execute their telegraphed
+    // intents, then every placed card burns one turn of its field lifetime
+    // and returns to the hand when the clock runs out, and finally the AI
+    // re-plans against the new board
     //
 
     {
-        static int lastChaseTurn = 0;
-        if ((gameTurn != lastChaseTurn) && (player != NULL))
+        static int lastCommittedTurn = 0;
+        if (gameTurn != lastCommittedTurn)
         {
-            lastChaseTurn = gameTurn;
-            for (int i = 0; i < entityCount; i++)
-            {
-                Entity *enemy = &entities[i];
-                if ((enemy->kind != ENTITY_ENEMY) || enemy->selected) continue;
+            lastCommittedTurn = gameTurn;
 
-                for (int step = 0; step < enemy->enemyMoveRange; step++)
-                {
-                    if (HexDistance(enemy->q, enemy->r, player->q, player->r) <= 1) break;
+            EnemyAIExecuteIntents();
 
-                    static const int dirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
-                    int bestQ = enemy->q;
-                    int bestR = enemy->r;
-                    int bestDist = HexDistance(enemy->q, enemy->r, player->q, player->r);
-                    for (int d = 0; d < 6; d++)
-                    {
-                        int nq = enemy->q + dirs[d][0];
-                        int nr = enemy->r + dirs[d][1];
-                        if (!HexOnBoard(nq, nr)) continue;
-
-                        bool occupied = false;
-                        for (int j = 0; j < entityCount; j++)
-                        {
-                            const Entity *other = &entities[j];
-                            if ((other->kind != ENTITY_ENEMY) || (other == enemy)) continue;
-                            if ((other->q == nq) && (other->r == nr)) occupied = true;
-                        }
-                        if (occupied) continue;
-
-                        int dist = HexDistance(nq, nr, player->q, player->r);
-                        if (dist < bestDist)
-                        {
-                            bestDist = dist;
-                            bestQ = nq;
-                            bestR = nr;
-                        }
-                    }
-
-                    if ((bestQ == enemy->q) && (bestR == enemy->r)) break; // boxed in
-                    enemy->q = bestQ;
-                    enemy->r = bestR;
-                    LOG("INFO: ENEMY: chased to (q=%d, r=%d)\n", enemy->q, enemy->r);
-                }
-            }
-        }
-    }
-
-    //
-    // card return -- the default turn behavior until kinds grow their own
-    // logic: every placed card lifts off its tile and returns to the hand,
-    // kind and level intact, springing into the fan from the tile it left
-    //
-
-    {
-        static int lastReturnTurn = 0;
-        if (gameTurn != lastReturnTurn)
-        {
-            lastReturnTurn = gameTurn;
             int cellCount = entityCount; // spawns below append to the pool
             for (int i = 0; i < cellCount; i++)
             {
                 Entity *cell = &entities[i];
                 if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0)) continue;
 
-                Entity *back = EntitySpawn(ENTITY_CARD);
-                if (back != NULL)
-                {
-                    back->cardKind = cell->cardKind;
-                    back->cardLevel = cell->cardLevel;
-                    back->value = (int)cell->cardLevel;
-                    back->tint = cardKindTints[cell->cardKind];
-                    back->cardMode = CARD_REC_FORM;
-                    back->modelIndex = cell->modelIndex;
-                    Vector2 lift = GetWorldToScreen(cell->position, camera);
-                    back->position = (Vector3){lift.x, lift.y, 0.0f};
-                    LOG("INFO: CARD: %s lvl %d returned to hand from (q=%d, r=%d)\n",
-                        cardKindNames[cell->cardKind], (int)cell->cardLevel, cell->q, cell->r);
-                }
+                cell->turnLifetime--;
+                if (cell->turnLifetime > 0) continue;
 
-                cell->value = 0;
-                cell->cardKind = CARD_NONE;
-                cell->cardLevel = 0;
-                cell->isLeyline = false;
+                LOG("INFO: CARD: %s lvl %d expired, returned to hand from (q=%d, r=%d)\n",
+                    cardKindNames[cell->cardKind], (int)cell->cardLevel, cell->q, cell->r);
+                ReturnPlacedCard(cell);
             }
+
+            EnemyAIUpdate(); // new turn started: re-plan
         }
     }
     //----------------------------------------------------------------------------------
@@ -2458,6 +2951,12 @@ static void UpdateDrawFrame(void)
     // board tiles -- raised prisms, hover reads as a raised tile
     //
 
+    { // Card shell per-frame uniforms; cardValue/danger are set per cell below
+        float shellCamPos[3] = {camera.position.x, camera.position.y, camera.position.z};
+        SetShaderValue(cardShellShader, cardShellViewPosLoc, shellCamPos, SHADER_UNIFORM_VEC3);
+        SetShaderValue(cardShellShader, cardShellTimeLoc, &auroraTime, SHADER_UNIFORM_FLOAT);
+    }
+
     for (int i = 0; i < entityCount; i++)
     {
         const Entity *cell = &entities[i];
@@ -2524,6 +3023,20 @@ static void UpdateDrawFrame(void)
             DrawModel(hexModels[cell->modelIndex % cardModelCount], (Vector3){0},
                       hexModelScale * HEX_SIZE / HEX_MODEL_R * levelScale, WHITE);
             rlPopMatrix();
+
+            // The generated shell over the gem, worn ONLY while a strike is
+            // telegraphed on this card: the pulsing red danger skin
+            if (cell->inDanger)
+            {
+                float shellValue = (float)cell->cardLevel;
+                float shellDanger = 1.0f;
+                SetShaderValue(cardShellShader, cardShellValueLoc, &shellValue, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(cardShellShader, cardShellDangerLoc, &shellDanger, SHADER_UNIFORM_FLOAT);
+                Matrix shellTransform = MatrixMultiply(
+                    MatrixScale(levelScale, 1.0f, levelScale),
+                    MatrixTranslate(cell->position.x, height + 0.01f, cell->position.z));
+                DrawMesh(cell->cardShellMesh, cardShellMaterial, shellTransform);
+            }
             rlEnableBackfaceCulling();
         }
     }
@@ -2540,10 +3053,7 @@ static void UpdateDrawFrame(void)
             const Entity *card = &entities[i];
             if ((card->kind != ENTITY_CARD) || !card->selected || (card->cardMode != CARD_HEX_FORM)) continue;
 
-            bool ghostMerge = (hoveredCell->value > 0)
-                           && (hoveredCell->cardKind == card->cardKind)
-                           && (hoveredCell->cardLevel == card->cardLevel)
-                           && (hoveredCell->cardLevel < CARD_LVL_3);
+            bool ghostMerge = (hoveredCell->value > 0) && (hoveredCell->cardKind == card->cardKind) && (hoveredCell->cardLevel == card->cardLevel) && (hoveredCell->cardLevel < CARD_LVL_3);
             bool ghostValid = (hoveredCell->value == 0) || ghostMerge;
             if (cardModelCount > 0)
             {
@@ -2623,22 +3133,26 @@ static void UpdateDrawFrame(void)
     //
 
     {
-        enum { LEY_W = 2 * GRID_RADIUS + 1 };
+        enum
+        {
+            LEY_W = 2 * GRID_RADIUS + 1
+        };
         static const int leyDirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
         bool conductive[LEY_W][LEY_W] = {0};
         bool endpoint[LEY_W][LEY_W] = {0};
         bool live[LEY_W][LEY_W] = {0};
 
-        // conductivity: leyline cells conduct, tiles wearing a placed card
-        // are spell endpoints, the player's tile is the source
+        // conductivity: ONLY leyline tiles conduct (plus the player's tile as
+        // the source). Placed non-leyline cards are endpoints: they tap into
+        // an adjacent live leyline but never extend the chain themselves
         for (int i = 0; i < entityCount; i++)
         {
             const Entity *cell = &entities[i];
             if (cell->kind != ENTITY_HEX_CELL) continue;
             int qi = cell->q + GRID_RADIUS;
             int ri = cell->r + GRID_RADIUS;
-            if (cell->isLeyline || (cell->value > 0)) conductive[qi][ri] = true;
-            if (cell->value > 0) endpoint[qi][ri] = true;
+            if (cell->isLeyline) conductive[qi][ri] = true;
+            if ((cell->value > 0) && !cell->isLeyline) endpoint[qi][ri] = true;
         }
         if (player != NULL) conductive[player->q + GRID_RADIUS][player->r + GRID_RADIUS] = true;
 
@@ -2710,13 +3224,34 @@ static void UpdateDrawFrame(void)
             {
                 for (int r = -GRID_RADIUS; r <= GRID_RADIUS; r++)
                 {
-                    if (!HexOnBoard(q, r) || !conductive[q + GRID_RADIUS][r + GRID_RADIUS]) continue;
+                    bool aCon = HexOnBoard(q, r) && conductive[q + GRID_RADIUS][r + GRID_RADIUS];
+                    bool aEnd = HexOnBoard(q, r) && endpoint[q + GRID_RADIUS][r + GRID_RADIUS];
+                    if (!aCon && !aEnd) continue;
                     for (int d = 0; d < 3; d++) // half the dirs = each pair once
                     {
                         int nq = q + leyDirs[d][0];
                         int nr = r + leyDirs[d][1];
-                        if (!HexOnBoard(nq, nr) || !conductive[nq + GRID_RADIUS][nr + GRID_RADIUS]) continue;
-                        bool lit = live[q + GRID_RADIUS][r + GRID_RADIUS] && live[nq + GRID_RADIUS][nr + GRID_RADIUS];
+                        if (!HexOnBoard(nq, nr)) continue;
+                        bool bCon = conductive[nq + GRID_RADIUS][nr + GRID_RADIUS];
+                        bool bEnd = endpoint[nq + GRID_RADIUS][nr + GRID_RADIUS];
+                        bool lit;
+                        if (aCon && bCon)
+                        {
+                            // chain span: live only when both ends reach the player
+                            lit = live[q + GRID_RADIUS][r + GRID_RADIUS] && live[nq + GRID_RADIUS][nr + GRID_RADIUS];
+                        }
+                        else if (aCon && bEnd)
+                        {
+                            lit = live[q + GRID_RADIUS][r + GRID_RADIUS]; // tap into the endpoint
+                        }
+                        else if (aEnd && bCon)
+                        {
+                            lit = live[nq + GRID_RADIUS][nr + GRID_RADIUS];
+                        }
+                        else
+                        {
+                            continue; // endpoint-endpoint: spells never chain each other
+                        }
                         if ((pass == 1) && !lit) continue;
 
                         Vector3 a = HexAxialToWorld(q, r);
@@ -2759,14 +3294,22 @@ static void UpdateDrawFrame(void)
         }
         rlSetLineWidth(1.0f);
 
-        // spell endpoints the network reaches get an activation ring
+        // spell endpoints get an activation ring when any neighbouring
+        // leyline tile is live (adjacency taps them in; they never conduct)
         BeginBlendMode(BLEND_ADDITIVE);
         for (int i = 0; i < entityCount; i++)
         {
             const Entity *cell = &entities[i];
             if (cell->kind != ENTITY_HEX_CELL) continue;
             if (!endpoint[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS]) continue;
-            if (!live[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS]) continue;
+            bool tapped = false;
+            for (int d = 0; d < 6; d++)
+            {
+                int nq = cell->q + leyDirs[d][0];
+                int nr = cell->r + leyDirs[d][1];
+                if (HexOnBoard(nq, nr) && live[nq + GRID_RADIUS][nr + GRID_RADIUS]) tapped = true;
+            }
+            if (!tapped) continue;
             float ring = cell->radius * (0.62f + 0.06f * sinf(airTime * 3.0f));
             Color rc = LeylineIridColor((float)cell->q * 0.31f + (float)cell->r * 0.17f, airTime);
             DrawCylinder((Vector3){cell->position.x, HEX_TILE_HEIGHT + 0.03f, cell->position.z},
@@ -2907,7 +3450,9 @@ static void UpdateDrawFrame(void)
 
             Vector3 pos = ScreenToHandPlane((Vector2){card->position.x, card->position.y});
             Model model = cardModels[card->modelIndex % cardModelCount];
-            float scale = cardModelScale * cardScale;
+            // Hand cards are screen-space UI: scale with the ortho zoom
+            // (fovy, 16 = home) so they keep a constant on-screen size
+            float scale = cardModelScale * cardScale * (camera.fovy / 16.0f);
 
             rlPushMatrix();
             rlTranslatef(pos.x, pos.y, pos.z);
@@ -2999,6 +3544,51 @@ static void UpdateDrawFrame(void)
     }
 
     //
+    // card tooltip -- the hovered card's tooltip buffer in a dark strip above
+    // the fan; grabbed cards keep quiet
+    //
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *card = &entities[i];
+        if ((card->kind != ENTITY_CARD) || !card->hovered || card->selected) continue;
+        if (card->tooltip[0] == '\0') continue;
+
+        const int tipSize = 20;
+        int tw = MeasureText(card->tooltip, tipSize);
+        int tx = (int)card->position.x - tw / 2;
+        int ty = (int)(card->position.y - CARD_HEIGHT * cardScale / 2.0f) - tipSize - 16;
+        // Keep the strip on screen when an edge card is hovered
+        if (tx < 8) tx = 8;
+        if (tx + tw > screenWidth - 8) tx = screenWidth - 8 - tw;
+        DrawRectangle(tx - 8, ty - 6, tw + 16, tipSize + 12, Fade(BLACK, 0.72f));
+        DrawText(card->tooltip, tx, ty, tipSize, RAYWHITE);
+        break; // Fan cards overlap: only the frontmost hovered one speaks
+    }
+
+    //
+    // placed card countdown -- turns left on the field, on the tile's lower
+    // edge (white, flipping red on the last turn)
+    //
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *cell = &entities[i];
+        if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0)) continue;
+
+        Vector3 edge = cell->position;
+        edge.y = HEX_TILE_HEIGHT;
+        edge.z += HEX_SIZE * 0.55f; // Toward the camera-facing edge of the tile
+        Vector2 at = GetWorldToScreen(edge, camera);
+        const char *turnsText = TextFormat("%d", cell->turnLifetime);
+        const int turnsSize = 22;
+        int tx2 = (int)at.x - MeasureText(turnsText, turnsSize) / 2;
+        Color turnsColor = (cell->turnLifetime <= 1) ? (Color){235, 70, 60, 255} : RAYWHITE;
+        DrawText(turnsText, tx2 + 2, (int)at.y + 2, turnsSize, BLACK);
+        DrawText(turnsText, tx2, (int)at.y, turnsSize, turnsColor);
+    }
+
+    //
     // health bars -- rows of heart icons
     //
 
@@ -3058,6 +3648,8 @@ static void UpdateDrawFrame(void)
         EndBlendMode();
     }
 
+    DrawIntent(airTime);
+
     if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, LIGHTGRAY);
 
     if ((frameCounter / 20) % 2) DrawText("hex merge time!", screenWidth / 2 - MeasureText("hex merge time!", 30) / 2, 28, 30, MAROON);
@@ -3101,6 +3693,16 @@ static void UpdateDrawFrame(void)
     igText("build %s  (%s %s)", BUILD_GIT_HASH, __DATE__, __TIME__);
     igText("entities: %d/%d", entityCount, MAX_ENTITIES);
     igText("mouse cell: (q=%d, r=%d)", mouseHexQ, mouseHexR);
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *enemy = &entities[i];
+        if (enemy->kind != ENTITY_ENEMY) continue;
+        const char *what = (enemy->enemyIntentKind == ENEMY_INTENT_STRIKE) ? "STRIKE"
+                           : (enemy->enemyIntentKind == ENEMY_INTENT_MOVE) ? "move"
+                                                                           : "hold";
+        igText("enemy (%d,%d): %s -> (%d,%d)", enemy->q, enemy->r, what,
+               enemy->enemyIntentQ, enemy->enemyIntentR);
+    }
 
     if (igButton("deal card", (ImVec2_c){0, 0})) SpawnCard();
 
@@ -3179,6 +3781,13 @@ static void UpdateDrawFrame(void)
     rlImGuiEnd();
 
     EndDrawing();
+
+    // Debug: F10 dumps the frame to debug_shot.png next to the binary
+    if (IsKeyPressed(KEY_F10)) TakeScreenshot("debug_shot.png");
+    { // TEMP
+        static int shotFrame = 0;
+        if (++shotFrame == 95) TakeScreenshot("det_check.png");
+    }
     //----------------------------------------------------------------------------------
 }
 
@@ -3237,6 +3846,10 @@ int main(void)
 
         cardModels[cardModelCount] = LoadModel(path);
         hexModels[cardModelCount] = LoadModel(hexPath);
+        for (int k = CARD_LEYLINE; k < NUM_CARD_KINDS; k++)
+        {
+            if (TextFindIndex(GetFileName(path), kindModelTags[k]) >= 0) kindModelIndex[k] = cardModelCount;
+        }
         cardModelCount++;
         LOG("INFO: MODEL: loaded card/hex pair %s\n", path);
     }
@@ -3336,6 +3949,16 @@ int main(void)
     blurShader = LoadShaderFromMemory(NULL, blurFS);
     blurDirLoc = GetShaderLocation(blurShader, "dir");
 
+    // Card shell shader: loaded before SpawnHexGrid generates the per-cell
+    // shell meshes it draws
+    cardShellShader = LoadShaderFromMemory(cardShellVS, cardShellFS);
+    cardShellViewPosLoc = GetShaderLocation(cardShellShader, "viewPos");
+    cardShellValueLoc = GetShaderLocation(cardShellShader, "cardValue");
+    cardShellDangerLoc = GetShaderLocation(cardShellShader, "danger");
+    cardShellTimeLoc = GetShaderLocation(cardShellShader, "time");
+    cardShellMaterial = LoadMaterialDefault();
+    cardShellMaterial.shader = cardShellShader;
+
     LoadTweaks(); // Tweakable globals populate from resources/tweaks.json
 
     leverTrackTexture = LoadTexture("resources/lever_track_128x16.png");
@@ -3371,7 +3994,19 @@ int main(void)
     }
 
     SpawnEnemy(2, -2);
-
+    { // TEMP adjacency
+        for (int i = 0; i < entityCount; i++)
+        {
+            Entity *cell = &entities[i];
+            if ((cell->kind != ENTITY_HEX_CELL) || (cell->q != 3) || (cell->r != -2)) continue;
+            cell->cardKind = CARD_WARD;
+            cell->cardLevel = CARD_LVL_1;
+            cell->value = 1;
+            cell->modelIndex = 0;
+            cell->turnLifetime = cardKindLifetimes[CARD_WARD];
+        }
+    }
+    EnemyAIUpdate(); // first plan: the telegraph exists before any input event
 
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
@@ -3422,6 +4057,12 @@ int main(void)
     UnloadShader(blurShader);
     for (int i = 0; i < shardModelCount; i++) UnloadModel(shardModels[i]);
     if (centerGemLoaded) UnloadModel(centerGemModel);
+    UnloadShader(cardShellShader);
+    // Hex cells never despawn, so every cell still owns its shell mesh here
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_HEX_CELL) UnloadMesh(entities[i].cardShellMesh);
+    }
     UnloadTexture(whiteTexture);
     UnloadRenderTexture(target);
     free(entities);
