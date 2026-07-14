@@ -313,6 +313,7 @@ static RenderTexture2D target = {0}; // Render texture to render our game
 static int frameCounter = 0;
 
 static Texture2D heartTexture = {0};       // Heart icon for health bars (resources/heart_icon_32x32.png)
+static Texture2D titleTexture = {0};       // Start screen Leylines lockup (resources/leylines_title.png)
 static Texture2D reticleTexture = {0};     // Hover reticle frame (resources/highlight_slot_26x26.png)
 static Texture2D impactLightTexture = {0}; // Light-burst sheet, 8 frames in a row, white on alpha
                                            // (resources/impact_light_8x256.png)
@@ -1397,7 +1398,8 @@ static const char *tutorialCaptions[TUTORIAL_SLIDES] = {
 };
 static int shotStage = -1;   // --tutorial-shots sequence position, -1 = off
 static int shotTimer = 0;    // Frames until the current scene is captured
-static bool shotQuit = false; // True once the last scene is exported
+static bool shotQuit = false;     // True once the last scene is exported
+static bool shotShowcase = false; // --showcase-shots: full-res submission stills
 
 // 2.5D camera: tilted orthographic view down at the board plane (y = 0);
 // no perspective foreshortening, so tiles read as a flat iso board
@@ -2829,6 +2831,128 @@ static void StageTutorialScene(int stage)
     EnemyAIUpdate(); // telegraphs and danger flags match the staged board
 }
 
+// Showcase staging: snap the hand cards straight into their fan slots so a
+// short-delay capture doesn't catch them springing up from below the screen
+static void SettleHand(void)
+{
+    int handCount = 0;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_CARD) handCount++;
+    }
+    int slot = 0;
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *card = &entities[i];
+        if (card->kind != ENTITY_CARD) continue;
+        float fanIndex = (float)slot - (float)(handCount - 1) / 2.0f;
+        slot++;
+        card->position = (Vector3){
+            (float)screenWidth / 2.0f + fanIndex * CARD_FAN_STEP * cardScale,
+            (float)screenHeight - CARD_FAN_BOTTOM + fabsf(fanIndex) * CARD_FAN_ARC,
+            0.0f};
+        card->velocity = (Vector3){0};
+        card->alpha = 1.0f;
+    }
+}
+
+// Submission screenshots (--showcase-shots): full-resolution staged moments
+// of the game's best reads. Returns the frames to wait before capturing --
+// short for one-shot fx (the burst is mid-flight), longer for calm scenes
+#define SHOWCASE_SHOTS 7
+static int StageShowcaseScene(int stage)
+{
+    ResetGame();
+    gameState = GAME_STATE_PLAYING;
+    tutorialOpen = false;
+
+    Entity *enemy = NULL;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if ((entities[i].kind == ENTITY_ENEMY) && (enemy == NULL)) enemy = &entities[i];
+    }
+
+    switch (stage)
+    {
+    case 0: // the placement animation: impact burst popping on a fresh card
+    {
+        StageTutorialCard(-1, 0, CARD_WARD, CARD_LVL_1);
+        StageTutorialCard(1, -1, CARD_LEYLINE, CARD_LVL_1);
+        StageTutorialCard(0, -1, CARD_FIREBALL, CARD_LVL_2);
+        SettleHand();
+        Entity *fresh = FindCell(0, -1);
+        if (fresh != NULL)
+            impact = (ImpactFx){.position = fresh->position, .tint = cardKindTints[CARD_FIREBALL], .age = 0.0f, .active = true};
+        EnemyAIUpdate();
+        return 2; // catch the ring mid-flight
+    }
+    case 1: // the leyline network alive, a fireball banking its charge
+        StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
+        StageTutorialCard(2, 0, CARD_LEYLINE, CARD_LVL_1);
+        StageTutorialCard(3, 0, CARD_FIREBALL, CARD_LVL_1);
+        StageTutorialCard(-1, 1, CARD_LEYLINE, CARD_LVL_1);
+        StageTutorialCard(-2, 2, CARD_WARD, CARD_LVL_1);
+        if (FindCell(3, 0) != NULL) FindCell(3, 0)->fireballCharge = 1;
+        break;
+    case 2: // threats telegraphed: a baited strike and an archer arching in
+        StageTutorialCard(1, -1, CARD_WARD, CARD_LVL_1);
+        SpawnEnemy(-4, 2);
+        break;
+    case 3: // a detonation, enemies caught in the blast
+    {
+        StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
+        StageTutorialCard(2, 0, CARD_FIREBALL, CARD_LVL_2);
+        SettleHand();
+        SpawnEnemy(3, 0);
+        SpawnEnemy(2, 1);
+        SpawnEnemy(-3, 0); // out of the blast: a survivor for scale
+        Entity *bomb = FindCell(2, 0);
+        if (bomb != NULL) DetonateFireball(bomb);
+        EnemyAIUpdate();
+        return 2; // the boom flash + fresh card drops
+    }
+    case 4: // the hex curse: a purple ally turning on its own
+        if (enemy != NULL) enemy->hexedTurns = 2;
+        SpawnEnemy(3, -2);
+        break;
+    case 5: // the win screen: all four pieces of the hex king
+        for (int k = CARD_LEYLINE; k < NUM_CARD_KINDS; k++)
+        {
+            SpawnCardKind((CardKind)k);
+            entities[entityCount - 1].cardLevel = CARD_LVL_4;
+        }
+        SettleHand();
+        gameTurn = 23; // a plausible run length for the "assembled in N turns" line
+        break;
+    case 6: // a leyline WEB: chains branching from the player, spells tapped on
+    {
+        static const int web[][2] = {{1, 0}, {2, 0}, {3, 0}, {2, -1}, {1, 1}, {2, 1},
+                                     {0, 2}, {0, 3}, {-1, 1}, {-2, 1}, {-1, 2}, {-1, 3}};
+        for (int w = 0; w < (int)(sizeof(web) / sizeof(web[0])); w++)
+        {
+            StageTutorialCard(web[w][0], web[w][1], CARD_LEYLINE, CARD_LVL_1);
+        }
+        StageTutorialCard(4, -1, CARD_FIREBALL, CARD_LVL_1); // tapped at the chain ends
+        StageTutorialCard(-3, 2, CARD_WARD, CARD_LVL_1);
+        StageTutorialCard(1, 2, CARD_HEX, CARD_LVL_1);
+        Entity *fb = FindCell(4, -1);
+        if (fb != NULL) fb->fireballCharge = 1;
+        if (enemy != NULL) // keep the enemy out of the web's face
+        {
+            enemy->q = 4;
+            enemy->r = -4;
+            enemy->position = HexAxialToWorld(enemy->q, enemy->r);
+        }
+        SettleHand();
+        break;
+    }
+    default:
+        break;
+    }
+    EnemyAIUpdate();
+    return 40; // calm scenes: let the springs and telegraphs settle
+}
+
 // enemy intent -- the telegraph for the next lever pull, drawing only the
 // stored intent fields EnemyAIUpdate computed so it can never lie. Strike: a
 // red dashed arc to the doomed card, a pulsing ring, the raised wash hex,
@@ -3757,7 +3881,10 @@ static void UpdateDrawFrame(void)
 
         float drawSize = cell->radius * 0.92f; // Small gap between neighbour cells
 
-        float height = cell->hovered ? HEX_TILE_HEIGHT_HOVER : HEX_TILE_HEIGHT;
+        // Hover no longer raises the prism (the raised copy z-fought the base
+        // mesh): the hovered tile flips from inverse gem to the TRUE gem
+        // effect instead, so it reads as lit crystal
+        float height = HEX_TILE_HEIGHT;
 
         // Every tile is an inverse gem: the prism mesh drawn with the inverse
         // gem material refracts the aurora sky as its negative. GenMeshCylinder
@@ -3766,7 +3893,7 @@ static void UpdateDrawFrame(void)
         Matrix tileTransform = MatrixMultiply(
             MatrixScale(drawSize, height, drawSize),
             MatrixTranslate(cell->position.x, cell->position.y, cell->position.z));
-        DrawMesh(hexPrismMesh, inverseGemMaterial, tileTransform);
+        DrawMesh(hexPrismMesh, cell->hovered ? gemMaterial : inverseGemMaterial, tileTransform);
 
         // Tile art on the prism top: a plain textured quad, deliberately NOT
         // drawn with the gem material -- the art obscures the effect and the
@@ -4534,7 +4661,7 @@ static void UpdateDrawFrame(void)
 
     if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, LIGHTGRAY);
 
-    if ((frameCounter / 20) % 2) DrawTextOutlined("hex merge time!", screenWidth / 2 - MeasureText("hex merge time!", 30) / 2, 28, 30, MAROON);
+    if ((frameCounter / 20) % 2) DrawTextOutlined("Merge all card types to lvl 4 to win", screenWidth / 2 - MeasureText("Merge all card types to lvl 4 to win", 24) / 2, 28, 24, MAROON);
 
     // Spawn countdowns: turns until the crystal's next card gift and the
     // next enemy reinforcement (both fire on the lever pull they hit 0 on)
@@ -4566,11 +4693,30 @@ static void UpdateDrawFrame(void)
     {
         DrawRectangle(0, 0, screenWidth, screenHeight, Fade(BLACK, 0.62f));
 
-        const char *title = (gameState == GAME_STATE_START) ? "HEX MERGE"
-                            : (gameState == GAME_STATE_WIN) ? "EXODIA!"
-                                                            : "GAME OVER";
-        Color titleColor = (gameState == GAME_STATE_OVER) ? (Color){235, 70, 60, 255} : (Color){255, 220, 60, 255};
-        DrawTextOutlined(title, screenWidth / 2 - MeasureText(title, 64) / 2, screenHeight / 2 - 110, 64, titleColor);
+        if (gameState == GAME_STATE_START)
+        {
+            if (titleTexture.id != 0)
+            {
+                // The Leylines lockup (FF font + pastel gradient), centered
+                // where the old text title sat
+                float tw = 540.0f;
+                float th = tw * (float)titleTexture.height / (float)titleTexture.width;
+                DrawTexturePro(titleTexture,
+                               (Rectangle){0, 0, (float)titleTexture.width, (float)titleTexture.height},
+                               (Rectangle){((float)screenWidth - tw) / 2.0f, (float)screenHeight / 2.0f - 90.0f - th / 2.0f, tw, th},
+                               (Vector2){0, 0}, 0.0f, WHITE);
+            }
+            else
+            {
+                DrawTextOutlined("LEYLINES", screenWidth / 2 - MeasureText("LEYLINES", 64) / 2, screenHeight / 2 - 110, 64, (Color){255, 220, 60, 255});
+            }
+        }
+        else
+        {
+            const char *title = (gameState == GAME_STATE_WIN) ? "EXODIA!" : "GAME OVER";
+            Color titleColor = (gameState == GAME_STATE_OVER) ? (Color){235, 70, 60, 255} : (Color){255, 220, 60, 255};
+            DrawTextOutlined(title, screenWidth / 2 - MeasureText(title, 64) / 2, screenHeight / 2 - 110, 64, titleColor);
+        }
 
         if (gameState == GAME_STATE_START)
         {
@@ -4800,22 +4946,27 @@ static void UpdateDrawFrame(void)
         if (++shotFrame == 95) TakeScreenshot("det_check.png");
     }
 
-    // --tutorial-shots: let each staged scene settle a beat, capture it
-    // downscaled, stage the next, and quit after the last
+    // --tutorial-shots / --showcase-shots: let each staged scene settle,
+    // capture it (tutorial slides downscale, showcase stays full-res),
+    // stage the next, and quit after the last
     if (shotStage >= 0)
     {
         shotTimer--;
         if (shotTimer <= 0)
         {
             Image shot = LoadImageFromScreen();
-            ImageResize(&shot, 360, 360);
-            ExportImage(shot, TextFormat("tutorial_%d.png", shotStage));
+            if (!shotShowcase) ImageResize(&shot, 360, 360);
+            ExportImage(shot, TextFormat(shotShowcase ? "showcase_%d.png" : "tutorial_%d.png", shotStage));
             UnloadImage(shot);
             shotStage++;
-            if (shotStage >= TUTORIAL_SLIDES)
+            if (shotStage >= (shotShowcase ? SHOWCASE_SHOTS : TUTORIAL_SLIDES))
             {
                 shotStage = -1;
                 shotQuit = true;
+            }
+            else if (shotShowcase)
+            {
+                shotTimer = StageShowcaseScene(shotStage);
             }
             else
             {
@@ -4870,6 +5021,10 @@ int main(int argc, char *argv[])
     // Load resources (desktop: resources/ sits next to the binary,
     // web: emscripten preloads it into the .data bundle)
     heartTexture = LoadTexture("resources/heart_icon_32x32.png");
+
+    // The start screen's Leylines lockup (pre-rendered FF font + gradient)
+    titleTexture = LoadTexture("resources/leylines_title.png");
+    SetTextureFilter(titleTexture, TEXTURE_FILTER_BILINEAR);
 
     reticleTexture = LoadTexture("resources/highlight_slot_26x26.png");
     SetTextureFilter(reticleTexture, TEXTURE_FILTER_POINT); // Keep the pixel art crisp when scaled
@@ -5045,6 +5200,13 @@ int main(int argc, char *argv[])
         shotStage = 0;
         shotTimer = 45;
     }
+    // --showcase-shots: full-res submission screenshots of the staged moments
+    if ((argc > 1) && TextIsEqual(argv[1], "--showcase-shots"))
+    {
+        shotShowcase = true;
+        shotTimer = StageShowcaseScene(0);
+        shotStage = 0;
+    }
 
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
@@ -5063,6 +5225,7 @@ int main(int argc, char *argv[])
     //--------------------------------------------------------------------------------------
     rlImGuiShutdown();
     UnloadTexture(heartTexture);
+    UnloadTexture(titleTexture);
     UnloadTexture(reticleTexture);
     UnloadTexture(impactLightTexture);
     UnloadTexture(playerTexture);

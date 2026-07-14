@@ -17,6 +17,7 @@ jittered icosphere, vertices unmerged so every facet is flat).
 Controls: wheel zooms, left/right spins the gem, sliders tune the optics.
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -26,8 +27,11 @@ import pyray as rl
 import trimesh
 from raylib import ffi
 
+from enemy_proto import ENEMY_VS, ENEMY_FS, OUTLINE_FS, build_enemy_glb
+from enemy_proto import LOOK_FILE as ENEMY_LOOK_FILE
+
 SCRATCH = Path(__file__).parent / "export"
-SCREEN_W, SCREEN_H = 900, 620
+SCREEN_W, SCREEN_H = 630, 500 # the itch cover gif aspect: what you see is what exports
 
 GEM_VS = """
 #version 330
@@ -534,6 +538,7 @@ def draw_backdrop(t):
 
 def main():
     shot_mode = "--shot" in sys.argv
+    bg_mode = "--bg-shot" in sys.argv  # crystals-only background export, then exit
 
     rl.init_window(SCREEN_W, SCREEN_H, "refraction proto")
     rl.set_target_fps(60)
@@ -569,6 +574,200 @@ def main():
     gem.materials[0].maps[rl.MaterialMapIndex.MATERIAL_MAP_ALBEDO].texture = scene_rt.texture
     gem2.materials[0].shader = shader
     gem2.materials[0].maps[rl.MaterialMapIndex.MATERIAL_MAP_ALBEDO].texture = scene_rt.texture
+
+    # the enemy demo (enemy_proto shaders + saved look), standing right in
+    # front of the big gem
+    elook = json.loads(ENEMY_LOOK_FILE.read_text()) if ENEMY_LOOK_FILE.is_file() else {}
+    enemy_shader = rl.load_shader_from_memory(ENEMY_VS, ENEMY_FS)
+    EU = {n: rl.get_shader_location(enemy_shader, n)
+          for n in ("time", "yaw", "spikeLen", "spikeDensity", "pulseSpeed",
+                    "breatheAmp", "breatheSpeed", "viewPos", "rim", "lineWidth", "expand")}
+    enemy_outline = rl.load_shader_from_memory(ENEMY_VS, OUTLINE_FS)
+    EUO = {n: rl.get_shader_location(enemy_outline, n)
+           for n in ("time", "yaw", "spikeLen", "spikeDensity", "pulseSpeed",
+                     "breatheAmp", "breatheSpeed", "expand", "alpha")}
+    enemy_model = rl.load_model(str(build_enemy_glb(int(elook.get("subdiv", 2)),
+                                                    int(elook.get("seed", 7)))))
+
+    # live enemy knobs, seeded from the saved look: size, position, and the
+    # shader params (spikes / breath / rim / wires / red hull)
+    ep = {
+        "size": ffi.new("float *", float(elook.get("size", 0.9)) * 0.55),
+        "x": ffi.new("float *", 0.0),
+        "y": ffi.new("float *", 1.15),
+        "z": ffi.new("float *", 2.3),
+        "spike_len": ffi.new("float *", float(elook.get("spike_len", 0.35))),
+        "spike_density": ffi.new("float *", float(elook.get("spike_density", 0.45))),
+        "pulse_speed": ffi.new("float *", float(elook.get("pulse_speed", 2.2))),
+        "breathe_amp": ffi.new("float *", float(elook.get("breathe_amp", 0.06))),
+        "breathe_speed": ffi.new("float *", float(elook.get("breathe_speed", 1.6))),
+        "rim": ffi.new("float *", float(elook.get("rim", 0.8))),
+        "line_width": ffi.new("float *", float(elook.get("line_width", 2.0))),
+        "red_outline": ffi.new("float *", float(elook.get("red_outline", 0.05))),
+        "spin": ffi.new("float *", 26.0),  # deg/s
+    }
+
+    # title text: Final-Fantasy-style serif (Cinzel, the Runic lookalike)
+    # with live knobs. The text renders white into its own texture so the
+    # fill can be anything: flat picked color, or the FF logo treatment --
+    # a vertical pastel gradient
+    TITLE_TEXT = "LEYLINES" # the FF fan font is capitals-only
+    TITLE_BASE_SIZE = 128   # big base render so the size slider can go huge and stay sharp
+    TITLE_RT_W, TITLE_RT_H = 960, 220
+    title_font = rl.load_font_ex(str(Path(__file__).parent / "assets" / "finalf.ttf"),
+                                 TITLE_BASE_SIZE, None, 0)
+    rl.set_texture_filter(title_font.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+    title_rt = rl.load_render_texture(TITLE_RT_W, TITLE_RT_H)
+    rl.set_texture_filter(title_rt.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+    tp = {
+        "size": ffi.new("float *", 64.0),
+        "x": ffi.new("float *", 0.0),    # offset from centered
+        "y": ffi.new("float *", float(SCREEN_H - 60)),
+        "glow": ffi.new("float *", 70.0),   # halo alpha, 0 = off
+        "rot": ffi.new("float *", 0.0),     # degrees, spins about the text center
+        "outline": ffi.new("float *", 2.0), # black ring thickness, px
+        "spacing": ffi.new("float *", 1.0), # letter spacing, px at base size
+    }
+    title_color = ffi.new("struct Color *", [255, 214, 70, 255])
+    title_pastel = ffi.new("bool *", True)  # the FF pastel gradient fill
+    title_show = ffi.new("bool *", True)    # off = pure scene (background exports)
+    # the three gradient stops, each with its own picker
+    grad_top = ffi.new("struct Color *", [255, 252, 240, 255])
+    grad_mid = ffi.new("struct Color *", [255, 191, 209, 255])
+    grad_low = ffi.new("struct Color *", [158, 191, 255, 255])
+
+    # FF logo fill: white-hot top melting through pastels toward the base
+    TITLE_GRAD_FS = """
+#version 100
+precision mediump float;
+varying vec2 fragTexCoord;
+varying vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec3 gradTop;
+uniform vec3 gradMid;
+uniform vec3 gradLow;
+void main()
+{
+    vec4 texel = texture2D(texture0, fragTexCoord);
+    float y = 1.0 - fragTexCoord.y; // render textures store bottom-up
+    vec3 grad = mix(gradTop, gradMid, smoothstep(0.18, 0.58, y));
+    grad = mix(grad, gradLow, smoothstep(0.55, 0.95, y));
+    gl_FragColor = vec4(grad, 1.0)*texel;
+}
+"""
+    TITLE_VS = """
+#version 100
+attribute vec3 vertexPosition;
+attribute vec2 vertexTexCoord;
+attribute vec4 vertexColor;
+uniform mat4 mvp;
+varying vec2 fragTexCoord;
+varying vec4 fragColor;
+void main()
+{
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    gl_Position = mvp*vec4(vertexPosition, 1.0);
+}
+"""
+    title_grad_shader = rl.load_shader_from_memory(TITLE_VS, TITLE_GRAD_FS)
+    grad_locs = {n: rl.get_shader_location(title_grad_shader, n)
+                 for n in ("gradTop", "gradMid", "gradLow")}
+
+    def set_grad_color(loc, c):
+        rl.set_shader_value(title_grad_shader, loc,
+                            ffi.new("float[3]", [c.r / 255.0, c.g / 255.0, c.b / 255.0]),
+                            rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
+
+    def draw_enemy(t):
+        """Outline hulls + body off the live knobs. Called in BOTH passes:
+        into the scene texture (so the gem refracts him) and on screen."""
+        eyaw = t * math.radians(ep["spin"][0])
+        epos = rl.Vector3(ep["x"][0], ep["y"][0], ep["z"][0])
+        esize = ep["size"][0]
+        set_f(enemy_shader, EU["time"], t)
+        set_f(enemy_shader, EU["yaw"], eyaw)
+        set_f(enemy_shader, EU["spikeLen"], ep["spike_len"][0])
+        set_f(enemy_shader, EU["spikeDensity"], ep["spike_density"][0])
+        set_f(enemy_shader, EU["pulseSpeed"], ep["pulse_speed"][0])
+        set_f(enemy_shader, EU["breatheAmp"], ep["breathe_amp"][0])
+        set_f(enemy_shader, EU["breatheSpeed"], ep["breathe_speed"][0])
+        set_f(enemy_shader, EU["rim"], ep["rim"][0])
+        set_f(enemy_shader, EU["lineWidth"], ep["line_width"][0])
+        set_f(enemy_shader, EU["expand"], 0.0)
+        set_v3(enemy_shader, EU["viewPos"], cam.position.x, cam.position.y, cam.position.z)
+        eo = ep["red_outline"][0]
+        if eo > 0.002:
+            set_f(enemy_outline, EUO["time"], t)
+            set_f(enemy_outline, EUO["yaw"], eyaw)
+            set_f(enemy_outline, EUO["spikeLen"], ep["spike_len"][0])
+            set_f(enemy_outline, EUO["spikeDensity"], ep["spike_density"][0])
+            set_f(enemy_outline, EUO["pulseSpeed"], ep["pulse_speed"][0])
+            set_f(enemy_outline, EUO["breatheAmp"], ep["breathe_amp"][0])
+            set_f(enemy_outline, EUO["breatheSpeed"], ep["breathe_speed"][0])
+            rl.rl_draw_render_batch_active()
+            rl.rl_set_cull_face(rl.rl.RL_CULL_FACE_FRONT)
+            enemy_model.materials[0].shader = enemy_outline
+            set_f(enemy_outline, EUO["expand"], eo)
+            set_f(enemy_outline, EUO["alpha"], 1.0)
+            rl.draw_model(enemy_model, epos, esize, rl.WHITE)
+            rl.begin_blend_mode(rl.BlendMode.BLEND_ADDITIVE)
+            set_f(enemy_outline, EUO["expand"], eo * 2.6)
+            set_f(enemy_outline, EUO["alpha"], 0.28)
+            rl.draw_model(enemy_model, epos, esize, rl.WHITE)
+            rl.end_blend_mode()
+            rl.rl_set_cull_face(rl.rl.RL_CULL_FACE_BACK)
+        enemy_model.materials[0].shader = enemy_shader
+        rl.draw_model(enemy_model, epos, esize, rl.WHITE)
+
+    def render_title_rt():
+        """The raw glyphs, white, into their own texture (done OUTSIDE any
+        other texture mode -- texture modes cannot nest)."""
+        t_spacing = tp["spacing"][0]
+        t_w = rl.measure_text_ex(title_font, TITLE_TEXT, TITLE_BASE_SIZE, t_spacing).x
+        rl.begin_texture_mode(title_rt)
+        rl.clear_background(rl.BLANK)
+        rl.draw_text_ex(title_font, TITLE_TEXT,
+                        rl.Vector2((TITLE_RT_W - t_w) / 2.0, (TITLE_RT_H - TITLE_BASE_SIZE) / 2.0),
+                        TITLE_BASE_SIZE, t_spacing, rl.WHITE)
+        rl.end_texture_mode()
+
+    def draw_title():
+        """Stamps compose the look -- warm halo, BLACK outline, then the FF
+        pastel gradient or the flat picked fill. Drawn INTO the refracted
+        scene (pass 1), so the gem and every shard bends the letters."""
+        t_scale = tp["size"][0] / TITLE_BASE_SIZE
+        src = rl.Rectangle(0, 0, TITLE_RT_W, -TITLE_RT_H)
+        t_rot = tp["rot"][0]
+        t_origin = rl.Vector2(TITLE_RT_W * t_scale / 2.0, TITLE_RT_H * t_scale / 2.0)
+
+        def stamp(dx, dy, tint):
+            dest = rl.Rectangle(SCREEN_W / 2.0 + tp["x"][0] + dx, tp["y"][0] + dy,
+                                TITLE_RT_W * t_scale, TITLE_RT_H * t_scale)
+            rl.draw_texture_pro(title_rt.texture, src, dest, t_origin, t_rot, tint)
+
+        glow_a = tp["glow"][0]
+        if glow_a > 1.0:
+            for radius, alpha in ((8, int(glow_a * 0.55)), (5, int(glow_a))):
+                for k in range(8):
+                    a = math.tau * k / 8.0
+                    stamp(math.cos(a) * radius, math.sin(a) * radius,
+                          rl.Color(255, 190, 120, min(int(alpha), 255)))
+        o_px = tp["outline"][0]
+        if o_px > 0.1:
+            for k in range(8):  # true black ring, thickness from the slider
+                a = math.tau * k / 8.0
+                stamp(math.cos(a) * o_px, math.sin(a) * o_px, rl.BLACK)
+        if title_pastel[0]:
+            set_grad_color(grad_locs["gradTop"], grad_top[0])
+            set_grad_color(grad_locs["gradMid"], grad_mid[0])
+            set_grad_color(grad_locs["gradLow"], grad_low[0])
+            rl.begin_shader_mode(title_grad_shader)
+            stamp(0.0, 0.0, rl.WHITE)  # gradient shader paints the glyphs
+            rl.end_shader_mode()
+        else:
+            fill = title_color[0]
+            stamp(0.0, 0.0, rl.Color(fill.r, fill.g, fill.b, 255))
 
     # shard particle models: three variants sharing the same refraction setup
     shards = []
@@ -616,8 +815,22 @@ def main():
     fresnel_ptr = ffi.new("float *", 4.0)
     tint_ptr = ffi.new("float *", 0.10)      # how milky the quartz is
 
-    panel = rl.Rectangle(652, 36, 236, 460)
+    panel = rl.Rectangle(422, 8, 200, 470)
     spin = 0.0
+    show_ui = True  # P hides every panel for a clean export view
+
+    # G exports a gif: a deterministic clock drives GIF_SECONDS of frames
+    # (so llvmpipe's framerate doesn't change the motion), captured off the
+    # screen and assembled by PIL into screenshots/leylines_cover.gif
+    GIF_FPS = 6          # itch's 3 MB cover cap rules: few frames...
+    GIF_SECONDS = 6.0
+    GIF_SCALE = 0.8      # ...and a 504x400 downscale (still above itch minimum)
+    GIF_CROSS = 1.5      # extra seconds recorded, crossfaded tail-into-head: seamless loop
+    GIF_OUT = Path(__file__).parent.parent / "screenshots" / "leylines_bg.gif"
+    GIF_SCRATCH = Path(__file__).parent / "gif_frames"
+    rec_i = -1          # -1 = not recording
+    rec_base_t = 0.0
+    rec_status = ""
     frame = 0
     show_normals = False
     normals_ptr = ffi.new("int *", 0)
@@ -628,6 +841,9 @@ def main():
         frame += 1
         t = rl.get_time()
         dt = rl.get_frame_time()
+        if rec_i >= 0:  # recording: fixed synthetic clock, real time ignored
+            t = rec_base_t + rec_i / GIF_FPS
+            dt = 1.0 / GIF_FPS
 
         if rl.is_key_down(rl.KeyboardKey.KEY_RIGHT):
             spin += 60.0 * dt
@@ -658,22 +874,20 @@ def main():
         update_reactivity(tris, int(tri_ptr[0]), mouse_world, dt)
         update_reactivity(particles, int(count_ptr[0]), mouse_world, dt)
 
+        render_title_rt()  # glyph texture first: texture modes cannot nest
+
         # Pass 1: the world without the gem -- this is what the gem will bend.
         # The flat triangles live here too, so the crystals refract them.
         rl.begin_texture_mode(scene_rt)
-        rl.clear_background(rl.Color(12, 12, 18, 255))
+        rl.clear_background(rl.Color(255, 0, 0, 255))  # flat RED backdrop, nothing else
         rl.begin_mode_3d(cam)
-        draw_aurora_plane(aurora_shader, aurora_time_loc, aurora_intensity_loc, t, aurora_ptr[0])
-        set_v3(water_shader, water_locs["viewPos"], cam.position.x, cam.position.y, cam.position.z)
-        set_f(water_shader, water_locs["time"], t)
-        set_f(water_shader, water_locs["intensity"], aurora_ptr[0])
-        set_f(water_shader, water_locs["waveAmp"], wave_amp_ptr[0])
-        set_f(water_shader, water_locs["waveScale"], wave_scale_ptr[0])
-        draw_water_plane(water_shader)
-        draw_backdrop(t)
         draw_tri_particles(tris, int(tri_ptr[0]), t, 1.0)
+        if not bg_mode:
+            draw_enemy(t)  # the gem refracts HIM -- he must exist in the scene it bends
         rl.end_mode_3d()
-        rl.end_texture_mode()
+        if title_show[0]:
+            draw_title()  # the title lives in the refracted scene too: shards
+        rl.end_texture_mode() # and the gem bend the letters drifting past them
 
         # Glow mask: only the triangles, on black -- whatever lands in this
         # buffer is what blooms in the post step (no lights involved)
@@ -709,6 +923,15 @@ def main():
         set_f(shader, locs["chromatic"], chroma_ptr[0])
         set_f(shader, locs["fresnelPow"], fresnel_ptr[0])
         set_v4(shader, locs["tint"], (0.85, 0.92, 1.0, tint_ptr[0]))
+        if rl.is_key_pressed(rl.KeyboardKey.KEY_P):
+            show_ui = not show_ui
+        if (rl.is_key_pressed(rl.KeyboardKey.KEY_G) or (bg_mode and frame == 40)) and rec_i < 0:
+            if bg_mode:
+                title_show[0] = False
+            rec_i = 0
+            rec_base_t = t
+            show_ui = False
+            GIF_SCRATCH.mkdir(exist_ok=True)
         if rl.is_key_pressed(rl.KeyboardKey.KEY_N):
             show_normals = not show_normals
         normals_ptr[0] = 1 if show_normals else 0
@@ -717,7 +940,7 @@ def main():
 
         # Pass 2: the same scene on screen, gem on top refracting pass 1
         rl.begin_drawing()
-        rl.clear_background(rl.Color(12, 12, 18, 255))
+        rl.clear_background(rl.Color(255, 0, 0, 255))
         rl.draw_texture_pro(scene_rt.texture,
                             rl.Rectangle(0, 0, SCREEN_W, -SCREEN_H),
                             rl.Rectangle(0, 0, SCREEN_W, SCREEN_H),
@@ -746,6 +969,10 @@ def main():
             rl.draw_model_ex(shards[p["variant"]], rl.Vector3(x, y, z),
                              rl.Vector3(p["axis"][0], p["axis"][1], p["axis"][2]),
                              angle, rl.Vector3(s, s, s), rl.WHITE)
+
+        # the enemy again, sharp, in front of the gem on screen
+        if not bg_mode:
+            draw_enemy(t)
         rl.end_mode_3d()
 
         # Post: vertical blur leg composited additively -- the glow blooms
@@ -760,36 +987,142 @@ def main():
         rl.end_shader_mode()
         rl.end_blend_mode()
 
-        # optics panel
-        rl.gui_window_box(panel, "quartz optics")
-        px, py = int(panel.x + 10), int(panel.y + 30)
-        rl.gui_label(rl.Rectangle(px, py, 216, 14), f"ior  {ior_ptr[0]:.2f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 14, 216, 14), "", "", ior_ptr, 1.0, 2.4)
-        rl.gui_label(rl.Rectangle(px, py + 36, 216, 14), f"strength  {strength_ptr[0]:.2f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 50, 216, 14), "", "", strength_ptr, 0.0, 1.0)
-        rl.gui_label(rl.Rectangle(px, py + 72, 216, 14), f"dispersion  {chroma_ptr[0]:.3f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 86, 216, 14), "", "", chroma_ptr, 0.0, 0.15)
-        rl.gui_label(rl.Rectangle(px, py + 108, 216, 14), f"fresnel  {fresnel_ptr[0]:.1f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 122, 216, 14), "", "", fresnel_ptr, 1.0, 8.0)
-        rl.gui_label(rl.Rectangle(px, py + 144, 216, 14), f"milkiness  {tint_ptr[0]:.2f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 158, 216, 14), "", "", tint_ptr, 0.0, 0.8)
-        rl.gui_label(rl.Rectangle(px, py + 180, 216, 14), f"particles  {int(count_ptr[0])}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 194, 216, 14), "", "", count_ptr, 0.0, float(MAX_PARTICLES))
-        rl.gui_label(rl.Rectangle(px, py + 216, 216, 14), f"particle size  {psize_ptr[0]:.2f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 230, 216, 14), "", "", psize_ptr, 0.3, 2.5)
-        rl.gui_label(rl.Rectangle(px, py + 252, 216, 14), f"triangles  {int(tri_ptr[0])}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 266, 216, 14), "", "", tri_ptr, 0.0, float(MAX_TRIS))
-        rl.gui_label(rl.Rectangle(px, py + 288, 216, 14), f"glow  {glow_ptr[0]:.2f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 302, 216, 14), "", "", glow_ptr, 0.0, 1.0)
-        rl.gui_label(rl.Rectangle(px, py + 324, 216, 14), f"aurora  {aurora_ptr[0]:.2f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 338, 216, 14), "", "", aurora_ptr, 0.0, 2.0)
-        rl.gui_label(rl.Rectangle(px, py + 360, 216, 14), f"wave amp  {wave_amp_ptr[0]:.2f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 374, 216, 14), "", "", wave_amp_ptr, 0.0, 1.2)
-        rl.gui_label(rl.Rectangle(px, py + 396, 216, 14), f"wave scale  {wave_scale_ptr[0]:.2f}")
-        rl.gui_slider_bar(rl.Rectangle(px, py + 410, 216, 14), "", "", wave_scale_ptr, 0.3, 4.0)
+        if show_ui:
+                # optics panel
+            rl.gui_window_box(panel, "quartz optics")
+            px, py = int(panel.x + 8), int(panel.y + 28)
+            rl.gui_label(rl.Rectangle(px, py, 184, 12), f"ior  {ior_ptr[0]:.2f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 14, 184, 12), "", "", ior_ptr, 1.0, 2.4)
+            rl.gui_label(rl.Rectangle(px, py + 36, 184, 12), f"strength  {strength_ptr[0]:.2f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 50, 184, 12), "", "", strength_ptr, 0.0, 1.0)
+            rl.gui_label(rl.Rectangle(px, py + 72, 184, 12), f"dispersion  {chroma_ptr[0]:.3f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 86, 184, 12), "", "", chroma_ptr, 0.0, 0.15)
+            rl.gui_label(rl.Rectangle(px, py + 108, 184, 12), f"fresnel  {fresnel_ptr[0]:.1f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 122, 184, 12), "", "", fresnel_ptr, 1.0, 8.0)
+            rl.gui_label(rl.Rectangle(px, py + 144, 184, 12), f"milkiness  {tint_ptr[0]:.2f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 158, 184, 12), "", "", tint_ptr, 0.0, 0.8)
+            rl.gui_label(rl.Rectangle(px, py + 180, 184, 12), f"particles  {int(count_ptr[0])}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 194, 184, 12), "", "", count_ptr, 0.0, float(MAX_PARTICLES))
+            rl.gui_label(rl.Rectangle(px, py + 216, 184, 12), f"particle size  {psize_ptr[0]:.2f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 230, 184, 12), "", "", psize_ptr, 0.3, 2.5)
+            rl.gui_label(rl.Rectangle(px, py + 252, 184, 12), f"triangles  {int(tri_ptr[0])}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 266, 184, 12), "", "", tri_ptr, 0.0, float(MAX_TRIS))
+            rl.gui_label(rl.Rectangle(px, py + 288, 184, 12), f"glow  {glow_ptr[0]:.2f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 302, 184, 12), "", "", glow_ptr, 0.0, 1.0)
+            rl.gui_label(rl.Rectangle(px, py + 324, 184, 12), f"aurora  {aurora_ptr[0]:.2f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 338, 184, 12), "", "", aurora_ptr, 0.0, 2.0)
+            rl.gui_label(rl.Rectangle(px, py + 360, 184, 12), f"wave amp  {wave_amp_ptr[0]:.2f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 374, 184, 12), "", "", wave_amp_ptr, 0.0, 1.2)
+            rl.gui_label(rl.Rectangle(px, py + 396, 184, 12), f"wave scale  {wave_scale_ptr[0]:.2f}")
+            rl.gui_slider_bar(rl.Rectangle(px, py + 410, 184, 12), "", "", wave_scale_ptr, 0.3, 4.0)
 
-        rl.draw_text("wheel: zoom   left/right: spin gem   n: show normals", 16, SCREEN_H - 28, 20, rl.GRAY)
+        if show_ui:
+            # title panel: sliders, FF-gradient toggle + its three stop
+            # pickers, flat fill picker
+            title_panel = rl.Rectangle(214, 8, 200, 484)
+            rl.gui_window_box(title_panel, "title")
+            tpx, tpy = int(title_panel.x + 8), int(title_panel.y + 28)
+
+            def tslider(i, label, key, lo, hi, fmt="{:.0f}"):
+                yy = tpy + i * 30
+                rl.gui_label(rl.Rectangle(tpx, yy, 184, 12), f"{label}  {fmt.format(tp[key][0])}")
+                rl.gui_slider_bar(rl.Rectangle(tpx, yy + 12, 184, 12), "", "", tp[key], lo, hi)
+
+            tslider(0, "size", "size", 20.0, 240.0)
+            tslider(1, "x offset", "x", -300.0, 300.0)
+            tslider(2, "y", "y", 0.0, float(SCREEN_H - 20))
+            tslider(3, "glow", "glow", 0.0, 200.0)
+            tslider(4, "rotation", "rot", -180.0, 180.0)
+            tslider(5, "outline px", "outline", 0.0, 6.0, "{:.1f}")
+            tslider(6, "spacing", "spacing", 0.0, 12.0, "{:.1f}")
+            cy0 = tpy + 7 * 30
+            rl.gui_check_box(rl.Rectangle(tpx, cy0, 14, 14), "FF pastel gradient", title_pastel)
+            rl.gui_check_box(rl.Rectangle(tpx + 110, cy0, 14, 14), "show title", title_show)
+            rl.gui_label(rl.Rectangle(tpx, cy0 + 20, 184, 12), "gradient top / mid / low")
+            rl.gui_color_picker(rl.Rectangle(tpx, cy0 + 34, 44, 44), "", grad_top)
+            rl.gui_color_picker(rl.Rectangle(tpx + 64, cy0 + 34, 44, 44), "", grad_mid)
+            rl.gui_color_picker(rl.Rectangle(tpx + 128, cy0 + 34, 44, 44), "", grad_low)
+            rl.gui_label(rl.Rectangle(tpx, cy0 + 86, 184, 12), "flat fill")
+            rl.gui_color_picker(rl.Rectangle(tpx, cy0 + 100, 160, 88), "", title_color)
+
+        if show_ui:
+            # enemy panel: size, position, and every shader knob
+            enemy_panel = rl.Rectangle(8, 8, 200, 434)
+            rl.gui_window_box(enemy_panel, "enemy")
+            epx, epy = int(enemy_panel.x + 8), int(enemy_panel.y + 28)
+
+            def eslider(i, label, key, lo, hi, fmt="{:.2f}"):
+                yy = epy + i * 30
+                rl.gui_label(rl.Rectangle(epx, yy, 184, 12), f"{label}  {fmt.format(ep[key][0])}")
+                rl.gui_slider_bar(rl.Rectangle(epx, yy + 12, 184, 12), "", "", ep[key], lo, hi)
+
+            eslider(0, "size", "size", 0.15, 1.6)
+            eslider(1, "pos x", "x", -3.0, 3.0)
+            eslider(2, "pos y", "y", 0.0, 3.5)
+            eslider(3, "pos z", "z", -1.5, 4.5)
+            eslider(4, "spike length", "spike_len", 0.0, 1.2)
+            eslider(5, "spike density", "spike_density", 0.05, 1.0)
+            eslider(6, "pulse speed", "pulse_speed", 0.0, 8.0)
+            eslider(7, "breathe amp", "breathe_amp", 0.0, 0.25)
+            eslider(8, "breathe speed", "breathe_speed", 0.0, 6.0)
+            eslider(9, "pastel rim", "rim", 0.0, 1.5)
+            eslider(10, "line width", "line_width", 1.0, 6.0, "{:.1f}")
+            eslider(11, "red outline", "red_outline", 0.0, 0.15, "{:.3f}")
+            eslider(12, "spin deg/s", "spin", 0.0, 120.0, "{:.0f}")
+
+        if show_ui:
+            rl.draw_text("wheel: zoom  arrows: spin gem  n: normals  p: panels  g: export gif", 8, SCREEN_H - 22, 16, rl.GRAY)
+            if rec_status:
+                rl.draw_text(rec_status, 8, SCREEN_H - 42, 16, rl.LIME)
         rl.end_drawing()
+
+        if rec_i >= 0:
+            shot = rl.load_image_from_screen()
+            rl.export_image(shot, str(GIF_SCRATCH / f"frame_{rec_i:03d}.png"))
+            rl.unload_image(shot)
+            rec_i += 1
+            if rec_i >= int(GIF_FPS * (GIF_SECONDS + GIF_CROSS)):
+                from PIL import Image
+                gif_size = (int(SCREEN_W * GIF_SCALE), int(SCREEN_H * GIF_SCALE))
+                raw = [Image.open(GIF_SCRATCH / f"frame_{k:03d}.png").convert("RGB").resize(gif_size, Image.LANCZOS)
+                       for k in range(rec_i)]
+                # seamless loop: the extra tail frames continue the motion past
+                # the loop point; fading them into the head hides the seam
+                n_out = int(GIF_FPS * GIF_SECONDS)
+                n_cross = rec_i - n_out
+                imgs = []
+                for k in range(n_out):
+                    if k < n_cross:
+                        imgs.append(Image.blend(raw[n_out + k], raw[k], k / n_cross))
+                    else:
+                        imgs.append(raw[k])
+                if bg_mode:
+                    # edge vignette into flat red: set the itch page background
+                    # color to #FF0000 and the gif dissolves into the page
+                    gw_, gh_ = gif_size
+                    yy, xx = np.mgrid[0:gh_, 0:gw_]
+                    margin_x, margin_y = gw_ * 0.16, gh_ * 0.16
+                    d = np.minimum(np.minimum(xx, gw_ - 1 - xx) / margin_x,
+                                   np.minimum(yy, gh_ - 1 - yy) / margin_y)
+                    a = np.clip(d, 0.0, 1.0)
+                    a = a * a * (3.0 - 2.0 * a)  # smoothstep
+                    vmask = Image.fromarray((a * 255).astype("uint8"), "L")
+                    page_red = Image.new("RGB", gif_size, (255, 0, 0))
+                    imgs = [Image.composite(im, page_red, vmask) for im in imgs]
+                pal = imgs[len(imgs) // 2].quantize(colors=96)
+                q = [im.quantize(palette=pal, dither=Image.Dither.NONE) for im in imgs]
+                GIF_OUT.parent.mkdir(exist_ok=True)
+                q[0].save(GIF_OUT, save_all=True, append_images=q[1:],
+                          duration=int(1000 / GIF_FPS), loop=0, optimize=True)
+                for f in GIF_SCRATCH.glob("frame_*.png"):
+                    f.unlink()
+                GIF_SCRATCH.rmdir()
+                rec_status = f"wrote {GIF_OUT.name} ({GIF_OUT.stat().st_size // 1024} KB)"
+                print(rec_status)
+                rec_i = -1
+                show_ui = True
+                if bg_mode:
+                    break
 
         if rl.is_key_pressed(rl.KeyboardKey.KEY_S) or (shot_mode and frame == 50):
             rl.take_screenshot("refraction_shot.png")
