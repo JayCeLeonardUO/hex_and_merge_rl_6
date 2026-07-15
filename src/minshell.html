@@ -49,11 +49,11 @@
           border: 0px none;
           background-color: black;
           display: block;
-          /* Show the square 720x720 framebuffer at native size (1:1, crisp),
-             shrinking to fit smaller viewports but never upscaling;
+          /* Scale the square 720x720 framebuffer to fill the viewport
+             (largest square that fits, up- or downscaling as needed);
              emscripten maps mouse coords through CSS size */
-          width: min(100vw, 100vh, 720px);
-          height: min(100vw, 100vh, 720px);
+          width: min(100vw, 100vh);
+          height: min(100vw, 100vh);
         }
     </style>
     <script type='text/javascript' src="https://cdn.jsdelivr.net/gh/eligrey/FileSaver.js/dist/FileSaver.min.js"> </script>
