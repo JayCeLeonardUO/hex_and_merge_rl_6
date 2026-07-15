@@ -949,6 +949,7 @@ static Sound sndReturn = {0}; // A card's field lifetime expiring
 static Sound sndHit = {0};    // Enemy smashes a card / hits the player
 static Sound sndLever = {0};  // The turn lever firing
 static Sound sndBoom = {0};   // Fireball detonation
+static Sound sndCharge = {0}; // Fireball banking a charge: rising power-up sweep
 
 // Background ambience: the floating-bowls recording over a pink noise bed,
 // loop-softened and mixed offline by sandbox/gen_ambience.py (streamed, so
@@ -2953,6 +2954,47 @@ static int StageShowcaseScene(int stage)
     return 40; // calm scenes: let the springs and telegraphs settle
 }
 
+// fireball flames -- a flickering crown over any fireball one pull from
+// detonating. Drawn LATE with depth off (like the telegraphs) so no gem,
+// card, or composite pass can sit on top of the warning
+static void DrawFireballFlames(float airTime)
+{
+    BeginMode3D(camera);
+    rlDisableDepthTest();
+    Vector3 camFwd = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    Vector3 right = Vector3Normalize(Vector3CrossProduct((Vector3){0.0f, 1.0f, 0.0f}, camFwd));
+    BeginBlendMode(BLEND_ADDITIVE);
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *cell = &entities[i];
+        if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0) || (cell->cardKind != CARD_FIREBALL)) continue;
+        if (cell->fireballCharge < FIREBALL_CHARGE_NEEDED - 1) continue;
+
+        for (int k = 0; k < 6; k++)
+        {
+            float phase = (float)k * 1.05f;
+            float flick = 0.55f + 0.45f * sinf(airTime * (6.0f + (float)(k % 3)) + phase * 3.7f);
+            float baseOff = sinf(phase * 2.3f) * 0.16f;
+            float w = 0.10f + 0.05f * sinf(airTime * 5.0f + phase);
+            float tall = (0.45f + 0.55f * flick) * ((k % 2 == 0) ? 1.0f : 0.65f);
+            float sway = sinf(airTime * 3.0f + phase) * 0.08f;
+            Vector3 base = {cell->position.x + right.x * baseOff, HEX_TILE_HEIGHT + 0.35f, cell->position.z + right.z * baseOff};
+            Vector3 a = Vector3Add(base, Vector3Scale(right, -w));
+            Vector3 b = Vector3Add(base, Vector3Scale(right, w));
+            Vector3 tip = {base.x + right.x * sway, base.y + tall, base.z + right.z * sway};
+            Color tongue = (k % 2 == 0) ? (Color){255, 120, 30, 190} : (Color){255, 210, 90, 160};
+            DrawTriangle3D(a, b, tip, tongue);
+            DrawTriangle3D(b, a, tip, tongue); // both windings: culling-proof
+        }
+    }
+    // Flush while depth testing is still off, or the batch dies against the
+    // gem depths at EndMode3D
+    rlDrawRenderBatchActive();
+    EndBlendMode();
+    rlEnableDepthTest();
+    EndMode3D();
+}
+
 // enemy intent -- the telegraph for the next lever pull, drawing only the
 // stored intent fields EnemyAIUpdate computed so it can never lie. Strike: a
 // red dashed arc to the doomed card, a pulsing ring, the raised wash hex,
@@ -3642,6 +3684,7 @@ static void UpdateDrawFrame(void)
                     LOG("INFO: FIREBALL: charged %d/%d at (q=%d, r=%d)\n",
                         cell->fireballCharge, FIREBALL_CHARGE_NEEDED, cell->q, cell->r);
                     if (cell->fireballCharge >= FIREBALL_CHARGE_NEEDED) DetonateFireball(cell);
+                    else PlaySound(sndCharge); // rising sweep; the boom itself covers the last pull
                 }
             }
 
@@ -3988,6 +4031,7 @@ static void UpdateDrawFrame(void)
                 DrawSphere(ep, 0.07f, (Color){255, 230, 150, 230});
                 DrawSphere(ep, 0.13f, (Color){255, 120, 40, 80});
             }
+
         }
     }
 
@@ -4657,7 +4701,8 @@ static void UpdateDrawFrame(void)
         EndBlendMode();
     }
 
-    DrawIntent(airTime);
+    DrawFireballFlames(airTime); // armed-fireball crown, over everything
+    DrawIntent(airTime);         // telegraphs stay topmost of all
 
     if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, LIGHTGRAY);
 
@@ -5001,6 +5046,7 @@ int main(int argc, char *argv[])
     sndHit = SynthSound(150.0f, 55.0f, 0.24f, 0.55f, 0.8f);
     sndLever = SynthSound(320.0f, 70.0f, 0.14f, 0.35f, 0.55f);
     sndBoom = SynthSound(110.0f, 38.0f, 0.45f, 0.7f, 0.9f);
+    sndCharge = SynthSound(220.0f, 880.0f, 0.35f, 0.12f, 0.5f);
 
     // The ambience bed under everything, quiet enough to sit behind the SFX
     bgNoise = LoadMusicStream("resources/ambience.wav");
@@ -5275,6 +5321,7 @@ int main(int argc, char *argv[])
     UnloadSound(sndHit);
     UnloadSound(sndLever);
     UnloadSound(sndBoom);
+    UnloadSound(sndCharge);
     for (int n = 0; n < TUTORIAL_SLIDES; n++) UnloadTexture(tutorialTex[n]);
     UnloadMusicStream(bgNoise);
     CloseAudioDevice();
