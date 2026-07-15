@@ -36,10 +36,20 @@ elif [[ "$DEBUG_MODE" == "gdbgui" ]]; then
 else
     "$CMAKE" -B build && "$CMAKE" --build build || exit 1
 
+    # A graphics driver update can break GLX until the next reboot (context
+    # creation fails BadValue and the game segfaults on launch). Fall back to
+    # Mesa's software renderer so the game still runs; once GLX is healthy
+    # again this check passes and the GPU is used as normal.
+    GL_ENV=""
+    if command -v glxinfo >/dev/null 2>&1 && ! glxinfo -B >/dev/null 2>&1; then
+        echo "WARNING: GLX is broken (reboot pending?) - running on software GL"
+        GL_ENV="__GLX_VENDOR_LIBRARY_NAME=mesa LIBGL_ALWAYS_SOFTWARE=1"
+    fi
+
     tmux kill-session -t "$TMUX_RUN_SESSION" 2>/dev/null || true
     sleep 0.2
     # cwd must be the binary dir so the game finds resources/
-    tmux new-session -d -s "$TMUX_RUN_SESSION" -c "$PWD/build/$TARGET" "./$TARGET"
+    tmux new-session -d -s "$TMUX_RUN_SESSION" -c "$PWD/build/$TARGET" "$GL_ENV ./$TARGET"
 
     echo "Running in tmux session '$TMUX_RUN_SESSION'"
 

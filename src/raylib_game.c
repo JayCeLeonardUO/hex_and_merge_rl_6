@@ -145,7 +145,7 @@ static const char *exodiaPieceShort[NUM_CARD_KINDS] = {"", "king's head", "right
 static const char *cardKindTooltips[NUM_CARD_KINDS] = {
     "",
     "conduit: its tile joins the leyline network",
-    "leyline-charged: detonates at 2 charges, hits all within 1 tile",
+    "leyline-charged: detonates at 2, hits EVERYTHING within 1 tile - you too",
     "curse trap: the enemy that strikes it fights for you 1/2/3 turns",
     "baits enemy strikes, absorbs the hit for no heart, rests 1 turn after",
 };
@@ -1390,15 +1390,15 @@ static int tutorialSlide = 0;
 static const char *tutorialCaptions[TUTORIAL_SLIDES] = {
     "Drag cards from your hand onto empty tiles. Drop one onto a same kind + level card to merge it a level up.",
     "Leylines conduct power from your tile. Spells only work while a live chain touches them.",
-    "A connected fireball banks a charge each turn. At 2 charges it detonates, hitting everything within 1 tile.",
+    "A connected fireball banks a charge each turn. At 2 charges it detonates, hitting EVERYTHING within 1 tile -- including you. Keep a leyline between you and the bomb.",
     "Wards bait enemy strikes: no heart lost. The used ward rests in your hand for one turn.",
     "Hex is a trap. The enemy that smashes it turns purple and fights for you for 1-3 turns.",
     "Red arch: the enemy will walk there. Pulsing dashes and a ! : it will hit that tile.",
     "Stand on a pickup to take it. The crystal grows one every 2 turns; slain enemies drop them too.",
     "Click the crystal to end your turn. Merge every kind to level 4 -- all four exodia pieces win.",
 };
-static int shotStage = -1;   // --tutorial-shots sequence position, -1 = off
-static int shotTimer = 0;    // Frames until the current scene is captured
+static int shotStage = -1;        // --tutorial-shots sequence position, -1 = off
+static int shotTimer = 0;         // Frames until the current scene is captured
 static bool shotQuit = false;     // True once the last scene is exported
 static bool shotShowcase = false; // --showcase-shots: full-res submission stills
 
@@ -1823,10 +1823,6 @@ static void HexWorldToAxial(float x, float z, int *q, int *r)
     *r = (int)rz;
 }
 
-static void AdvanceTurn(void)
-{
-}
-
 // Screen text with a black border, readable over any backdrop: an 8-way
 // black ring (thicker for big type) under the colored fill
 static void DrawTextOutlined(const char *text, int x, int y, int size, Color color)
@@ -2203,9 +2199,12 @@ static void SpawnEnemyDrop(int q, int r)
 }
 
 // Fireball detonation: a radius-FIREBALL_AOE_RADIUS blast that destroys
-// every enemy in reach. The spent emplacement follows the level rule: lvl 1
-// leaves a husk blocking the tile for one committed turn before the card
-// returns to the hand, lvl 2+ returns immediately
+// every enemy in reach -- and the blast doesn't care whose side you're on:
+// the player caught in radius eats it too, so a fireball is only safe to
+// run with a leyline keeping it at arm's length. The spent emplacement
+// follows the level rule: lvl 1 leaves a husk blocking the tile for one
+// committed turn before the card returns to the hand, lvl 2+ returns
+// immediately
 static void DetonateFireball(Entity *cell)
 {
     LOG("INFO: FIREBALL: lvl %d detonated at (q=%d, r=%d)\n", (int)cell->cardLevel, cell->q, cell->r);
@@ -2222,6 +2221,23 @@ static void DetonateFireball(Entity *cell)
         LOG("INFO: FIREBALL: enemy at (q=%d, r=%d) destroyed\n", enemy->q, enemy->r);
         SpawnEnemyDrop(enemy->q, enemy->r); // the drop appends at the tail, then the despawn swaps it into this slot
         EntityDespawn(i);
+    }
+
+    // The player in the blast radius takes it like an enemy hit: 2 hearts
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *p = &entities[i];
+        if (p->kind != ENTITY_PLAYER) continue;
+        if (HexDistance(cell->q, cell->r, p->q, p->r) > FIREBALL_AOE_RADIUS) continue;
+
+        LOG("INFO: FIREBALL: the player caught the blast, -2 hearts\n");
+        for (int h = 0; h < entityCount; h++)
+        {
+            Entity *bar = &entities[h];
+            if (bar->kind != ENTITY_HEALTH_BAR) continue;
+            bar->health -= 2;
+            if (bar->health < 0) bar->health = 0;
+        }
     }
 
     if (cell->cardLevel >= CARD_LVL_2)
@@ -2504,7 +2520,7 @@ static void EnemyAIExecuteIntents(void)
                     LOG("INFO: HEX: enemy at (q=%d, r=%d) cursed, fights for you %d turns\n",
                         enemy->q, enemy->r, (int)cell->cardLevel);
                 }
-                Entity *back = ReturnPlacedCard(cell); // forced back to the hand...
+                Entity *back = ReturnPlacedCard(cell);             // forced back to the hand...
                 if (warded && (back != NULL)) back->huskTurns = 1; // used wards come home exhausted for a turn
                 for (int h = 0; !warded && !hexTrap && (h < entityCount); h++)
                 {
@@ -2787,47 +2803,47 @@ static void StageTutorialScene(int stage)
 
     switch (stage)
     {
-    case 0: // cards on tiles + a merged lvl 2
-        StageTutorialCard(-1, 0, CARD_WARD, CARD_LVL_1);
-        StageTutorialCard(1, -1, CARD_FIREBALL, CARD_LVL_2);
-        break;
-    case 1: // leyline chain from the player to a tapped fireball
-    case 2: // ...same scene, with a banked charge glowing
-        StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
-        StageTutorialCard(2, 0, CARD_LEYLINE, CARD_LVL_1);
-        StageTutorialCard(3, 0, CARD_FIREBALL, CARD_LVL_1);
-        if (stage == 2)
-        {
-            Entity *fb = FindCell(3, 0);
-            if (fb != NULL) fb->fireballCharge = 1;
-        }
-        break;
-    case 3: // ward baiting the enemy's strike telegraph
-        StageTutorialCard(1, -1, CARD_WARD, CARD_LVL_1);
-        break;
-    case 4: // hexed (purple) enemy turning on a fresh foe
-        if (enemy != NULL) enemy->hexedTurns = 2;
-        SpawnEnemy(3, -2);
-        break;
-    case 5: // both telegraphs: a far enemy arching in, a close one striking
-        if (enemy != NULL)
-        {
-            enemy->q = 3;
-            enemy->r = -4;
-            enemy->position = HexAxialToWorld(enemy->q, enemy->r);
-        }
-        SpawnEnemy(1, 1); // adjacent to the player: attack "!"
-        break;
-    case 6: // pickups: a crystal gift beside the crystal, an enemy drop afield
-        StageTutorialPickup(1, 0, CARD_LEYLINE);
-        StageTutorialPickup(-2, 1, CARD_FIREBALL);
-        break;
-    case 7: // the goal: an exodia piece resting in the hand
-        SpawnCardKind(CARD_WARD);
-        entities[entityCount - 1].cardLevel = CARD_LVL_4;
-        break;
-    default:
-        break;
+        case 0: // cards on tiles + a merged lvl 2
+            StageTutorialCard(-1, 0, CARD_WARD, CARD_LVL_1);
+            StageTutorialCard(1, -1, CARD_FIREBALL, CARD_LVL_2);
+            break;
+        case 1: // leyline chain from the player to a tapped fireball
+        case 2: // ...same scene, with a banked charge glowing
+            StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
+            StageTutorialCard(2, 0, CARD_LEYLINE, CARD_LVL_1);
+            StageTutorialCard(3, 0, CARD_FIREBALL, CARD_LVL_1);
+            if (stage == 2)
+            {
+                Entity *fb = FindCell(3, 0);
+                if (fb != NULL) fb->fireballCharge = 1;
+            }
+            break;
+        case 3: // ward baiting the enemy's strike telegraph
+            StageTutorialCard(1, -1, CARD_WARD, CARD_LVL_1);
+            break;
+        case 4: // hexed (purple) enemy turning on a fresh foe
+            if (enemy != NULL) enemy->hexedTurns = 2;
+            SpawnEnemy(3, -2);
+            break;
+        case 5: // both telegraphs: a far enemy arching in, a close one striking
+            if (enemy != NULL)
+            {
+                enemy->q = 3;
+                enemy->r = -4;
+                enemy->position = HexAxialToWorld(enemy->q, enemy->r);
+            }
+            SpawnEnemy(1, 1); // adjacent to the player: attack "!"
+            break;
+        case 6: // pickups: a crystal gift beside the crystal, an enemy drop afield
+            StageTutorialPickup(1, 0, CARD_LEYLINE);
+            StageTutorialPickup(-2, 1, CARD_FIREBALL);
+            break;
+        case 7: // the goal: an exodia piece resting in the hand
+            SpawnCardKind(CARD_WARD);
+            entities[entityCount - 1].cardLevel = CARD_LVL_4;
+            break;
+        default:
+            break;
     }
     EnemyAIUpdate(); // telegraphs and danger flags match the staged board
 }
@@ -2875,80 +2891,79 @@ static int StageShowcaseScene(int stage)
 
     switch (stage)
     {
-    case 0: // the placement animation: impact burst popping on a fresh card
-    {
-        StageTutorialCard(-1, 0, CARD_WARD, CARD_LVL_1);
-        StageTutorialCard(1, -1, CARD_LEYLINE, CARD_LVL_1);
-        StageTutorialCard(0, -1, CARD_FIREBALL, CARD_LVL_2);
-        SettleHand();
-        Entity *fresh = FindCell(0, -1);
-        if (fresh != NULL)
-            impact = (ImpactFx){.position = fresh->position, .tint = cardKindTints[CARD_FIREBALL], .age = 0.0f, .active = true};
-        EnemyAIUpdate();
-        return 2; // catch the ring mid-flight
-    }
-    case 1: // the leyline network alive, a fireball banking its charge
-        StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
-        StageTutorialCard(2, 0, CARD_LEYLINE, CARD_LVL_1);
-        StageTutorialCard(3, 0, CARD_FIREBALL, CARD_LVL_1);
-        StageTutorialCard(-1, 1, CARD_LEYLINE, CARD_LVL_1);
-        StageTutorialCard(-2, 2, CARD_WARD, CARD_LVL_1);
-        if (FindCell(3, 0) != NULL) FindCell(3, 0)->fireballCharge = 1;
-        break;
-    case 2: // threats telegraphed: a baited strike and an archer arching in
-        StageTutorialCard(1, -1, CARD_WARD, CARD_LVL_1);
-        SpawnEnemy(-4, 2);
-        break;
-    case 3: // a detonation, enemies caught in the blast
-    {
-        StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
-        StageTutorialCard(2, 0, CARD_FIREBALL, CARD_LVL_2);
-        SettleHand();
-        SpawnEnemy(3, 0);
-        SpawnEnemy(2, 1);
-        SpawnEnemy(-3, 0); // out of the blast: a survivor for scale
-        Entity *bomb = FindCell(2, 0);
-        if (bomb != NULL) DetonateFireball(bomb);
-        EnemyAIUpdate();
-        return 2; // the boom flash + fresh card drops
-    }
-    case 4: // the hex curse: a purple ally turning on its own
-        if (enemy != NULL) enemy->hexedTurns = 2;
-        SpawnEnemy(3, -2);
-        break;
-    case 5: // the win screen: all four pieces of the hex king
-        for (int k = CARD_LEYLINE; k < NUM_CARD_KINDS; k++)
+        case 0: // the placement animation: impact burst popping on a fresh card
         {
-            SpawnCardKind((CardKind)k);
-            entities[entityCount - 1].cardLevel = CARD_LVL_4;
+            StageTutorialCard(-1, 0, CARD_WARD, CARD_LVL_1);
+            StageTutorialCard(1, -1, CARD_LEYLINE, CARD_LVL_1);
+            StageTutorialCard(0, -1, CARD_FIREBALL, CARD_LVL_2);
+            SettleHand();
+            Entity *fresh = FindCell(0, -1);
+            if (fresh != NULL)
+                impact = (ImpactFx){.position = fresh->position, .tint = cardKindTints[CARD_FIREBALL], .age = 0.0f, .active = true};
+            EnemyAIUpdate();
+            return 2; // catch the ring mid-flight
         }
-        SettleHand();
-        gameTurn = 23; // a plausible run length for the "assembled in N turns" line
-        break;
-    case 6: // a leyline WEB: chains branching from the player, spells tapped on
-    {
-        static const int web[][2] = {{1, 0}, {2, 0}, {3, 0}, {2, -1}, {1, 1}, {2, 1},
-                                     {0, 2}, {0, 3}, {-1, 1}, {-2, 1}, {-1, 2}, {-1, 3}};
-        for (int w = 0; w < (int)(sizeof(web) / sizeof(web[0])); w++)
+        case 1: // the leyline network alive, a fireball banking its charge
+            StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
+            StageTutorialCard(2, 0, CARD_LEYLINE, CARD_LVL_1);
+            StageTutorialCard(3, 0, CARD_FIREBALL, CARD_LVL_1);
+            StageTutorialCard(-1, 1, CARD_LEYLINE, CARD_LVL_1);
+            StageTutorialCard(-2, 2, CARD_WARD, CARD_LVL_1);
+            if (FindCell(3, 0) != NULL) FindCell(3, 0)->fireballCharge = 1;
+            break;
+        case 2: // threats telegraphed: a baited strike and an archer arching in
+            StageTutorialCard(1, -1, CARD_WARD, CARD_LVL_1);
+            SpawnEnemy(-4, 2);
+            break;
+        case 3: // a detonation, enemies caught in the blast
         {
-            StageTutorialCard(web[w][0], web[w][1], CARD_LEYLINE, CARD_LVL_1);
+            StageTutorialCard(1, 0, CARD_LEYLINE, CARD_LVL_1);
+            StageTutorialCard(2, 0, CARD_FIREBALL, CARD_LVL_2);
+            SettleHand();
+            SpawnEnemy(3, 0);
+            SpawnEnemy(2, 1);
+            SpawnEnemy(-3, 0); // out of the blast: a survivor for scale
+            Entity *bomb = FindCell(2, 0);
+            if (bomb != NULL) DetonateFireball(bomb);
+            EnemyAIUpdate();
+            return 2; // the boom flash + fresh card drops
         }
-        StageTutorialCard(4, -1, CARD_FIREBALL, CARD_LVL_1); // tapped at the chain ends
-        StageTutorialCard(-3, 2, CARD_WARD, CARD_LVL_1);
-        StageTutorialCard(1, 2, CARD_HEX, CARD_LVL_1);
-        Entity *fb = FindCell(4, -1);
-        if (fb != NULL) fb->fireballCharge = 1;
-        if (enemy != NULL) // keep the enemy out of the web's face
+        case 4: // the hex curse: a purple ally turning on its own
+            if (enemy != NULL) enemy->hexedTurns = 2;
+            SpawnEnemy(3, -2);
+            break;
+        case 5: // the win screen: all four pieces of the hex king
+            for (int k = CARD_LEYLINE; k < NUM_CARD_KINDS; k++)
+            {
+                SpawnCardKind((CardKind)k);
+                entities[entityCount - 1].cardLevel = CARD_LVL_4;
+            }
+            SettleHand();
+            gameTurn = 23; // a plausible run length for the "assembled in N turns" line
+            break;
+        case 6: // a leyline WEB: chains branching from the player, spells tapped on
         {
-            enemy->q = 4;
-            enemy->r = -4;
-            enemy->position = HexAxialToWorld(enemy->q, enemy->r);
+            static const int web[][2] = {{1, 0}, {2, 0}, {3, 0}, {2, -1}, {1, 1}, {2, 1}, {0, 2}, {0, 3}, {-1, 1}, {-2, 1}, {-1, 2}, {-1, 3}};
+            for (int w = 0; w < (int)(sizeof(web) / sizeof(web[0])); w++)
+            {
+                StageTutorialCard(web[w][0], web[w][1], CARD_LEYLINE, CARD_LVL_1);
+            }
+            StageTutorialCard(4, -1, CARD_FIREBALL, CARD_LVL_1); // tapped at the chain ends
+            StageTutorialCard(-3, 2, CARD_WARD, CARD_LVL_1);
+            StageTutorialCard(1, 2, CARD_HEX, CARD_LVL_1);
+            Entity *fb = FindCell(4, -1);
+            if (fb != NULL) fb->fireballCharge = 1;
+            if (enemy != NULL) // keep the enemy out of the web's face
+            {
+                enemy->q = 4;
+                enemy->r = -4;
+                enemy->position = HexAxialToWorld(enemy->q, enemy->r);
+            }
+            SettleHand();
+            break;
         }
-        SettleHand();
-        break;
-    }
-    default:
-        break;
+        default:
+            break;
     }
     EnemyAIUpdate();
     return 40; // calm scenes: let the springs and telegraphs settle
@@ -3298,7 +3313,7 @@ static void UpdateDrawFrame(void)
         {
             Entity *card = &entities[i];
             if (card->kind != ENTITY_CARD) continue;
-            if (card->huskTurns > 0) continue;            // Dead in the hand: ungrabbable until it wakes
+            if (card->huskTurns > 0) continue;           // Dead in the hand: ungrabbable until it wakes
             if (card->cardLevel >= CARD_LVL_4) continue; // Exodia pieces are inert trophies
 
             Rectangle rect = {card->position.x - CARD_WIDTH * cardScale / 2.0f, card->position.y - CARD_HEIGHT * cardScale / 2.0f,
@@ -3683,8 +3698,10 @@ static void UpdateDrawFrame(void)
                     cell->fireballCharge++;
                     LOG("INFO: FIREBALL: charged %d/%d at (q=%d, r=%d)\n",
                         cell->fireballCharge, FIREBALL_CHARGE_NEEDED, cell->q, cell->r);
-                    if (cell->fireballCharge >= FIREBALL_CHARGE_NEEDED) DetonateFireball(cell);
-                    else PlaySound(sndCharge); // rising sweep; the boom itself covers the last pull
+                    if (cell->fireballCharge >= FIREBALL_CHARGE_NEEDED)
+                        DetonateFireball(cell);
+                    else
+                        PlaySound(sndCharge); // rising sweep; the boom itself covers the last pull
                 }
             }
 
@@ -3915,6 +3932,29 @@ static void UpdateDrawFrame(void)
                 if (heat > fireballHeat[nq + GRID_RADIUS][nr + GRID_RADIUS]) fireballHeat[nq + GRID_RADIUS][nr + GRID_RADIUS] = heat;
             }
         }
+
+        // A grabbed fireball ghosting over the board previews its would-be
+        // blast around the hovered tile -- aim the bomb before committing
+        // (and see when YOU are standing inside it)
+        if (hoveredCell != NULL)
+        {
+            for (int i = 0; i < entityCount; i++)
+            {
+                const Entity *card = &entities[i];
+                if ((card->kind != ENTITY_CARD) || !card->selected || (card->cardMode != CARD_HEX_FORM)) continue;
+                if (card->cardKind != CARD_FIREBALL) continue;
+
+                float heat = 0.60f + 0.20f * sinf(auroraTime * 5.0f);
+                for (int d = -1; d < 6; d++)
+                {
+                    int nq = hoveredCell->q + ((d < 0) ? 0 : aoeDirs[d][0]);
+                    int nr = hoveredCell->r + ((d < 0) ? 0 : aoeDirs[d][1]);
+                    if (!HexOnBoard(nq, nr)) continue;
+                    if (heat > fireballHeat[nq + GRID_RADIUS][nr + GRID_RADIUS]) fireballHeat[nq + GRID_RADIUS][nr + GRID_RADIUS] = heat;
+                }
+                break; // only one card can be grabbed
+            }
+        }
     }
 
     for (int i = 0; i < entityCount; i++)
@@ -3980,6 +4020,18 @@ static void UpdateDrawFrame(void)
         if (heat > 0.0f)
             DrawCylinder(cell->position, drawSize, drawSize, height + 0.012f, 6, Fade((Color){255, 120, 50, 255}, 0.30f * heat));
 
+        // Dragging the player: every tile his one step may land on pulses
+        // green (nothing glows once the turn's move is spent)
+        if ((player != NULL) && player->selected && (playerMovedTurn != gameTurn))
+        {
+            int stepDist = HexDistance(player->q, player->r, cell->q, cell->r);
+            if ((stepDist > 0) && (stepDist <= player->moveRange) && !HexTileSolid(cell->q, cell->r))
+            {
+                float pulse = 0.30f + 0.12f * sinf(auroraTime * 5.0f);
+                DrawCylinder(cell->position, drawSize, drawSize, height + 0.014f, 6, Fade((Color){120, 255, 160, 255}, pulse));
+            }
+        }
+
         // Spent fireball husk: charred mounds and a breathing ember squat on
         // the tile until the cooldown hands the card back
         if (cell->huskTurns > 0)
@@ -4031,7 +4083,6 @@ static void UpdateDrawFrame(void)
                 DrawSphere(ep, 0.07f, (Color){255, 230, 150, 230});
                 DrawSphere(ep, 0.13f, (Color){255, 120, 40, 80});
             }
-
         }
     }
 
@@ -4507,9 +4558,9 @@ static void UpdateDrawFrame(void)
         if (card->selected && (card->cardMode == CARD_HEX_FORM)) continue;
 
         bool isPiece = (card->cardLevel >= CARD_LVL_4);
-        const char *valueText = (card->huskTurns > 0)  ? TextFormat("%s zzz", cardKindNames[card->cardKind])
-                                : isPiece              ? TextFormat("%s", exodiaPieceShort[card->cardKind])
-                                                       : TextFormat("%s %d", cardKindNames[card->cardKind], (int)card->cardLevel);
+        const char *valueText = (card->huskTurns > 0) ? TextFormat("%s zzz", cardKindNames[card->cardKind])
+                                : isPiece             ? TextFormat("%s", exodiaPieceShort[card->cardKind])
+                                                      : TextFormat("%s %d", cardKindNames[card->cardKind], (int)card->cardLevel);
         Color valueColor = (card->huskTurns > 0) ? GRAY
                            : isPiece             ? (Color){255, 220, 60, 255}
                                                  : card->tint;
@@ -4550,7 +4601,7 @@ static void UpdateDrawFrame(void)
         if (card->tooltip[0] == '\0') continue;
 
         const int tipSize = 18;
-        const int tipMaxW = 300;  // Wrap width, keeps long descriptions on screen
+        const int tipMaxW = 300; // Wrap width, keeps long descriptions on screen
         const int tipLineH = tipSize + 5;
 
         // Word wrap: greedy fill over index slices of the tooltip buffer,
@@ -4866,8 +4917,10 @@ static void UpdateDrawFrame(void)
 
         igTextWrapped("%s", tutorialCaptions[tutorialSlide]);
         igSpacing();
-        if (tutorialTex[tutorialSlide].id != 0) rlImGuiImageSize(&tutorialTex[tutorialSlide], 380, 380);
-        else igTextWrapped("(slide image missing -- run the game with --tutorial-shots to regenerate)");
+        if (tutorialTex[tutorialSlide].id != 0)
+            rlImGuiImageSize(&tutorialTex[tutorialSlide], 380, 380);
+        else
+            igTextWrapped("(slide image missing -- run the game with --tutorial-shots to regenerate)");
         igSpacing();
 
         if (igButton("< prev", (ImVec2_c){0, 0}) && (tutorialSlide > 0)) tutorialSlide--;
