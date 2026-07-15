@@ -84,6 +84,12 @@ def beam_point(a, b, arc, tt):
     return x, y, z
 
 
+def tapped(tile, live):
+    """A spell tile activates when ANY neighbour is a live leyline tile --
+    spells tap the network by adjacency, they never extend it."""
+    return any((tile[0] + dq, tile[1] + dr) in live for dq, dr in DIRS)
+
+
 def flood(conducting, start):
     seen = {start}
     frontier = [start]
@@ -211,16 +217,15 @@ def main():
     def pull_lever(now):
         nonlocal turn
         turn += 1
-        conducting = set(leylines) | set(fireballs) | {player}
-        live = flood(conducting, player)
+        live = flood(set(leylines) | {player}, player)  # only leylines conduct
         need = max(1, int(params["charge_needed"][0]))
         # husks that spent last turn dead on the field come back to the hand
         for tile in list(dead_husks):
             dead_husks.discard(tile)
             hand_count += 1
         for tile in list(fireballs):
-            if tile not in live:
-                continue  # not connected: no charge this turn
+            if not tapped(tile, live):
+                continue  # no adjacent live leyline: no charge this turn
             fb = fireballs[tile]
             fb["charge"] += 1
             if fb["charge"] >= need:
@@ -321,22 +326,17 @@ def main():
         aoe_flash[:] = [f for f in aoe_flash if (t - f["t0"]) < 0.5]
 
         # connectivity for this frame's visuals
-        conducting = set(leylines) | set(fireballs) | {player}
+        conducting = set(leylines) | {player}  # only leylines conduct
         live = flood(conducting, player)
         need = max(1, int(params["charge_needed"][0]))
 
         # level 3 removes the cast time: those fireballs detonate the instant
-        # a leyline chain reaches them (placement onto a live chain included)
-        boomed = False
+        # a live leyline touches them (placement next to one included)
         for tile in list(fireballs):
-            if fireballs[tile]["level"] >= 3 and tile in live:
+            if fireballs[tile]["level"] >= 3 and tapped(tile, live):
                 del fireballs[tile]
                 hand_count += 1
                 detonate(tile, t)
-                boomed = True
-        if boomed:
-            conducting = set(leylines) | set(fireballs) | {player}
-            live = flood(conducting, player)
 
         # AOE preview: every tile a placed fireball will hit, with a heat
         # level that rises as the charge builds (and pulses gently)
@@ -421,13 +421,18 @@ def main():
         rl.rl_draw_render_batch_active()
         rl.rl_disable_depth_mask()
 
-        # leyline beams (lit iridescent when both ends reach the player)
+        # leyline beams: chain spans between conducting tiles plus a tap beam
+        # from a live leyline to each adjacent fireball (spells never chain)
+        beam_pairs = []
         for (q, r) in conducting:
             for dq, dr in DIRS:
                 n = (q + dq, r + dr)
-                if n not in conducting or not (q, r) < n:
-                    continue
-                lit = (q, r) in live and n in live
+                if n in conducting and (q, r) < n:
+                    beam_pairs.append(((q, r), n, (q, r) in live and n in live))
+                elif n in fireballs:
+                    beam_pairs.append(((q, r), n, (q, r) in live))
+        for ((q, r), n, lit) in beam_pairs:
+            if True:
                 a, b = axial_to_world(q, r), axial_to_world(*n)
                 seed = (a[0] + b[0]) * 0.35 + (a[1] + b[1]) * 0.21
                 rl.rl_set_line_width(3.0)
@@ -468,7 +473,7 @@ def main():
         for tile, fb in fireballs.items():
             charge = fb["charge"]
             x, z = axial_to_world(*tile)
-            connected = tile in live
+            connected = tapped(tile, live)
             size = params["flame_size"][0] * (0.5 + 0.45 * charge / max(need - 1, 1)) \
                  * (1.0 + 0.18 * (fb["level"] - 1))
             fi = int(t * params["fps"][0]) % count
@@ -585,7 +590,7 @@ def main():
         # panel
         rl.gui_window_box(panel, "fireball charge")
         px, py = int(panel.x + 10), int(panel.y + 30)
-        charging = sum(1 for tile in fireballs if tile in live)
+        charging = sum(1 for tile in fireballs if tapped(tile, live))
         rl.gui_label(rl.Rectangle(px, py, 234, 14),
                      f"turn {turn}  hand {hand_count}  charging {charging}/{len(fireballs)}"
                      f"  dead {len(dead_husks)}  enemies {len(enemies)}")

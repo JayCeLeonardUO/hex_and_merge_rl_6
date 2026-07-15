@@ -200,20 +200,23 @@ def main():
         if rl.is_key_pressed(rl.KeyboardKey.KEY_X):
             leylines.clear()
 
-        # connectivity: the spell conducts as an endpoint; the player conducts
-        # as the source. Everything reachable from the player is "live"
-        live = connected_component(leylines, player, extra=[spell])
-        active = spell in live
+        # connectivity: ONLY leyline tiles conduct (player = source). The
+        # spell is an endpoint: it activates when a live leyline touches it,
+        # but it never extends the chain itself
+        live = connected_component(leylines, player, extra=[])
+        active = any((spell[0] + dq, spell[1] + dr) in live for dq, dr in DIRS)
 
-        # network segments between adjacent conducting tiles
-        network = set(leylines) | {player, spell}
+        # segments: chain spans between conducting tiles + taps to the spell
+        network = set(leylines) | {player}
         segments = []
         for (q, r) in network:
             for dq, dr in DIRS:
                 n = (q + dq, r + dr)
                 if n in network and (q, r) < n:
-                    lit = active and (q, r) in live and n in live
+                    lit = (q, r) in live and n in live
                     segments.append(((q, r), n, lit))
+                elif n == spell:
+                    segments.append(((q, r), n, (q, r) in live))
 
         # --- layer 1: the leyline network alone, on transparent ---
         rl.begin_texture_mode(line_rt)
