@@ -3988,6 +3988,11 @@ static void UpdateDrawFrame(void)
         float u0 = (float)variant / TILE_ART_VARIANTS;
         float u1 = (float)(variant + 1) / TILE_ART_VARIANTS;
 
+        // No depth writes: the quad is wider than the tile, and its transparent
+        // corners overlap the neighbour's quad at the same height -- writing
+        // depth there eats the neighbour's art edge pixel by pixel
+        rlDrawRenderBatchActive();
+        rlDisableDepthMask();
         float artHalf = drawSize * tileArtScale;
         rlPushMatrix();
         rlTranslatef(cell->position.x, height + 0.005f, cell->position.z);
@@ -4007,18 +4012,24 @@ static void UpdateDrawFrame(void)
         rlEnd();
         rlSetTexture(0);
         rlPopMatrix();
+        rlDrawRenderBatchActive();
+        rlEnableDepthMask();
 
-        // Hover/placed color reads as a translucent wash over the gem
+        // Hover color reads as a translucent wash over the gem. Drawn as a
+        // thin puck floating just over the top face -- a full-height cylinder
+        // has its side walls exactly on the prism's side faces and z-fights
+        // them. Placed cards draw NO wash: the card model carries the color
+        Vector3 washBase = {cell->position.x, height + 0.008f, cell->position.z};
         if (cell->hovered)
-            DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(SKYBLUE, 0.35f));
-        else if (cell->value > 0)
-            DrawCylinder(cell->position, drawSize, drawSize, height + 0.01f, 6, Fade(cell->tint, 0.30f));
-        DrawCylinderWires(cell->position, drawSize, drawSize, height, 6, DARKGRAY);
+            DrawCylinder(washBase, drawSize, drawSize, 0.004f, 6, Fade(SKYBLUE, 0.35f));
+        // Wires sit a hair outside the prism: drawn AT its radius/height the
+        // lines are coplanar with the faces and stipple (line-vs-face z-fight)
+        DrawCylinderWires(cell->position, drawSize * 1.01f, drawSize * 1.01f, height + 0.002f, 6, DARKGRAY);
 
         // Fireball blast preview: in-range tiles wear an ember wash
         float heat = fireballHeat[cell->q + GRID_RADIUS][cell->r + GRID_RADIUS];
         if (heat > 0.0f)
-            DrawCylinder(cell->position, drawSize, drawSize, height + 0.012f, 6, Fade((Color){255, 120, 50, 255}, 0.30f * heat));
+            DrawCylinder(washBase, drawSize, drawSize, 0.006f, 6, Fade((Color){255, 120, 50, 255}, 0.30f * heat));
 
         // Dragging the player: every tile his one step may land on pulses
         // green (nothing glows once the turn's move is spent)
@@ -4028,7 +4039,7 @@ static void UpdateDrawFrame(void)
             if ((stepDist > 0) && (stepDist <= player->moveRange) && !HexTileSolid(cell->q, cell->r))
             {
                 float pulse = 0.30f + 0.12f * sinf(auroraTime * 5.0f);
-                DrawCylinder(cell->position, drawSize, drawSize, height + 0.014f, 6, Fade((Color){120, 255, 160, 255}, pulse));
+                DrawCylinder(washBase, drawSize, drawSize, 0.008f, 6, Fade((Color){120, 255, 160, 255}, pulse));
             }
         }
 
@@ -4048,11 +4059,18 @@ static void UpdateDrawFrame(void)
         {
             rlDisableBackfaceCulling();
             rlPushMatrix();
-            rlTranslatef(cell->position.x, height + 0.01f, cell->position.z);
-            // Merged cards read bigger: +18% per level above 1
-            float levelScale = 1.0f + 0.18f * (float)(cell->cardLevel - CARD_LVL_1);
+            // Lifted clear of every tile overlay below it (art +0.005, tint
+            // wash +0.01, heat +0.012, move pulse +0.014): the hex form is a
+            // zero-thickness mesh and z-fights anything coplanar
+            rlTranslatef(cell->position.x, height + 0.03f, cell->position.z);
+            // Merged cards read bigger per level, but the whole run stays on
+            // the tile's top face: lvl 1 sits at 84% of it, lvl 4 lands flush
+            // with the edge. Cards used to overhang the tile at lvl 2+, which
+            // spilled onto neighbours and z-fought the overhang of an adjacent
+            // placed card (two flat models meeting at the same height)
+            float levelScale = 0.84f + 0.07f * (float)(cell->cardLevel - CARD_LVL_1);
             DrawModel(hexModels[cell->modelIndex % cardModelCount], (Vector3){0},
-                      hexModelScale * HEX_SIZE / HEX_MODEL_R * levelScale, WHITE);
+                      hexModelScale * drawSize / HEX_MODEL_R * levelScale, WHITE);
             rlPopMatrix();
 
             // The generated shell over the gem, worn ONLY while a strike is
@@ -4064,8 +4082,8 @@ static void UpdateDrawFrame(void)
                 SetShaderValue(cardShellShader, cardShellValueLoc, &shellValue, SHADER_UNIFORM_FLOAT);
                 SetShaderValue(cardShellShader, cardShellDangerLoc, &shellDanger, SHADER_UNIFORM_FLOAT);
                 Matrix shellTransform = MatrixMultiply(
-                    MatrixScale(levelScale, 1.0f, levelScale),
-                    MatrixTranslate(cell->position.x, height + 0.01f, cell->position.z));
+                    MatrixScale(levelScale * drawSize / HEX_SIZE, 1.0f, levelScale * drawSize / HEX_SIZE),
+                    MatrixTranslate(cell->position.x, height + 0.03f, cell->position.z));
                 DrawMesh(cell->cardShellMesh, cardShellMaterial, shellTransform);
             }
             rlEnableBackfaceCulling();
