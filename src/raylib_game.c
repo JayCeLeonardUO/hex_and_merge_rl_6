@@ -315,6 +315,7 @@ static int frameCounter = 0;
 static Texture2D heartTexture = {0};       // Heart icon for health bars (resources/heart_icon_32x32.png)
 static Texture2D mouseRightTexture = {0};  // Right-click prompt icon (Kenney input prompts, CC0)
 static Texture2D mouseDragTexture = {0};   // Mouse-with-horizontal-arrows icon, same pack
+static Texture2D mouseLeftTexture = {0};   // Left-click (drag) prompt icon, same pack
 static Texture2D titleTexture = {0};       // Start screen Leylines lockup (resources/leylines_title.png)
 static Texture2D reticleTexture = {0};     // Hover reticle frame (resources/highlight_slot_26x26.png)
 static Texture2D impactLightTexture = {0}; // Light-burst sheet, 8 frames in a row, white on alpha
@@ -1877,6 +1878,21 @@ static bool HudButton(Rectangle bounds, const char *label)
     DrawTextOutlined(label, (int)(bounds.x + bounds.width / 2.0f) - MeasureText(label, size) / 2,
                      (int)(bounds.y + bounds.height / 2.0f) - size / 2, size, border);
     return hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+// Looping drag demo: the left-click mouse icon glides from -> to, fading at
+// both ends -- the gesture itself, on repeat until the player mimics it
+static void DrawTutorialDragLoop(Vector2 from, Vector2 to)
+{
+    if (mouseLeftTexture.id == 0) return;
+    float lap = fmodf((float)GetTime(), 1.6f) / 1.6f;
+    float glide = lap * lap * (3.0f - 2.0f * lap); // smoothstep ease
+    float fade = (lap < 0.15f) ? (lap / 0.15f)
+                 : (lap > 0.8f) ? ((1.0f - lap) / 0.2f)
+                                : 1.0f;
+    Vector2 at = {from.x + (to.x - from.x) * glide - 32.0f,
+                  from.y + (to.y - from.y) * glide - 32.0f};
+    DrawTextureEx(mouseLeftTexture, at, 0.0f, 1.0f, Fade(WHITE, fade));
 }
 
 // Turn button: the crystal on the right edge commits the turn on click. It
@@ -5145,8 +5161,27 @@ static void UpdateDrawFrame(void)
                 Color ringRed = {255, 55, 45, 255};
                 DrawRing((Vector2){card->position.x, card->position.y}, r - 5.0f, r + 5.0f, 0.0f, 360.0f, 48,
                          Fade(ringRed, 0.55f + 0.45f * tPulse));
+
+                if (tutorialTargetOn)
+                {
+                    Vector3 tw = HexAxialToWorld(tutorialTargetQ, tutorialTargetR);
+                    tw.y = HEX_TILE_HEIGHT;
+                    DrawTutorialDragLoop((Vector2){card->position.x, card->position.y},
+                                         GetWorldToScreen(tw, camera));
+                }
                 break;
             }
+        }
+
+        // Move step: the same drag loop, from the mage to the target tile
+        // (quiet while he is already being dragged)
+        if ((tutorialStep == TUT_MOVE) && tutorialTargetOn && (player != NULL) && !player->selected)
+        {
+            Vector3 pw = HexAxialToWorld(player->q, player->r);
+            pw.y = HEX_TILE_HEIGHT;
+            Vector3 tw = HexAxialToWorld(tutorialTargetQ, tutorialTargetR);
+            tw.y = HEX_TILE_HEIGHT;
+            DrawTutorialDragLoop(GetWorldToScreen(pw, camera), GetWorldToScreen(tw, camera));
         }
 
         // The target tile's marker: a fat pulsating red ring, screen-space so
@@ -5170,6 +5205,20 @@ static void UpdateDrawFrame(void)
             for (int ring = 0; ring < 3; ring++)
                 DrawCircleLines((int)leverKnobScreenPos.x, (int)leverKnobScreenPos.y,
                                 34.0f + ringPulse + (float)ring, (Color){255, 220, 60, 255});
+
+            // Clicking demo beside the crystal: the left-click icon dips like
+            // a button press once a beat, with a little flash on the tap
+            if (mouseLeftTexture.id != 0)
+            {
+                float phase = fmodf((float)GetTime(), 1.2f);
+                float press = (phase < 0.25f) ? sinf(phase / 0.25f * PI) : 0.0f;
+                float scale = 1.0f - 0.18f * press;
+                Vector2 at = {leverKnobScreenPos.x - 96.0f - 32.0f * scale, leverKnobScreenPos.y - 32.0f * scale};
+                if (press > 0.5f)
+                    DrawCircleGradient((Vector2){at.x + 32.0f * scale, at.y + 32.0f * scale},
+                                       40.0f, Fade((Color){255, 240, 140, 255}, 0.35f * press), BLANK);
+                DrawTextureEx(mouseLeftTexture, at, 0.0f, scale, WHITE);
+            }
         }
 
         if (tutorialStep == TUT_DONE)
@@ -5575,6 +5624,7 @@ int main(int argc, char *argv[])
     heartTexture = LoadTexture("resources/heart_icon_32x32.png");
     mouseRightTexture = LoadTexture("resources/mouse_right_64x64.png");
     mouseDragTexture = LoadTexture("resources/mouse_horizontal_64x64.png");
+    mouseLeftTexture = LoadTexture("resources/mouse_left_64x64.png");
 
     // The start screen's Leylines lockup (pre-rendered FF font + gradient)
     titleTexture = LoadTexture("resources/leylines_title.png");
@@ -5781,6 +5831,7 @@ int main(int argc, char *argv[])
     UnloadTexture(heartTexture);
     UnloadTexture(mouseRightTexture);
     UnloadTexture(mouseDragTexture);
+    UnloadTexture(mouseLeftTexture);
     UnloadTexture(titleTexture);
     UnloadTexture(reticleTexture);
     UnloadTexture(impactLightTexture);
