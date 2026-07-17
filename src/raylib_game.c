@@ -336,6 +336,18 @@ static Vector2 leverKnobScreenPos = {0}; // Button center this frame; the 3D gem
 static HoverReticle reticle = {0}; // Persistent hover-effect state, updated in DrawHoverdHexEffect()
 
 static ImpactFx impact = {0};      // Impact ring/dust of the last card placement
+
+// Merge level-up burst: gold shockwave rings + a rising LVL text over the
+// merged tile, unmissable where the old impact ring alone was easy to miss
+typedef struct LevelUpFx
+{
+    Vector3 position; // Merged tile, world space
+    int level;        // The level just reached
+    float t0;         // GetTime() at the merge
+    bool active;
+} LevelUpFx;
+static LevelUpFx levelUpFx = {0};
+#define LEVELUP_DURATION 1.15f
 static float shakeTimeLeft = 0.0f; // Screen shake seconds remaining (kicked by a card placement)
 
 // Card/hex models loaded from resources/models; 0 loaded = the card draw
@@ -952,7 +964,8 @@ static Sound sndReturn = {0}; // A card's field lifetime expiring
 static Sound sndHit = {0};    // Enemy smashes a card / hits the player
 static Sound sndLever = {0};  // The turn lever firing
 static Sound sndBoom = {0};   // Fireball detonation
-static Sound sndCharge = {0}; // Fireball banking a charge: rising power-up sweep
+static Sound sndCharge = {0};  // Fireball banking a charge: rising power-up sweep
+static Sound sndLevelUp = {0}; // Merge level-up: rising four-note fanfare
 
 // Background ambience: the floating-bowls recording over a pink noise bed,
 // loop-softened and mixed offline by sandbox/gen_ambience.py (streamed, so
@@ -984,6 +997,45 @@ static Sound SynthSound(float startFreq, float endFreq, float duration, float no
 
     Wave wave = {.frameCount = (unsigned int)frameCount, .sampleRate = sampleRate, .sampleSize = 16, .channels = 1, .data = samples};
     Sound sound = LoadSoundFromWave(wave); // Copies the samples into the audio buffer
+    MemFree(samples);
+    return sound;
+}
+
+// Level-up fanfare: a rising C-E-G-C arpeggio, each note a sine with a soft
+// octave harmonic and percussive decay, later notes ringing over the earlier
+// ones -- bigger news than the single merge blip can carry
+static Sound SynthLevelUpSound(void)
+{
+    const int sampleRate = 22050;
+    const float noteFreqs[4] = {523.25f, 659.25f, 783.99f, 1046.50f};
+    const float noteStep = 0.085f; // Onset spacing
+    const float noteLen = 0.30f;   // Each note rings past the next onset
+    float duration = noteStep * 3.0f + noteLen;
+    int frameCount = (int)(duration * (float)sampleRate);
+    short *samples = (short *)MemAlloc((unsigned int)((size_t)frameCount * sizeof(short)));
+
+    for (int i = 0; i < frameCount; i++)
+    {
+        float t = (float)i / (float)sampleRate;
+        float s = 0.0f;
+        for (int n = 0; n < 4; n++)
+        {
+            float nt = t - noteStep * (float)n;
+            if ((nt < 0.0f) || (nt >= noteLen)) continue;
+            float k = nt / noteLen;
+            float env = expf(-6.0f * k) * (1.0f - k);              // Percussive decay, clickless end
+            float attack = fminf(1.0f, nt / 0.003f);               // ~3ms ramp, clickless start
+            float tone = sinf(2.0f * PI * noteFreqs[n] * nt) + 0.35f * sinf(4.0f * PI * noteFreqs[n] * nt);
+            s += tone * env * attack * ((n == 3) ? 1.25f : 0.85f); // The top note lands hardest
+        }
+        s *= 0.30f;
+        if (s > 1.0f) s = 1.0f;
+        if (s < -1.0f) s = -1.0f;
+        samples[i] = (short)(s * 32767.0f);
+    }
+
+    Wave wave = {.frameCount = (unsigned int)frameCount, .sampleRate = sampleRate, .sampleSize = 16, .channels = 1, .data = samples};
+    Sound sound = LoadSoundFromWave(wave);
     MemFree(samples);
     return sound;
 }
@@ -3670,9 +3722,12 @@ static void UpdateDrawFrame(void)
                     hoveredCell->turnLifetime = cardKindLifetimes[hoveredCell->cardKind]; // merge refreshes the clock
                     hoveredCell->fireballCharge = 0;                                      // merged fireballs charge from scratch
                     impact = (ImpactFx){.position = hoveredCell->position, .tint = card->tint, .age = 0.0f, .active = true};
+                    levelUpFx = (LevelUpFx){.position = hoveredCell->position, .level = (int)hoveredCell->cardLevel,
+                                            .t0 = (float)GetTime(), .active = true};
+                    shakeTimeLeft = SHAKE_DURATION; // a merge lands harder than a placement
                     LOG("INFO: CARD: merged %s to lvl %d at (q=%d, r=%d)\n",
                         cardKindNames[card->cardKind], (int)hoveredCell->cardLevel, hoveredCell->q, hoveredCell->r);
-                    PlaySound(sndMerge);
+                    PlaySound(sndLevelUp); // the fanfare, not the blip: a merge is the game's big beat
                     EntityDespawn(i);
                     // Lvl 4 = an exodia piece: it leaves the board at once and
                     // lives in the hand as an inert trophy
@@ -4414,6 +4469,22 @@ static void UpdateDrawFrame(void)
                     MatrixTranslate(cell->position.x, height + 0.03f, cell->position.z));
                 DrawMesh(cell->cardShellMesh, cardShellMaterial, shellTransform);
             }
+
+            // Level pips: one solid-gold diamond per level, crowning the
+            // card's far edge (the near edge belongs to the lifetime label).
+            // Flat bright color on purpose: gem-material pips vanished among
+            // the scene's decorative crystals
+            for (int pip = 0; pip < (int)cell->cardLevel; pip++)
+            {
+                float bobPhase = auroraTime * 2.5f + (float)pip * 1.7f;
+                Vector3 pc = {cell->position.x + ((float)pip - (float)(cell->cardLevel - 1) / 2.0f) * 0.32f,
+                              height + 0.50f + 0.04f * sinf(bobPhase),
+                              cell->position.z - 0.42f};
+                Color goldTop = {255, 225, 80, 255};
+                Color goldBottom = {200, 150, 30, 255};
+                DrawCylinderEx(pc, (Vector3){pc.x, pc.y + 0.16f, pc.z}, 0.12f, 0.0f, 4, goldTop);
+                DrawCylinderEx((Vector3){pc.x, pc.y - 0.16f, pc.z}, pc, 0.0f, 0.12f, 4, goldBottom);
+            }
             rlEnableBackfaceCulling();
         }
 
@@ -5102,6 +5173,40 @@ static void UpdateDrawFrame(void)
     DrawFireballFlames(airTime); // armed-fireball crown, over everything
     DrawIntent(airTime);         // telegraphs stay topmost of all
 
+    // Merge level-up burst: two expanding gold shockwave rings and a rising
+    // "LVL N" over the merged tile, topmost so nothing can hide the payoff
+    if (levelUpFx.active)
+    {
+        float fxAge = (float)GetTime() - levelUpFx.t0;
+        if (fxAge >= LEVELUP_DURATION)
+        {
+            levelUpFx.active = false;
+        }
+        else
+        {
+            float k = fxAge / LEVELUP_DURATION;
+            Vector3 at = levelUpFx.position;
+            at.y = HEX_TILE_HEIGHT;
+            Vector2 sp = GetWorldToScreen(at, camera);
+            float pxPerUnit = (float)screenHeight / camera.fovy;
+            Color gold = {255, 220, 60, 255};
+
+            float r1 = (0.2f + 1.3f * k) * pxPerUnit;
+            DrawRing(sp, r1 - 7.0f * (1.0f - k), r1, 0.0f, 360.0f, 48, Fade(gold, 0.9f * (1.0f - k)));
+            float k2 = (k > 0.15f) ? (k - 0.15f) / 0.85f : 0.0f;
+            float r2 = (0.2f + 1.1f * k2) * pxPerUnit;
+            if (k2 > 0.0f) DrawRing(sp, r2 - 5.0f * (1.0f - k2), r2, 0.0f, 360.0f, 48, Fade(WHITE, 0.6f * (1.0f - k2)));
+
+            // The text pops in oversized, settles, rides up, and fades late
+            const char *lvlText = (levelUpFx.level >= (int)CARD_LVL_4) ? "EXODIA PIECE!" : TextFormat("LVL %d!", levelUpFx.level);
+            int size = (k < 0.12f) ? (int)(56.0f - 16.0f * (k / 0.12f)) : 40;
+            float rise = 46.0f + 40.0f * k;
+            float alpha = (k > 0.7f) ? (1.0f - k) / 0.3f : 1.0f;
+            DrawTextOutlined(lvlText, (int)sp.x - MeasureText(lvlText, size) / 2, (int)(sp.y - rise) - size / 2, size,
+                             Fade(gold, alpha));
+        }
+    }
+
     if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, LIGHTGRAY);
 
     if (!tutorialLive && ((frameCounter / 20) % 2)) DrawTextOutlined("Merge all card types to lvl 4 to win", screenWidth / 2 - MeasureText("Merge all card types to lvl 4 to win", 24) / 2, 28, 24, MAROON);
@@ -5597,6 +5702,7 @@ int main(int argc, char *argv[])
     sndPickup = SynthSound(500.0f, 750.0f, 0.07f, 0.0f, 0.35f);
     sndPlace = SynthSound(240.0f, 130.0f, 0.12f, 0.25f, 0.55f);
     sndMerge = SynthSound(520.0f, 1180.0f, 0.22f, 0.0f, 0.45f);
+    sndLevelUp = SynthLevelUpSound();
     sndReturn = SynthSound(700.0f, 280.0f, 0.16f, 0.0f, 0.35f);
     sndHit = SynthSound(150.0f, 55.0f, 0.24f, 0.55f, 0.8f);
     sndLever = SynthSound(320.0f, 70.0f, 0.14f, 0.35f, 0.55f);
@@ -5878,6 +5984,7 @@ int main(int argc, char *argv[])
     UnloadSound(sndPickup);
     UnloadSound(sndPlace);
     UnloadSound(sndMerge);
+    UnloadSound(sndLevelUp);
     UnloadSound(sndReturn);
     UnloadSound(sndHit);
     UnloadSound(sndLever);
