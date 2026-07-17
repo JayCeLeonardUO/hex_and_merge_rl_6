@@ -1452,6 +1452,10 @@ typedef enum
     TUT_BOOM,     // End it again: full charge detonates
     TUT_WARD,     // An enemy closes in: bait it with the ward
     TUT_RESOLVE,  // End turns until the ward soaks the strike
+    TUT_BAIT,     // Place a ley where the foe can reach it
+    TUT_STRIKE,   // Watch it get struck: an unwarded card costs a heart
+    TUT_KILL,     // Fireball the foe: slain enemies drop cards
+    TUT_LOOT,     // Walk onto the drop and the crystal's gift
     TUT_DONE,     // Wrap-up + play button
 } TutorialStep;
 static bool tutorialLive = false;       // Interactive tutorial in progress
@@ -1459,6 +1463,7 @@ static TutorialStep tutorialStep = TUT_LOOK;
 static int tutorialTurnMark = 0;        // gameTurn when the waiting step began
 static bool tutorialOops = false;       // TUT_SPELL: fireball sitting off the chain
 static float tutorialYawMark = 0.0f;    // Camera yaw at TUT_LOOK entry
+static int tutorialHealthMark = 0;      // Hearts at step entry (TUT_STRIKE watches for the loss)
 
 // Tutorial slideshow: one staged screenshot per rule, captured by running
 // the game with --tutorial-shots (each scene is built on the real board,
@@ -2704,13 +2709,18 @@ static void EnemyAIExecuteIntents(void)
 // has started (after intents execute and placed cards return). The intent
 // display only reads the stored fields -- it cannot disagree with what
 // EnemyAIExecuteIntents will do
-// Hard-coded tutorial AI, replacing the free plan wholesale: the demo foe
-// exists to showcase the ward. It marches on the ward once one is down and
-// strikes it when adjacent; before that it closes on the player but stops
-// beside him without ever landing a hit -- and it never freelances into
-// smashing the leyline chain the earlier steps just built
+// Hard-coded tutorial AI, replacing the free plan wholesale, phased by step:
+// through the ward duel the foe hunts the ward and nothing else (before one
+// is down it closes on the player but stops beside him without ever landing
+// a hit -- it never freelances into smashing the chain). On the hostage
+// lesson (TUT_BAIT/TUT_STRIKE) it hunts the nearest regular placed card so
+// the heart-loss rule shows itself. From TUT_KILL on it stands still: a
+// sitting target for the fireball
 static void TutorialDirectEnemies(Entity *player)
 {
+    bool huntCards = (tutorialStep == TUT_BAIT) || (tutorialStep == TUT_STRIKE);
+    bool standStill = (tutorialStep >= TUT_KILL);
+
     Entity *ward = NULL;
     for (int i = 0; i < entityCount; i++)
     {
@@ -2722,7 +2732,8 @@ static void TutorialDirectEnemies(Entity *player)
         }
     }
 
-    // The free plan's danger flags are void: only the ward may wear the shell
+    // The free plan's danger flags are void: only the scripted prey may wear
+    // the shell
     for (int i = 0; i < entityCount; i++)
     {
         if (entities[i].kind == ENTITY_HEX_CELL) entities[i].inDanger = false;
@@ -2734,6 +2745,44 @@ static void TutorialDirectEnemies(Entity *player)
         if (enemy->kind != ENTITY_ENEMY) continue;
 
         enemy->enemyIntentKind = ENEMY_INTENT_NONE;
+        if (standStill) continue;
+
+        if (huntCards)
+        {
+            // The hostage lesson: nearest placed non-ward card is the prey
+            Entity *prey = NULL;
+            int preyDist = 0;
+            for (int j = 0; j < entityCount; j++)
+            {
+                Entity *cell = &entities[j];
+                if ((cell->kind != ENTITY_HEX_CELL) || (cell->value == 0) || (cell->cardKind == CARD_WARD)) continue;
+                int dist = HexDistance(enemy->q, enemy->r, cell->q, cell->r);
+                if ((prey == NULL) || (dist < preyDist))
+                {
+                    prey = cell;
+                    preyDist = dist;
+                }
+            }
+            if (prey == NULL) continue; // nothing placed yet: hold
+            if (preyDist <= 1)
+            {
+                enemy->enemyIntentKind = ENEMY_INTENT_STRIKE;
+                enemy->enemyIntentQ = prey->q;
+                enemy->enemyIntentR = prey->r;
+                prey->inDanger = true;
+                continue;
+            }
+            int destQ, destR;
+            EnemyChaseDestination(enemy, prey, &destQ, &destR);
+            if ((destQ != enemy->q) || (destR != enemy->r))
+            {
+                enemy->enemyIntentKind = ENEMY_INTENT_MOVE;
+                enemy->enemyIntentQ = destQ;
+                enemy->enemyIntentR = destR;
+            }
+            continue;
+        }
+
         if ((ward != NULL) && (HexDistance(enemy->q, enemy->r, ward->q, ward->r) <= 1))
         {
             enemy->enemyIntentKind = ENEMY_INTENT_STRIKE;
@@ -3015,6 +3064,13 @@ static void TutorialUpdate(const Entity *player)
         if (cell->cardKind == CARD_FIREBALL) fireball = cell;
         if (cell->cardKind == CARD_WARD) wardPlaced = true;
     }
+    int hearts = 0, foes = 0, pickups = 0;
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_HEALTH_BAR) hearts = entities[i].health;
+        if (entities[i].kind == ENTITY_ENEMY) foes++;
+        if (entities[i].kind == ENTITY_PICKUP) pickups++;
+    }
 
     bool advance = false;
     switch (tutorialStep)
@@ -3050,6 +3106,12 @@ static void TutorialUpdate(const Entity *player)
         // The duel plays out: the enemy closes in and strikes, the soaked
         // ward leaves the board (lifetime expiry counts too -- don't stall)
         case TUT_RESOLVE: advance = (gameTurn > tutorialTurnMark) && !wardPlaced; break;
+        // Any non-ward, non-hex card on the field gives the foe a hostage
+        case TUT_BAIT: advance = leyPlaced || (fireball != NULL); break;
+        // The lesson lands when the strike does: a heart is gone
+        case TUT_STRIKE: advance = (hearts < tutorialHealthMark) || (foes == 0); break;
+        case TUT_KILL: advance = (foes == 0); break;
+        case TUT_LOOT: advance = (pickups == 0); break;
         case TUT_DONE: break;
     }
     if (!advance) return;
@@ -3057,8 +3119,23 @@ static void TutorialUpdate(const Entity *player)
     tutorialStep++;
     tutorialTurnMark = gameTurn;
     tutorialOops = false;
+    tutorialHealthMark = hearts;
     PlaySound(sndMerge); // the merge chime doubles as the "lesson learned" ding
     LOG("INFO: TUTORIAL: step %d reached (turn %d)\n", (int)tutorialStep, gameTurn);
+    if (tutorialStep == TUT_LOOT)
+    {
+        // The crystal's gift joins the enemy's drop: both spoils in one walk.
+        // Its timed spawns are suspended in the tutorial, so plant one by
+        // hand on a free tile beside the crystal
+        static const int giftDirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
+        for (int d = 0; d < 6; d++)
+        {
+            Entity *cell = FindCell(giftDirs[d][0], giftDirs[d][1]);
+            if ((cell == NULL) || !TutorialTileOpen(cell)) continue;
+            StageTutorialPickup(cell->q, cell->r, CARD_LEYLINE);
+            break;
+        }
+    }
     if (tutorialStep == TUT_WARD)
     {
         // The foe spawns two tiles from WHEREVER the player stands, so the
@@ -3095,8 +3172,19 @@ static void TutorialComputeTarget(const Entity *player)
     bool wantNeighbor = (tutorialStep == TUT_MOVE) || (tutorialStep == TUT_PLACE) || (tutorialStep == TUT_WARD);
     bool conductive[LEY_W][LEY_W];
     bool live[LEY_W][LEY_W];
-    if (tutorialStep == TUT_SPELL) ComputeLeylineNetwork(player, conductive, live);
+    if ((tutorialStep == TUT_SPELL) || (tutorialStep == TUT_KILL)) ComputeLeylineNetwork(player, conductive, live);
 
+    // The foe anchors the hostage and revenge steps' rings
+    const Entity *foe = NULL;
+    if ((tutorialStep == TUT_BAIT) || (tutorialStep == TUT_KILL))
+    {
+        for (int i = 0; i < entityCount; i++)
+        {
+            if (entities[i].kind == ENTITY_ENEMY) { foe = &entities[i]; break; }
+        }
+    }
+
+    bool targetKills = false; // TUT_KILL: a tapped tile whose blast reaches the foe beats any other
     for (int i = 0; i < entityCount; i++)
     {
         const Entity *cell = &entities[i];
@@ -3109,16 +3197,35 @@ static void TutorialComputeTarget(const Entity *player)
             hit = (cell->value > 0) && (cell->cardKind == CARD_LEYLINE) && (cell->cardLevel == CARD_LVL_1);
         else if (tutorialStep == TUT_SPELL)
             hit = TutorialTileOpen(cell) && LeylineTapped(live, cell->q, cell->r);
+        else if (tutorialStep == TUT_BAIT)
+            hit = TutorialTileOpen(cell) && (foe != NULL) && (HexDistance(foe->q, foe->r, cell->q, cell->r) == 1);
+        else if (tutorialStep == TUT_KILL)
+            hit = TutorialTileOpen(cell) && LeylineTapped(live, cell->q, cell->r);
+        else if (tutorialStep == TUT_LOOT)
+        {
+            for (int j = 0; j < entityCount; j++)
+            {
+                const Entity *gift = &entities[j];
+                if ((gift->kind == ENTITY_PICKUP) && (gift->q == cell->q) && (gift->r == cell->r)) hit = true;
+            }
+        }
         if (!hit) continue;
 
-        // Of the candidates keep the one nearest the board center: it reads
+        // TUT_KILL: a tile whose radius-1 blast reaches the foe wins outright
+        // over merely-tapped tiles (extend the chain first if none qualifies)
+        bool kills = (tutorialStep == TUT_KILL) && (foe != NULL) &&
+                     (HexDistance(foe->q, foe->r, cell->q, cell->r) <= FIREBALL_AOE_RADIUS);
+        if (targetKills && !kills) continue;
+
+        // Of equal candidates keep the one nearest the board center: it reads
         // as "that one" instead of hopping to whatever the scan met first,
         // and stays stable while the step is underway
-        if (tutorialTargetOn &&
+        if (tutorialTargetOn && (kills == targetKills) &&
             (HexDistance(cell->q, cell->r, 0, 0) >= HexDistance(tutorialTargetQ, tutorialTargetR, 0, 0))) continue;
         tutorialTargetQ = cell->q;
         tutorialTargetR = cell->r;
         tutorialTargetOn = true;
+        targetKills = kills;
     }
 }
 
@@ -3139,6 +3246,10 @@ static void TutorialLines(const char **line1, const char **line2)
         case TUT_BOOM: *line1 = "one more pull"; *line2 = "end the turn again: full charge detonates (stand clear!)"; break;
         case TUT_WARD: *line1 = "an enemy! the red arc is its plan"; *line2 = "drop your ward on the red-ringed tile to soak the coming strike"; break;
         case TUT_RESOLVE: *line1 = "brace"; *line2 = "keep ending turns -- it closes in, strikes, and your ward soaks it"; break;
+        case TUT_BAIT: *line1 = "cards are hostages"; *line2 = "drop a ley card on the red-ringed tile -- the foe wants it"; break;
+        case TUT_STRIKE: *line1 = "unwarded cards cost blood"; *line2 = "end the turn -- a struck card with no ward takes one of your hearts"; break;
+        case TUT_KILL: *line1 = "revenge"; *line2 = "drop the fire card on the ringed tile and end turns -- the blast takes it"; break;
+        case TUT_LOOT: *line1 = "spoils"; *line2 = "slain foes drop cards, the crystal grows one every 2 turns -- walk onto them"; break;
         case TUT_DONE: *line1 = "that's the loop"; *line2 = "merge every card type to lvl 4 to assemble exodia and win"; break;
         default: *line1 = ""; *line2 = ""; break;
     }
@@ -5250,10 +5361,10 @@ static void UpdateDrawFrame(void)
 
         // The hand card the step wants played gets its own pulsing ring at
         // its fan slot (quiet while it is being dragged: the ghost takes over)
-        CardKind wantKind = ((tutorialStep == TUT_PLACE) || (tutorialStep == TUT_MERGE)) ? CARD_LEYLINE
-                            : (tutorialStep == TUT_SPELL)                                ? CARD_FIREBALL
-                            : (tutorialStep == TUT_WARD)                                 ? CARD_WARD
-                                                                                         : CARD_NONE;
+        CardKind wantKind = ((tutorialStep == TUT_PLACE) || (tutorialStep == TUT_MERGE) || (tutorialStep == TUT_BAIT)) ? CARD_LEYLINE
+                            : ((tutorialStep == TUT_SPELL) || (tutorialStep == TUT_KILL))                              ? CARD_FIREBALL
+                            : (tutorialStep == TUT_WARD)                                                               ? CARD_WARD
+                                                                                                                       : CARD_NONE;
         if (wantKind != CARD_NONE)
         {
             for (int i = 0; i < entityCount; i++)
@@ -5304,7 +5415,8 @@ static void UpdateDrawFrame(void)
             DrawRing(ringAt, r + 9.0f, r + 12.0f, 0.0f, 360.0f, 48, Fade(ringRed, 0.30f + 0.30f * tPulse));
         }
 
-        if ((tutorialStep == TUT_COMMIT) || (tutorialStep == TUT_BOOM) || (tutorialStep == TUT_RESOLVE))
+        if ((tutorialStep == TUT_COMMIT) || (tutorialStep == TUT_BOOM) || (tutorialStep == TUT_RESOLVE) ||
+            (tutorialStep == TUT_STRIKE) || (tutorialStep == TUT_KILL) || (tutorialStep == TUT_LOOT))
         {
             float ringPulse = 6.0f * (0.5f + 0.5f * sinf((float)GetTime() * 4.0f));
             for (int ring = 0; ring < 3; ring++)
