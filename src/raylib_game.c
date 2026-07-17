@@ -313,6 +313,8 @@ static RenderTexture2D target = {0}; // Render texture to render our game
 static int frameCounter = 0;
 
 static Texture2D heartTexture = {0};       // Heart icon for health bars (resources/heart_icon_32x32.png)
+static Texture2D mouseRightTexture = {0};  // Right-click prompt icon (Kenney input prompts, CC0)
+static Texture2D mouseDragTexture = {0};   // Mouse-with-horizontal-arrows icon, same pack
 static Texture2D titleTexture = {0};       // Start screen Leylines lockup (resources/leylines_title.png)
 static Texture2D reticleTexture = {0};     // Hover reticle frame (resources/highlight_slot_26x26.png)
 static Texture2D impactLightTexture = {0}; // Light-burst sheet, 8 frames in a row, white on alpha
@@ -5115,6 +5117,16 @@ static void UpdateDrawFrame(void)
         DrawTextOutlined(line1, screenWidth / 2 - w1 / 2, 32, 26, (Color){255, 220, 60, 255});
         DrawTextOutlined(line2, screenWidth / 2 - w2 / 2, 66, 20, RAYWHITE);
 
+        // Rotate step: the right-click and drag-sideways prompt icons under
+        // the banner, breathing gently so they read as "do this now"
+        if ((tutorialStep == TUT_LOOK) && (mouseRightTexture.id != 0) && (mouseDragTexture.id != 0))
+        {
+            float bob = sinf((float)GetTime() * 3.0f);
+            float iconY = 112.0f + bob * 3.0f;
+            DrawTextureEx(mouseRightTexture, (Vector2){(float)screenWidth / 2.0f - 72.0f, iconY}, 0.0f, 1.0f, WHITE);
+            DrawTextureEx(mouseDragTexture, (Vector2){(float)screenWidth / 2.0f + 8.0f, iconY}, 0.0f, 1.0f, WHITE);
+        }
+
         // The hand card the step wants played gets its own pulsing ring at
         // its fan slot (quiet while it is being dragged: the ghost takes over)
         CardKind wantKind = ((tutorialStep == TUT_PLACE) || (tutorialStep == TUT_MERGE)) ? CARD_LEYLINE
@@ -5346,21 +5358,29 @@ static void UpdateDrawFrame(void)
         // and tall: THE way to learn -- the slides below are the footnote
         ImVec2_c tutBtnSize = {igGetContentRegionAvail().x, 64};
         if (igButton("IN GAME TUTORIAL", tutBtnSize)) TutorialBegin();
+
+        // The slides hide behind a small toggle under the big button: the
+        // reference version for anyone who'd rather read than replay
+        static bool slidesOpen = false;
+        if (igButton("slide show tutorial", (ImVec2_c){0, 0})) slidesOpen = !slidesOpen;
         igSpacing();
 
-        igTextWrapped("%s", tutorialCaptions[tutorialSlide]);
-        igSpacing();
-        if (tutorialTex[tutorialSlide].id != 0)
-            rlImGuiImageSize(&tutorialTex[tutorialSlide], 380, 380);
-        else
-            igTextWrapped("(slide image missing -- run the game with --tutorial-shots to regenerate)");
-        igSpacing();
+        if (slidesOpen)
+        {
+            igTextWrapped("%s", tutorialCaptions[tutorialSlide]);
+            igSpacing();
+            if (tutorialTex[tutorialSlide].id != 0)
+                rlImGuiImageSize(&tutorialTex[tutorialSlide], 380, 380);
+            else
+                igTextWrapped("(slide image missing -- run the game with --tutorial-shots to regenerate)");
+            igSpacing();
 
-        if (igButton("< prev", (ImVec2_c){0, 0}) && (tutorialSlide > 0)) tutorialSlide--;
-        igSameLine(0.0f, 12.0f);
-        igText("%d / %d", tutorialSlide + 1, TUTORIAL_SLIDES);
-        igSameLine(0.0f, 12.0f);
-        if (igButton("next >", (ImVec2_c){0, 0}) && (tutorialSlide < TUTORIAL_SLIDES - 1)) tutorialSlide++;
+            if (igButton("< prev", (ImVec2_c){0, 0}) && (tutorialSlide > 0)) tutorialSlide--;
+            igSameLine(0.0f, 12.0f);
+            igText("%d / %d", tutorialSlide + 1, TUTORIAL_SLIDES);
+            igSameLine(0.0f, 12.0f);
+            if (igButton("next >", (ImVec2_c){0, 0}) && (tutorialSlide < TUTORIAL_SLIDES - 1)) tutorialSlide++;
+        }
 
         igEnd();
     }
@@ -5553,6 +5573,8 @@ int main(int argc, char *argv[])
     // Load resources (desktop: resources/ sits next to the binary,
     // web: emscripten preloads it into the .data bundle)
     heartTexture = LoadTexture("resources/heart_icon_32x32.png");
+    mouseRightTexture = LoadTexture("resources/mouse_right_64x64.png");
+    mouseDragTexture = LoadTexture("resources/mouse_horizontal_64x64.png");
 
     // The start screen's Leylines lockup (pre-rendered FF font + gradient)
     titleTexture = LoadTexture("resources/leylines_title.png");
@@ -5757,6 +5779,8 @@ int main(int argc, char *argv[])
     //--------------------------------------------------------------------------------------
     rlImGuiShutdown();
     UnloadTexture(heartTexture);
+    UnloadTexture(mouseRightTexture);
+    UnloadTexture(mouseDragTexture);
     UnloadTexture(titleTexture);
     UnloadTexture(reticleTexture);
     UnloadTexture(impactLightTexture);
