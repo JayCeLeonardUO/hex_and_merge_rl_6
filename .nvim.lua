@@ -2,18 +2,27 @@
 -- Mirrors the tmux workflow from my_raylib_games:
 --   <leader>R — build + run the game in a detached tmux session (popup shows build output)
 --   <C-t>     — toggle a bottom pane attached to the running game session
+-- The same build+run also hangs on screen as the clickable gold chip in the
+-- top-right corner (nvim_project_plugins/run_button.lua)
 
-local project_root = vim.fn.fnamemodify(vim.fn.findfile("CMakeLists.txt", ".;"), ":p:h")
+-- Anchored to this file's own directory: findfile("CMakeLists.txt") could
+-- land on src/CMakeLists.txt depending on cwd and 'path'
+local project_root = vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"))
 local game_session = "hex-game-run"
 
--- Build and run in tmux session (leader+R)
-vim.keymap.set("n", "<leader>R", function()
+-- Build and run in a tmux session: the popup shows the build output
+local function build_and_run()
   local tmux_cmd = string.format(
     "tmux display-popup -w 80%% -h 50%% 'cd %s && ./build_run.sh; exec $SHELL'",
     project_root
   )
   vim.fn.system(tmux_cmd)
-end, { desc = "Build and run game in tmux session" })
+end
+
+vim.keymap.set("n", "<leader>R", build_and_run, { desc = "Build and run game in tmux session" })
+
+-- The on-screen button, wired to the same runner
+dofile(project_root .. "/nvim_project_plugins/run_button.lua").setup({ run = build_and_run })
 
 -- Toggle bottom pane showing game session (Ctrl+T)
 vim.keymap.set("n", "<C-t>", function()
