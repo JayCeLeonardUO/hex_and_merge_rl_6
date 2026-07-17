@@ -1381,6 +1381,30 @@ typedef enum
 static GameState gameState = GAME_STATE_START;
 static bool tutorialOpen = false; // The "?" how-to-play window (ImGui)
 
+// Interactive tutorial (the title screen's "tutorial" button): a scripted
+// sequence on the live board where the player PERFORMS each rule -- move,
+// place, merge, connect, commit -- instead of reading about it. Each step
+// watches the real game state and advances when its goal is met; valid drop
+// targets breathe gold so the hand learns the motion
+typedef enum
+{
+    TUT_LOOK = 0, // Right-drag: spin the board
+    TUT_MOVE,     // Drag the mage one tile
+    TUT_PLACE,    // Place a ley card beside him
+    TUT_MERGE,    // Drop the twin ley on it: level 2
+    TUT_SPELL,    // The fire card at the chain's end
+    TUT_COMMIT,   // End the turn: connected spells charge
+    TUT_BOOM,     // End it again: full charge detonates
+    TUT_WARD,     // An enemy closes in: bait it with the ward
+    TUT_RESOLVE,  // End turns until the ward soaks the strike
+    TUT_DONE,     // Wrap-up + play button
+} TutorialStep;
+static bool tutorialLive = false;       // Interactive tutorial in progress
+static TutorialStep tutorialStep = TUT_LOOK;
+static int tutorialTurnMark = 0;        // gameTurn when the waiting step began
+static bool tutorialOops = false;       // TUT_SPELL: fireball sitting off the chain
+static float tutorialYawMark = 0.0f;    // Camera yaw at TUT_LOOK entry
+
 // Tutorial slideshow: one staged screenshot per rule, captured by running
 // the game with --tutorial-shots (each scene is built on the real board,
 // rendered, downscaled, and exported to tutorial_N.png)
@@ -1836,6 +1860,21 @@ static void DrawTextOutlined(const char *text, int x, int y, int size, Color col
         }
     }
     DrawText(text, x, y, size, color);
+}
+
+// HUD button: dark rounded body with a tinted border (the win screen's card
+// trick), gold label, brighter while hovered. True on the click frame
+static bool HudButton(Rectangle bounds, const char *label)
+{
+    Vector2 mouse = GetMousePosition();
+    bool hovered = CheckCollisionPointRec(mouse, bounds) && !igGetIO_Nil()->WantCaptureMouse;
+    Color border = hovered ? (Color){255, 240, 140, 255} : (Color){255, 220, 60, 255};
+    DrawRectangleRounded((Rectangle){bounds.x - 3, bounds.y - 3, bounds.width + 6, bounds.height + 6}, 0.35f, 6, border);
+    DrawRectangleRounded(bounds, 0.35f, 6, hovered ? (Color){56, 42, 24, 255} : (Color){24, 18, 28, 255});
+    int size = (bounds.height >= 48.0f) ? 26 : 20;
+    DrawTextOutlined(label, (int)(bounds.x + bounds.width / 2.0f) - MeasureText(label, size) / 2,
+                     (int)(bounds.y + bounds.height / 2.0f) - size / 2, size, border);
+    return hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 }
 
 // Turn button: the crystal on the right edge commits the turn on click. It
@@ -2595,6 +2634,58 @@ static void EnemyAIExecuteIntents(void)
 // has started (after intents execute and placed cards return). The intent
 // display only reads the stored fields -- it cannot disagree with what
 // EnemyAIExecuteIntents will do
+// Hard-coded tutorial AI, replacing the free plan wholesale: the demo foe
+// exists to showcase the ward. It marches on the ward once one is down and
+// strikes it when adjacent; before that it closes on the player but stops
+// beside him without ever landing a hit -- and it never freelances into
+// smashing the leyline chain the earlier steps just built
+static void TutorialDirectEnemies(Entity *player)
+{
+    Entity *ward = NULL;
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *cell = &entities[i];
+        if ((cell->kind == ENTITY_HEX_CELL) && (cell->value > 0) && (cell->cardKind == CARD_WARD))
+        {
+            ward = cell;
+            break;
+        }
+    }
+
+    // The free plan's danger flags are void: only the ward may wear the shell
+    for (int i = 0; i < entityCount; i++)
+    {
+        if (entities[i].kind == ENTITY_HEX_CELL) entities[i].inDanger = false;
+    }
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        Entity *enemy = &entities[i];
+        if (enemy->kind != ENTITY_ENEMY) continue;
+
+        enemy->enemyIntentKind = ENEMY_INTENT_NONE;
+        if ((ward != NULL) && (HexDistance(enemy->q, enemy->r, ward->q, ward->r) <= 1))
+        {
+            enemy->enemyIntentKind = ENEMY_INTENT_STRIKE;
+            enemy->enemyIntentQ = ward->q;
+            enemy->enemyIntentR = ward->r;
+            ward->inDanger = true;
+            continue;
+        }
+
+        const Entity *goal = (ward != NULL) ? ward : player;
+        if (goal == NULL) continue;
+        int destQ, destR;
+        EnemyChaseDestination(enemy, goal, &destQ, &destR); // stops beside the goal
+        if ((destQ != enemy->q) || (destR != enemy->r))
+        {
+            enemy->enemyIntentKind = ENEMY_INTENT_MOVE;
+            enemy->enemyIntentQ = destQ;
+            enemy->enemyIntentR = destR;
+        }
+    }
+}
+
 static void EnemyAIUpdate(void)
 {
     Entity *player = NULL;
@@ -2691,6 +2782,9 @@ static void EnemyAIUpdate(void)
             enemy->enemyIntentR = destR;
         }
     }
+
+    // The tutorial's foe is an actor, not an opponent: its script wins
+    if (tutorialLive) TutorialDirectEnemies(player);
 }
 
 // Fresh run: sweep every non-cell entity, wipe the board state off the
@@ -2758,6 +2852,17 @@ static Entity *FindCell(int q, int r)
     return NULL;
 }
 
+// True when the player or an enemy stands on (q, r): units block card drops
+static bool HexTileOccupied(int q, int r)
+{
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *unit = &entities[i];
+        if (((unit->kind == ENTITY_PLAYER) || (unit->kind == ENTITY_ENEMY)) && (unit->q == q) && (unit->r == r)) return true;
+    }
+    return false;
+}
+
 // Tutorial staging: plant a placed card directly on a tile
 static void StageTutorialCard(int q, int r, CardKind kind, CardLevel level)
 {
@@ -2783,6 +2888,190 @@ static void StageTutorialPickup(int q, int r, CardKind kind)
     gift->cardKind = kind;
     gift->tint = cardKindTints[kind];
     gift->modelIndex = (kindModelIndex[kind] >= 0) ? kindModelIndex[kind] : 0;
+}
+
+// A tile a tutorial target may point at: empty, walkable, nobody on it
+static bool TutorialTileOpen(const Entity *cell)
+{
+    return (cell->value == 0) && (cell->huskTurns == 0) &&
+           !HexTileSolid(cell->q, cell->r) && !HexTileOccupied(cell->q, cell->r);
+}
+
+// Interactive tutorial: fresh board, no enemy yet (one crawls in at
+// TUT_WARD), the standard hand of five is the lesson material
+static void TutorialBegin(void)
+{
+    ResetGame();
+    for (int i = entityCount - 1; i >= 0; i--)
+    {
+        if (entities[i].kind == ENTITY_ENEMY) EntityDespawn(i);
+    }
+    EnemyAIUpdate(); // no foes: clear the telegraphs ResetGame planned
+    gameState = GAME_STATE_PLAYING;
+    tutorialLive = true;
+    tutorialStep = TUT_LOOK;
+    tutorialTurnMark = 0;
+    tutorialOops = false;
+    tutorialOpen = false;
+    Vector3 camOffset = Vector3Subtract(camera.position, camera.target);
+    tutorialYawMark = atan2f(camOffset.x, camOffset.z);
+    LOG("INFO: TUTORIAL: begun\n");
+}
+
+// Leaving the tutorial (skip, or the wrap-up's play button): a real game
+static void TutorialEnd(void)
+{
+    tutorialLive = false;
+    ResetGame();
+    gameState = GAME_STATE_PLAYING;
+}
+
+// Advance the tutorial when the live board meets the current step's goal
+static void TutorialUpdate(const Entity *player)
+{
+    bool leyPlaced = false, leyMerged = false, wardPlaced = false, husk = false;
+    const Entity *fireball = NULL;
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *cell = &entities[i];
+        if (cell->kind != ENTITY_HEX_CELL) continue;
+        if (cell->huskTurns > 0) husk = true;
+        if (cell->value == 0) continue;
+        if (cell->cardKind == CARD_LEYLINE)
+        {
+            leyPlaced = true;
+            if (cell->cardLevel >= CARD_LVL_2) leyMerged = true;
+        }
+        if (cell->cardKind == CARD_FIREBALL) fireball = cell;
+        if (cell->cardKind == CARD_WARD) wardPlaced = true;
+    }
+
+    bool advance = false;
+    switch (tutorialStep)
+    {
+        case TUT_LOOK:
+        {
+            // Enough right-drag orbit that the spin was deliberate (the
+            // mouse sway tops out well under this)
+            Vector3 camOffset = Vector3Subtract(camera.position, camera.target);
+            float yaw = atan2f(camOffset.x, camOffset.z) - tutorialYawMark;
+            advance = fabsf(atan2f(sinf(yaw), cosf(yaw))) > 0.5f;
+            break;
+        }
+        case TUT_MOVE: advance = (playerMovedTurn >= 0); break;
+        case TUT_PLACE: advance = leyPlaced; break;
+        case TUT_MERGE: advance = leyMerged; break;
+        case TUT_SPELL:
+        {
+            // Advance only when the fireball actually taps the chain; placed
+            // astray it shows the "oops" line until lifetime hands it back
+            tutorialOops = false;
+            if (fireball == NULL) break;
+            bool conductive[LEY_W][LEY_W];
+            bool live[LEY_W][LEY_W];
+            ComputeLeylineNetwork(player, conductive, live);
+            advance = LeylineTapped(live, fireball->q, fireball->r);
+            tutorialOops = !advance;
+            break;
+        }
+        case TUT_COMMIT: advance = (gameTurn > tutorialTurnMark); break;
+        case TUT_BOOM: advance = husk || ((fireball == NULL) && (gameTurn > tutorialTurnMark)); break;
+        case TUT_WARD: advance = wardPlaced; break;
+        // The duel plays out: the enemy closes in and strikes, the soaked
+        // ward leaves the board (lifetime expiry counts too -- don't stall)
+        case TUT_RESOLVE: advance = (gameTurn > tutorialTurnMark) && !wardPlaced; break;
+        case TUT_DONE: break;
+    }
+    if (!advance) return;
+
+    tutorialStep++;
+    tutorialTurnMark = gameTurn;
+    tutorialOops = false;
+    PlaySound(sndMerge); // the merge chime doubles as the "lesson learned" ding
+    LOG("INFO: TUTORIAL: step %d reached (turn %d)\n", (int)tutorialStep, gameTurn);
+    if (tutorialStep == TUT_WARD)
+    {
+        // The foe spawns two tiles from WHEREVER the player stands, so the
+        // ward duel plays out within a couple of lever pulls: approach,
+        // telegraph, strike, soak
+        const Entity *spot = NULL;
+        for (int i = 0; i < entityCount; i++)
+        {
+            const Entity *cell = &entities[i];
+            if (cell->kind != ENTITY_HEX_CELL) continue;
+            if (HexDistance(cell->q, cell->r, player->q, player->r) != 2) continue;
+            if (!TutorialTileOpen(cell)) continue;
+            if ((spot != NULL) && (HexDistance(cell->q, cell->r, 0, 0) >= HexDistance(spot->q, spot->r, 0, 0))) continue;
+            spot = cell;
+        }
+        if (spot != NULL) SpawnEnemy(spot->q, spot->r);
+        else SpawnEnemy(2, -2); // pathological board: the old fixed perch
+        EnemyAIUpdate(); // its telegraph is the lesson: plan before the reveal
+    }
+}
+
+// The step's ONE target tile, wearing the pulsing red ring: the tutorial
+// points at an exact tile rather than washing every legal option. Rebuilt
+// every frame from live board queries (any legal completion still advances
+// the step, the ring is guidance not a gate)
+static int tutorialTargetQ = 0;
+static int tutorialTargetR = 0;
+static bool tutorialTargetOn = false;
+static void TutorialComputeTarget(const Entity *player)
+{
+    tutorialTargetOn = false;
+    if (!tutorialLive || (player == NULL)) return;
+
+    bool wantNeighbor = (tutorialStep == TUT_MOVE) || (tutorialStep == TUT_PLACE) || (tutorialStep == TUT_WARD);
+    bool conductive[LEY_W][LEY_W];
+    bool live[LEY_W][LEY_W];
+    if (tutorialStep == TUT_SPELL) ComputeLeylineNetwork(player, conductive, live);
+
+    for (int i = 0; i < entityCount; i++)
+    {
+        const Entity *cell = &entities[i];
+        if (cell->kind != ENTITY_HEX_CELL) continue;
+
+        bool hit = false;
+        if (wantNeighbor)
+            hit = TutorialTileOpen(cell) && (HexDistance(player->q, player->r, cell->q, cell->r) == 1);
+        else if (tutorialStep == TUT_MERGE)
+            hit = (cell->value > 0) && (cell->cardKind == CARD_LEYLINE) && (cell->cardLevel == CARD_LVL_1);
+        else if (tutorialStep == TUT_SPELL)
+            hit = TutorialTileOpen(cell) && LeylineTapped(live, cell->q, cell->r);
+        if (!hit) continue;
+
+        // Of the candidates keep the one nearest the board center: it reads
+        // as "that one" instead of hopping to whatever the scan met first,
+        // and stays stable while the step is underway
+        if (tutorialTargetOn &&
+            (HexDistance(cell->q, cell->r, 0, 0) >= HexDistance(tutorialTargetQ, tutorialTargetR, 0, 0))) continue;
+        tutorialTargetQ = cell->q;
+        tutorialTargetR = cell->r;
+        tutorialTargetOn = true;
+    }
+}
+
+// The banner copy: headline + instruction for the current step
+static void TutorialLines(const char **line1, const char **line2)
+{
+    switch (tutorialStep)
+    {
+        case TUT_LOOK: *line1 = "welcome, mage"; *line2 = "hold the RIGHT mouse button and drag to spin the board"; break;
+        case TUT_MOVE: *line1 = "one step a turn"; *line2 = "drag yourself onto the red-ringed tile to take a step"; break;
+        case TUT_PLACE: *line1 = "cards live on the board"; *line2 = "drag a ley card from your hand onto the red-ringed tile"; break;
+        case TUT_MERGE: *line1 = "equal cards merge"; *line2 = "drop your second ley card ON the ringed one to level it up"; break;
+        case TUT_SPELL:
+            if (tutorialOops) { *line1 = "no spark -- it sits off the chain"; *line2 = "end turns until it hops back to your hand, then try again"; }
+            else { *line1 = "spells tap the chain"; *line2 = "drop the fire card on the red-ringed tile beside your leyline"; }
+            break;
+        case TUT_COMMIT: *line1 = "time moves when you say so"; *line2 = "click the crystal to end the turn -- connected spells charge"; break;
+        case TUT_BOOM: *line1 = "one more pull"; *line2 = "end the turn again: full charge detonates (stand clear!)"; break;
+        case TUT_WARD: *line1 = "an enemy! the red arc is its plan"; *line2 = "drop your ward on the red-ringed tile to soak the coming strike"; break;
+        case TUT_RESOLVE: *line1 = "brace"; *line2 = "keep ending turns -- it closes in, strikes, and your ward soaks it"; break;
+        case TUT_DONE: *line1 = "that's the loop"; *line2 = "merge every card type to lvl 4 to assemble exodia and win"; break;
+        default: *line1 = ""; *line2 = ""; break;
+    }
 }
 
 // One staged scene per tutorial slide, built on the real board so the
@@ -3377,7 +3666,8 @@ static void UpdateDrawFrame(void)
                     EnemyAIUpdate(); // card played: re-plan
                 }
                 else if ((hoveredCell->value == 0) && (hoveredCell->huskTurns == 0) &&
-                         !HexTileSolid(hoveredCell->q, hoveredCell->r)) // husks and the crystal tile block placement
+                         !HexTileSolid(hoveredCell->q, hoveredCell->r) &&    // husks and the crystal tile block placement
+                         !HexTileOccupied(hoveredCell->q, hoveredCell->r))   // so does anyone standing there
                 {
                     // The ghost commits: the tile takes the card's kind,
                     // level, color, and hex model
@@ -3734,8 +4024,9 @@ static void UpdateDrawFrame(void)
 
             // every 5th turn the center crystal drops a card gift on a free
             // tile AROUND itself -- its own tile is solid (one gift at a
-            // time: uncollected gifts don't stack)
-            if ((gameTurn % CRYSTAL_GIFT_PERIOD) == 0)
+            // time: uncollected gifts don't stack). The tutorial suspends the
+            // timed spawns: its board changes only when a step scripts one
+            if (!tutorialLive && ((gameTurn % CRYSTAL_GIFT_PERIOD) == 0))
             {
                 static const int giftDirs[6][2] = {{1, 0}, {1, -1}, {0, -1}, {-1, 0}, {-1, 1}, {0, 1}};
                 bool taken = false;
@@ -3776,7 +4067,7 @@ static void UpdateDrawFrame(void)
 
             // every 7th turn another enemy crawls onto the board, on a free
             // tile kept off the player's back
-            if ((gameTurn % ENEMY_SPAWN_PERIOD) == 0)
+            if (!tutorialLive && ((gameTurn % ENEMY_SPAWN_PERIOD) == 0))
             {
                 for (int attempt = 0; attempt < 40; attempt++)
                 {
@@ -3804,6 +4095,9 @@ static void UpdateDrawFrame(void)
             EnemyAIUpdate(); // new turn started: re-plan
         }
     }
+
+    // Interactive tutorial: check the current step's goal against the board
+    if (tutorialLive && (gameState == GAME_STATE_PLAYING)) TutorialUpdate(player);
     //----------------------------------------------------------------------------------
 
     // Draw
@@ -3957,6 +4251,9 @@ static void UpdateDrawFrame(void)
         }
     }
 
+    // Interactive tutorial: pick this frame's target tile for the red ring
+    TutorialComputeTarget(player);
+
     for (int i = 0; i < entityCount; i++)
     {
         const Entity *cell = &entities[i];
@@ -4041,6 +4338,19 @@ static void UpdateDrawFrame(void)
                 float pulse = 0.30f + 0.12f * sinf(auroraTime * 5.0f);
                 DrawCylinder(washBase, drawSize, drawSize, 0.008f, 6, Fade((Color){120, 255, 160, 255}, pulse));
             }
+        }
+
+        // Interactive tutorial: the target tile wears a pulsating red ring
+        // (plus a faint red fill so it reads on busy art). The fill puck
+        // floats above the other washes (which span up to 0.016 over the top
+        // face) so no two pucks share a plane or a wall
+        if (tutorialLive && tutorialTargetOn && (cell->q == tutorialTargetQ) && (cell->r == tutorialTargetR))
+        {
+            // Just the faint red fill here in the world pass -- the fat
+            // pulsing target ring is screen-space, drawn topmost in the HUD
+            float tPulse = 0.5f + 0.5f * sinf(auroraTime * 5.0f);
+            Vector3 fillBase = {cell->position.x, height + 0.019f, cell->position.z};
+            DrawCylinder(fillBase, drawSize, drawSize, 0.006f, 6, Fade((Color){255, 55, 45, 255}, 0.16f + 0.14f * tPulse));
         }
 
         // Spent fireball husk: charred mounds and a breathing ember squat on
@@ -4143,7 +4453,8 @@ static void UpdateDrawFrame(void)
 
             bool ghostMerge = (hoveredCell->value > 0) && (hoveredCell->cardKind == card->cardKind) && (hoveredCell->cardLevel == card->cardLevel) && (hoveredCell->cardLevel < CARD_LVL_4);
             bool ghostValid = ((hoveredCell->value == 0) && (hoveredCell->huskTurns == 0) &&
-                               !HexTileSolid(hoveredCell->q, hoveredCell->r)) ||
+                               !HexTileSolid(hoveredCell->q, hoveredCell->r) &&
+                               !HexTileOccupied(hoveredCell->q, hoveredCell->r)) ||
                               ghostMerge;
             if (cardModelCount > 0)
             {
@@ -4775,15 +5086,93 @@ static void UpdateDrawFrame(void)
 
     if (hoveredCell != NULL) DrawText(TextFormat("cell (q=%d, r=%d)", hoveredCell->q, hoveredCell->r), 24, screenHeight - 40, 20, LIGHTGRAY);
 
-    if ((frameCounter / 20) % 2) DrawTextOutlined("Merge all card types to lvl 4 to win", screenWidth / 2 - MeasureText("Merge all card types to lvl 4 to win", 24) / 2, 28, 24, MAROON);
+    if (!tutorialLive && ((frameCounter / 20) % 2)) DrawTextOutlined("Merge all card types to lvl 4 to win", screenWidth / 2 - MeasureText("Merge all card types to lvl 4 to win", 24) / 2, 28, 24, MAROON);
 
     // Spawn countdowns: turns until the crystal's next card gift and the
-    // next enemy reinforcement (both fire on the lever pull they hit 0 on)
+    // next enemy reinforcement (both fire on the lever pull they hit 0 on).
+    // Hidden in the tutorial, where the timed spawns are suspended
+    if (!tutorialLive)
     {
         int nextCard = CRYSTAL_GIFT_PERIOD - (gameTurn % CRYSTAL_GIFT_PERIOD);
         int nextEnemy = ENEMY_SPAWN_PERIOD - (gameTurn % ENEMY_SPAWN_PERIOD);
         const char *spawnText = TextFormat("next card %d   next enemy %d", nextCard, nextEnemy);
         DrawTextOutlined(spawnText, screenWidth / 2 - MeasureText(spawnText, 20) / 2, 64, 20, LIGHTGRAY);
+    }
+
+    // Interactive tutorial chrome: the step banner up top, a pulsing ring
+    // around the crystal on the end-turn steps, and the exits (skip, and the
+    // wrap-up's play button)
+    if (tutorialLive && (gameState == GAME_STATE_PLAYING))
+    {
+        const char *line1 = "";
+        const char *line2 = "";
+        TutorialLines(&line1, &line2);
+
+        int w1 = MeasureText(line1, 26);
+        int w2 = MeasureText(line2, 20);
+        int bw = ((w1 > w2) ? w1 : w2) + 48;
+        DrawRectangleRounded((Rectangle){(float)(screenWidth - bw) / 2.0f, 20.0f, (float)bw, 78.0f}, 0.3f, 6, Fade(BLACK, 0.55f));
+        DrawTextOutlined(line1, screenWidth / 2 - w1 / 2, 32, 26, (Color){255, 220, 60, 255});
+        DrawTextOutlined(line2, screenWidth / 2 - w2 / 2, 66, 20, RAYWHITE);
+
+        // The hand card the step wants played gets its own pulsing ring at
+        // its fan slot (quiet while it is being dragged: the ghost takes over)
+        CardKind wantKind = ((tutorialStep == TUT_PLACE) || (tutorialStep == TUT_MERGE)) ? CARD_LEYLINE
+                            : (tutorialStep == TUT_SPELL)                                ? CARD_FIREBALL
+                            : (tutorialStep == TUT_WARD)                                 ? CARD_WARD
+                                                                                         : CARD_NONE;
+        if (wantKind != CARD_NONE)
+        {
+            for (int i = 0; i < entityCount; i++)
+            {
+                const Entity *card = &entities[i];
+                if ((card->kind != ENTITY_CARD) || (card->cardKind != wantKind) || (card->huskTurns > 0)) continue;
+                if (card->selected) break;
+                float tPulse = 0.5f + 0.5f * sinf((float)GetTime() * 5.0f);
+                float r = 52.0f + 6.0f * tPulse;
+                Color ringRed = {255, 55, 45, 255};
+                DrawRing((Vector2){card->position.x, card->position.y}, r - 5.0f, r + 5.0f, 0.0f, 360.0f, 48,
+                         Fade(ringRed, 0.55f + 0.45f * tPulse));
+                break;
+            }
+        }
+
+        // The target tile's marker: a fat pulsating red ring, screen-space so
+        // it rides on top of everything (cards, washes, beams included)
+        if (tutorialTargetOn)
+        {
+            Vector3 at = HexAxialToWorld(tutorialTargetQ, tutorialTargetR);
+            at.y = HEX_TILE_HEIGHT;
+            Vector2 ringAt = GetWorldToScreen(at, camera);
+            float pxPerUnit = (float)screenHeight / camera.fovy; // Ortho: fovy is the view's world height
+            float tPulse = 0.5f + 0.5f * sinf((float)GetTime() * 5.0f);
+            float r = (0.40f + 0.14f * tPulse) * pxPerUnit;
+            Color ringRed = {255, 55, 45, 255};
+            DrawRing(ringAt, r - 6.0f, r + 6.0f, 0.0f, 360.0f, 48, Fade(ringRed, 0.55f + 0.45f * tPulse));
+            DrawRing(ringAt, r + 9.0f, r + 12.0f, 0.0f, 360.0f, 48, Fade(ringRed, 0.30f + 0.30f * tPulse));
+        }
+
+        if ((tutorialStep == TUT_COMMIT) || (tutorialStep == TUT_BOOM) || (tutorialStep == TUT_RESOLVE))
+        {
+            float ringPulse = 6.0f * (0.5f + 0.5f * sinf((float)GetTime() * 4.0f));
+            for (int ring = 0; ring < 3; ring++)
+                DrawCircleLines((int)leverKnobScreenPos.x, (int)leverKnobScreenPos.y,
+                                34.0f + ringPulse + (float)ring, (Color){255, 220, 60, 255});
+        }
+
+        if (tutorialStep == TUT_DONE)
+        {
+            if (HudButton((Rectangle){(float)screenWidth / 2.0f - 85.0f, 108.0f, 170.0f, 52.0f}, "play"))
+            {
+                TutorialEnd();
+                PlaySound(sndLever);
+            }
+        }
+        else if (HudButton((Rectangle){(float)screenWidth - 118.0f, 112.0f, 94.0f, 32.0f}, "skip"))
+        {
+            TutorialEnd();
+            PlaySound(sndLever);
+        }
     }
 
     // help -- a "?" in the top right corner toggles the how-to-play window
@@ -4877,19 +5266,38 @@ static void UpdateDrawFrame(void)
             DrawTextOutlined(ranText, screenWidth / 2 - MeasureText(ranText, 24) / 2, screenHeight / 2 - 4, 24, RAYWHITE);
         }
 
-        // The pulsing prompt, and the click that acts on it
-        const char *prompt = (gameState == GAME_STATE_START) ? "click to start"
-                             : (gameState == GAME_STATE_WIN) ? "click to play again"
-                                                             : "click to try again";
-        float promptPulse = 0.65f + 0.35f * sinf((float)GetTime() * 3.0f);
-        DrawTextOutlined(prompt, screenWidth / 2 - MeasureText(prompt, 26) / 2, screenHeight / 2 + 96, 26,
-                         Fade((Color){255, 220, 60, 255}, promptPulse));
-
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !igGetIO_Nil()->WantCaptureMouse)
+        if (gameState == GAME_STATE_START)
         {
-            if (gameState != GAME_STATE_START) ResetGame();
-            gameState = GAME_STATE_PLAYING;
-            PlaySound(sndLever);
+            // Two doors in: play drops straight onto the board, tutorial runs
+            // the guided steps on the live board
+            float bw = 170.0f, bh = 52.0f, gap = 28.0f;
+            float by = (float)screenHeight / 2.0f + 92.0f;
+            if (HudButton((Rectangle){(float)screenWidth / 2.0f - bw - gap / 2.0f, by, bw, bh}, "play"))
+            {
+                gameState = GAME_STATE_PLAYING;
+                PlaySound(sndLever);
+            }
+            if (HudButton((Rectangle){(float)screenWidth / 2.0f + gap / 2.0f, by, bw, bh}, "tutorial"))
+            {
+                TutorialBegin();
+                PlaySound(sndLever);
+            }
+        }
+        else
+        {
+            // The pulsing prompt, and the click that acts on it
+            const char *prompt = (gameState == GAME_STATE_WIN) ? "click to play again" : "click to try again";
+            float promptPulse = 0.65f + 0.35f * sinf((float)GetTime() * 3.0f);
+            DrawTextOutlined(prompt, screenWidth / 2 - MeasureText(prompt, 26) / 2, screenHeight / 2 + 96, 26,
+                             Fade((Color){255, 220, 60, 255}, promptPulse));
+
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !igGetIO_Nil()->WantCaptureMouse)
+            {
+                tutorialLive = false; // A game over mid-tutorial exits it
+                ResetGame();
+                gameState = GAME_STATE_PLAYING;
+                PlaySound(sndLever);
+            }
         }
     }
 
