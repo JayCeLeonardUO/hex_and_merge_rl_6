@@ -5341,6 +5341,13 @@ static void UpdateDrawFrame(void)
         igSetNextWindowPos((ImVec2_c){40, 90}, ImGuiCond_FirstUseEver, (ImVec2_c){0, 0});
         igBegin("how to play", &tutorialOpen, 0);
 
+        // The guided version of these slides, played on the live board
+        // (drops the current run: it deals a fresh lesson board). Full-width
+        // and tall: THE way to learn -- the slides below are the footnote
+        ImVec2_c tutBtnSize = {igGetContentRegionAvail().x, 64};
+        if (igButton("IN GAME TUTORIAL", tutBtnSize)) TutorialBegin();
+        igSpacing();
+
         igTextWrapped("%s", tutorialCaptions[tutorialSlide]);
         igSpacing();
         if (tutorialTex[tutorialSlide].id != 0)
