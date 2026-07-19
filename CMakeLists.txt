@@ -16,8 +16,8 @@ FetchContent_Declare(
     FIND_PACKAGE_ARGS
 )
 
-# Box2D v3: C17 rigid-body physics. Keep the dependency lean by building only
-# the library; the project supplies its own raylib-based rendering and tooling.
+# Box2D v3: C17 rigid-body physics (desktop and Emscripten/WebAssembly). Keep
+# the dependency lean; the project supplies its own rendering and tooling.
 set(BOX2D_SAMPLES OFF CACHE BOOL "Build Box2D samples" FORCE)
 set(BOX2D_UNIT_TESTS OFF CACHE BOOL "Build Box2D unit tests" FORCE)
 set(BOX2D_DOCS OFF CACHE BOOL "Build Box2D documentation" FORCE)
