@@ -16,6 +16,17 @@ FetchContent_Declare(
     FIND_PACKAGE_ARGS
 )
 
+# Box2D v3: C17 rigid-body physics. Keep the dependency lean by building only
+# the library; the project supplies its own raylib-based rendering and tooling.
+set(BOX2D_SAMPLES OFF CACHE BOOL "Build Box2D samples" FORCE)
+set(BOX2D_UNIT_TESTS OFF CACHE BOOL "Build Box2D unit tests" FORCE)
+set(BOX2D_DOCS OFF CACHE BOOL "Build Box2D documentation" FORCE)
+FetchContent_Declare(
+    box2d
+    DOWNLOAD_EXTRACT_TIMESTAMP OFF
+    URL https://github.com/erincatto/box2d/archive/refs/tags/v3.1.1.tar.gz
+)
+
 # cimgui: C bindings for Dear ImGui (bundles imgui as a submodule)
 set(IMGUI_STATIC "yes" CACHE STRING "Build cimgui as a static library" FORCE)
 FetchContent_Declare(
@@ -31,7 +42,7 @@ FetchContent_Declare(
     GIT_TAG ef129d1858373b6fe332c45f85a1dfc1421bebae
 )
 
-FetchContent_MakeAvailable(raylib cimgui rlimgui)
+FetchContent_MakeAvailable(raylib box2d cimgui rlimgui)
 
 add_library(rlimgui_lib STATIC ${rlimgui_SOURCE_DIR}/rlImGui.cpp)
 target_include_directories(rlimgui_lib PUBLIC ${rlimgui_SOURCE_DIR})
@@ -84,7 +95,7 @@ else()
 endif()
 
 #set(raylib_VERBOSE 1)
-target_link_libraries(${PROJECT_NAME} raylib rlimgui_lib)
+target_link_libraries(${PROJECT_NAME} raylib rlimgui_lib box2d)
 
 # Web Configurations
 if ("${PLATFORM}" STREQUAL "Web")

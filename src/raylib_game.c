@@ -16,6 +16,7 @@
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include "cimgui.h"  // Dear ImGui C bindings
 #include "rlImGui.h" // raylib backend for Dear ImGui
+#include <box2d/box2d.h> // Box2D v3 physics diagnostics
 
 #if defined(PLATFORM_WEB)
 #include <emscripten/emscripten.h> // Emscripten library
@@ -1230,6 +1231,8 @@ static float mouseSwayAmount = 1.0f; // Camera lean toward the cursor, 0 = off (
 typedef struct AirParticle
 {
     Vector3 base; // Rest position in the air
+    Vector3 home; // Spawn anchor; a soft pull keeps moving particles on screen
+    Vector3 velocity; // Collision-aware drift velocity
     Vector3 off;  // Eased mouse-dodge offset
     Vector3 axis; // Tumble axis
     float phase;  // Per-particle time offset
@@ -1304,6 +1307,19 @@ static float airShardCount = 24.0f; // How many shards are active
 static float airTriCount = 18.0f;   // How many glow triangles are active
 static float airParticleScale = 1.0f;
 static float triGlowStrength = 0.8f;
+static float airMoveSpeed = 1.0f;
+static float airHomePull = 0.35f;
+static float airCollisionSize = 1.0f;
+static float airBounce = 0.9f;
+
+// Debug particle poker: a mouse-draggable kinematic sphere that transfers
+// its drag velocity to any air particle it strikes.
+static bool particlePokerActive = false;
+static bool particlePokerGrabbed = false;
+static Vector3 particlePokerPosition = {0};
+static Vector3 particlePokerVelocity = {0};
+static float particlePokerRadius = 0.65f;
+static float particlePokerStrength = 1.5f;
 
 // Impact light-burst tweakers, exposed in the hex debug ImGui window
 static float impactLightSize = 1.7f;   // Half-size of the burst quad, in hex sizes
@@ -1371,6 +1387,12 @@ static const Tweak tweaks[] = {
     {"air_shards", &airShardCount},
     {"air_tris", &airTriCount},
     {"air_particle_scale", &airParticleScale},
+    {"air_move_speed", &airMoveSpeed},
+    {"air_home_pull", &airHomePull},
+    {"air_collision_size", &airCollisionSize},
+    {"air_bounce", &airBounce},
+    {"particle_poker_radius", &particlePokerRadius},
+    {"particle_poker_strength", &particlePokerStrength},
     {"tri_glow", &triGlowStrength},
     {"center_gem_scale", &centerGemScale},
 };
@@ -1435,6 +1457,42 @@ typedef enum
 } GameState;
 static GameState gameState = GAME_STATE_START;
 static bool tutorialOpen = false; // The "?" how-to-play window (ImGui)
+
+// Tiny self-contained Box2D scene used by the ImGui debug panel. A dynamic
+// box falls onto a static floor, proving that the library is linked, stepping,
+// and resolving collisions without coupling physics to gameplay yet.
+static b2WorldId box2dTestWorld;
+static b2BodyId box2dTestBody;
+static bool box2dTestReady = false;
+static bool box2dTestPaused = false;
+
+static void ResetBox2dTest(void)
+{
+    if (box2dTestReady) b2DestroyWorld(box2dTestWorld);
+
+    b2WorldDef worldDef = b2DefaultWorldDef();
+    worldDef.gravity = (b2Vec2){0.0f, -10.0f};
+    box2dTestWorld = b2CreateWorld(&worldDef);
+
+    b2BodyDef groundDef = b2DefaultBodyDef();
+    groundDef.position = (b2Vec2){0.0f, -0.5f};
+    b2BodyId ground = b2CreateBody(box2dTestWorld, &groundDef);
+    b2ShapeDef groundShapeDef = b2DefaultShapeDef();
+    b2Polygon groundBox = b2MakeBox(4.0f, 0.5f);
+    b2CreatePolygonShape(ground, &groundShapeDef, &groundBox);
+
+    b2BodyDef bodyDef = b2DefaultBodyDef();
+    bodyDef.type = b2_dynamicBody;
+    bodyDef.position = (b2Vec2){0.0f, 5.0f};
+    box2dTestBody = b2CreateBody(box2dTestWorld, &bodyDef);
+    b2ShapeDef shapeDef = b2DefaultShapeDef();
+    shapeDef.density = 1.0f;
+    shapeDef.material.friction = 0.3f;
+    b2Polygon fallingBox = b2MakeBox(0.5f, 0.5f);
+    b2CreatePolygonShape(box2dTestBody, &shapeDef, &fallingBox);
+
+    box2dTestReady = true;
+}
 
 // Interactive tutorial (the title screen's "tutorial" button): a scripted
 // sequence on the live board where the player PERFORMS each rule -- move,
@@ -1713,6 +1771,12 @@ static AirParticle SpawnAirParticle(bool isTriangle, int seqIndex)
     p.base = Vector3Add(p.base, Vector3Scale(right, u * halfView * 0.95f));
     p.base = Vector3Add(p.base, Vector3Scale(up, v * halfView * 0.9f));
     if (p.base.y < 0.5f) p.base.y = 0.5f + (float)GetRandomValue(0, 150) / 100.0f;
+    p.home = p.base;
+    p.velocity = Vector3Scale(Vector3Normalize((Vector3){
+                                  (float)GetRandomValue(-100, 100),
+                                  (float)GetRandomValue(-60, 60),
+                                  (float)GetRandomValue(-100, 100)}),
+                              0.2f + (float)GetRandomValue(0, 40) / 100.0f);
 
     p.axis = Vector3Normalize((Vector3){(float)GetRandomValue(-100, 100) / 100.0f,
                                         (float)GetRandomValue(-100, 100) / 100.0f + 0.01f,
@@ -1738,21 +1802,128 @@ static AirParticle SpawnAirParticle(bool isTriangle, int seqIndex)
 // then drift back (same feel as the python demo)
 static void UpdateAirParticles(AirParticle *parts, int count, float dt)
 {
-    if (!mouseOnPlane) return;
     Vector3 mouseWorld = {mouseBoardX, 0.8f, mouseBoardZ};
     const float radius = 1.6f;
     for (int i = 0; i < count; i++)
     {
-        Vector3 d = Vector3Subtract(Vector3Add(parts[i].base, parts[i].off), mouseWorld);
-        float dist = Vector3Length(d);
         Vector3 target = {0};
-        if ((dist > 0.001f) && (dist < radius))
+        if (mouseOnPlane)
         {
-            float push = (radius - dist) / radius * 0.5f;
-            target = Vector3Scale(d, push / dist);
+            Vector3 d = Vector3Subtract(Vector3Add(parts[i].base, parts[i].off), mouseWorld);
+            float dist = Vector3Length(d);
+            if ((dist > 0.001f) && (dist < radius))
+            {
+                float push = (radius - dist) / radius * 0.5f;
+                target = Vector3Scale(d, push / dist);
+            }
         }
         float ease = 1.0f - expf(-6.0f * dt);
         parts[i].off = Vector3Add(parts[i].off, Vector3Scale(Vector3Subtract(target, parts[i].off), ease));
+
+        // Free drift plus a weak spring to the spawn point prevents particles
+        // from permanently leaving the camera after repeated collisions.
+        Vector3 towardHome = Vector3Subtract(parts[i].home, parts[i].base);
+        parts[i].velocity = Vector3Add(parts[i].velocity, Vector3Scale(towardHome, airHomePull * dt));
+        parts[i].velocity = Vector3Scale(parts[i].velocity, expf(-0.08f * dt));
+        parts[i].base = Vector3Add(parts[i].base, Vector3Scale(parts[i].velocity, airMoveSpeed * dt));
+    }
+}
+
+// Sphere collisions across both particle types. They remain visually 3D, so
+// this uses a 3D impulse response rather than flattening them into Box2D's 2D
+// plane. Equal particle mass keeps the small ambient motion predictable.
+static AirParticle *AirParticleAt(int index, int shardCount)
+{
+    return (index < shardCount) ? &airShards[index] : &airTris[index - shardCount];
+}
+
+static void ResolveAirParticleCollisions(int shardCount, int triCount)
+{
+    int total = shardCount + triCount;
+    for (int i = 0; i < total; i++)
+    {
+        AirParticle *a = AirParticleAt(i, shardCount);
+        for (int j = i + 1; j < total; j++)
+        {
+            AirParticle *b = AirParticleAt(j, shardCount);
+            float ra = fmaxf(0.06f, a->scale * airParticleScale * airCollisionSize);
+            float rb = fmaxf(0.06f, b->scale * airParticleScale * airCollisionSize);
+            Vector3 delta = Vector3Subtract(b->base, a->base);
+            float distSqr = Vector3LengthSqr(delta);
+            float minDist = ra + rb;
+            if (distSqr >= minDist * minDist) continue;
+
+            float dist = sqrtf(fmaxf(distSqr, 0.000001f));
+            Vector3 normal = (dist > 0.001f) ? Vector3Scale(delta, 1.0f / dist) : (Vector3){1, 0, 0};
+            float overlap = minDist - dist;
+            a->base = Vector3Subtract(a->base, Vector3Scale(normal, overlap * 0.5f));
+            b->base = Vector3Add(b->base, Vector3Scale(normal, overlap * 0.5f));
+
+            float closingSpeed = Vector3DotProduct(Vector3Subtract(b->velocity, a->velocity), normal);
+            if (closingSpeed >= 0.0f) continue;
+            float impulse = -(1.0f + airBounce) * closingSpeed * 0.5f;
+            a->velocity = Vector3Subtract(a->velocity, Vector3Scale(normal, impulse));
+            b->velocity = Vector3Add(b->velocity, Vector3Scale(normal, impulse));
+        }
+    }
+}
+
+static void SpawnParticlePoker(void)
+{
+    particlePokerPosition = Vector3Add(camera.target, (Vector3){0.0f, 4.0f, 0.0f});
+    particlePokerVelocity = (Vector3){0};
+    particlePokerActive = true;
+    particlePokerGrabbed = false;
+}
+
+static void UpdateParticlePoker(float dt, int shardCount, int triCount)
+{
+    if (!particlePokerActive) return;
+
+    Ray ray = GetScreenToWorldRay(GetMousePosition(), camera);
+    if (!particlePokerGrabbed && !uiWantsMouse && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        particlePokerGrabbed = GetRayCollisionSphere(ray, particlePokerPosition, particlePokerRadius * 1.35f).hit;
+
+    if (particlePokerGrabbed && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+    {
+        // Drag on a camera-facing plane through the poker, preserving depth.
+        Vector3 planeNormal = Vector3Normalize(Vector3Subtract(camera.position, camera.target));
+        float denominator = Vector3DotProduct(ray.direction, planeNormal);
+        if (fabsf(denominator) > 0.0001f)
+        {
+            float distance = Vector3DotProduct(Vector3Subtract(particlePokerPosition, ray.position), planeNormal) / denominator;
+            Vector3 next = Vector3Add(ray.position, Vector3Scale(ray.direction, distance));
+            particlePokerVelocity = Vector3Scale(Vector3Subtract(next, particlePokerPosition), 1.0f / fmaxf(dt, 0.001f));
+            float speed = Vector3Length(particlePokerVelocity);
+            if (speed > 14.0f) particlePokerVelocity = Vector3Scale(particlePokerVelocity, 14.0f / speed);
+            particlePokerPosition = next;
+        }
+    }
+    else
+    {
+        particlePokerGrabbed = false;
+        particlePokerVelocity = (Vector3){0};
+    }
+
+    // The poker is kinematic: it does not get pushed back, but particles are
+    // separated from its tip and inherit its swing velocity.
+    int total = shardCount + triCount;
+    for (int i = 0; i < total; i++)
+    {
+        AirParticle *p = AirParticleAt(i, shardCount);
+        float particleRadius = fmaxf(0.06f, p->scale * airParticleScale * airCollisionSize);
+        Vector3 delta = Vector3Subtract(p->base, particlePokerPosition);
+        float minDistance = particlePokerRadius + particleRadius;
+        float distanceSqr = Vector3LengthSqr(delta);
+        if (distanceSqr >= minDistance * minDistance) continue;
+
+        float distance = sqrtf(fmaxf(distanceSqr, 0.000001f));
+        Vector3 normal = (distance > 0.001f) ? Vector3Scale(delta, 1.0f / distance) : (Vector3){0, 1, 0};
+        p->base = Vector3Add(particlePokerPosition, Vector3Scale(normal, minDistance));
+        float outwardSpeed = Vector3DotProduct(particlePokerVelocity, normal);
+        Vector3 shove = Vector3Scale(normal, fmaxf(2.0f, outwardSpeed) * particlePokerStrength);
+        p->velocity = Vector3Add(Vector3Scale(p->velocity, 0.35f),
+                                 Vector3Add(Vector3Scale(particlePokerVelocity, particlePokerStrength), shove));
     }
 }
 
@@ -1790,6 +1961,19 @@ static void DrawAirTriangles(float t)
         rlPopMatrix();
     }
     rlEnableBackfaceCulling();
+}
+
+// Call immediately after an ImGui control to explain it after a short hover.
+static void DebugTooltip(const char *description)
+{
+    if (!igIsItemHovered(ImGuiHoveredFlags_DelayShort)) return;
+    if (igBeginTooltip())
+    {
+        igPushTextWrapPos(360.0f);
+        igTextUnformatted(description, NULL);
+        igPopTextWrapPos();
+        igEndTooltip();
+    }
 }
 
 // CRPG camera controls (Baldur's Gate style): WASD pans along the board
@@ -3941,8 +4125,12 @@ static void UpdateDrawFrame(void)
     // air particles -- dodge softly away from the cursor's board point
     //
 
-    UpdateAirParticles(airShards, (int)airShardCount < MAX_AIR_SHARDS ? (int)airShardCount : MAX_AIR_SHARDS, dt);
-    UpdateAirParticles(airTris, (int)airTriCount < MAX_AIR_TRIS ? (int)airTriCount : MAX_AIR_TRIS, dt);
+    int activeShardCount = (int)airShardCount < MAX_AIR_SHARDS ? (int)airShardCount : MAX_AIR_SHARDS;
+    int activeTriCount = (int)airTriCount < MAX_AIR_TRIS ? (int)airTriCount : MAX_AIR_TRIS;
+    UpdateAirParticles(airShards, activeShardCount, dt);
+    UpdateAirParticles(airTris, activeTriCount, dt);
+    ResolveAirParticleCollisions(activeShardCount, activeTriCount);
+    UpdateParticlePoker(dt, activeShardCount, activeTriCount);
 
     //
     // effect state -- reticle chases the hovered tile, impact ages out
@@ -4986,6 +5174,16 @@ static void UpdateDrawFrame(void)
     }
     DrawAirTriangles(airTime);
 
+    if (particlePokerActive)
+    {
+        Vector3 handleEnd = Vector3Add(particlePokerPosition, Vector3Scale(camera.up, 2.2f));
+        Color pokerColor = particlePokerGrabbed ? (Color){255, 245, 100, 255} : (Color){255, 70, 190, 255};
+        DrawCylinderEx(particlePokerPosition, handleEnd, particlePokerRadius * 0.24f,
+                       particlePokerRadius * 0.15f, 12, pokerColor);
+        DrawSphere(particlePokerPosition, particlePokerRadius, pokerColor);
+        DrawSphereWires(particlePokerPosition, particlePokerRadius * 1.04f, 10, 16, WHITE);
+    }
+
     //
     // hand cards -- glb card models standing at the fan positions (converted
     // from the screen-space springs), facing the camera like the player
@@ -5624,11 +5822,13 @@ static void UpdateDrawFrame(void)
         // and tall: THE way to learn -- the slides below are the footnote
         ImVec2_c tutBtnSize = {igGetContentRegionAvail().x, 64};
         if (igButton("IN GAME TUTORIAL", tutBtnSize)) TutorialBegin();
+        DebugTooltip("Starts the guided tutorial on a freshly prepared game board.");
 
         // The slides hide behind a small toggle under the big button: the
         // reference version for anyone who'd rather read than replay
         static bool slidesOpen = false;
         if (igButton("slide show tutorial", (ImVec2_c){0, 0})) slidesOpen = !slidesOpen;
+        DebugTooltip("Shows or hides the reference tutorial slides.");
         igSpacing();
 
         if (slidesOpen)
@@ -5642,10 +5842,12 @@ static void UpdateDrawFrame(void)
             igSpacing();
 
             if (igButton("< prev", (ImVec2_c){0, 0}) && (tutorialSlide > 0)) tutorialSlide--;
+            DebugTooltip("Moves to the previous tutorial slide.");
             igSameLine(0.0f, 12.0f);
             igText("%d / %d", tutorialSlide + 1, TUTORIAL_SLIDES);
             igSameLine(0.0f, 12.0f);
             if (igButton("next >", (ImVec2_c){0, 0}) && (tutorialSlide < TUTORIAL_SLIDES - 1)) tutorialSlide++;
+            DebugTooltip("Moves to the next tutorial slide.");
         }
 
         igEnd();
@@ -5662,6 +5864,27 @@ static void UpdateDrawFrame(void)
         igText("build %s  (%s %s)", BUILD_GIT_HASH, __DATE__, __TIME__);
         igText("entities: %d/%d", entityCount, MAX_ENTITIES);
         igText("mouse cell: (q=%d, r=%d)", mouseHexQ, mouseHexR);
+
+        igSeparator();
+        igText("Box2D v3 test");
+        if (!box2dTestReady) ResetBox2dTest();
+        if (!box2dTestPaused) b2World_Step(box2dTestWorld, GetFrameTime(), 4);
+        b2Vec2 testPosition = b2Body_GetPosition(box2dTestBody);
+        b2Vec2 testVelocity = b2Body_GetLinearVelocity(box2dTestBody);
+        bool boxLanded = (testPosition.y < 0.55f) && (fabsf(testVelocity.y) < 0.05f);
+        igTextColored(boxLanded ? (ImVec4_c){0.25f, 1.0f, 0.35f, 1.0f}
+                                : (ImVec4_c){1.0f, 0.8f, 0.2f, 1.0f},
+                      boxLanded ? "WORKING - collision resolved" : "RUNNING - box is falling");
+        igText("box position: (%.2f, %.2f)", testPosition.x, testPosition.y);
+        igText("vertical velocity: %.2f", testVelocity.y);
+        if (igButton(box2dTestPaused ? "resume physics" : "pause physics", (ImVec2_c){0, 0}))
+            box2dTestPaused = !box2dTestPaused;
+        DebugTooltip("Pauses or resumes the small Box2D falling-box simulation.");
+        igSameLine(0.0f, 8.0f);
+        if (igButton("reset Box2D test", (ImVec2_c){0, 0})) ResetBox2dTest();
+        DebugTooltip("Recreates the Box2D test world and drops the box from its starting height.");
+        igSeparator();
+
         for (int i = 0; i < entityCount; i++)
         {
             const Entity *enemy = &entities[i];
@@ -5676,53 +5899,119 @@ static void UpdateDrawFrame(void)
         }
 
         if (igButton("deal card", (ImVec2_c){0, 0})) SpawnCard();
+        DebugTooltip("Adds one random card to the hand for gameplay testing.");
         igSameLine(0.0f, 8.0f);
         if (igButton("test win screen", (ImVec2_c){0, 0})) gameState = GAME_STATE_WIN;
+        DebugTooltip("Immediately opens the win screen without completing a run.");
 
         if (igButton("save tweaks", (ImVec2_c){0, 0})) SaveTweaks();
+        DebugTooltip("Writes every debug slider value to resources/tweaks.json.");
         igSameLine(0.0f, 8.0f);
         if (igButton("reload tweaks", (ImVec2_c){0, 0})) LoadTweaks();
+        DebugTooltip("Reloads slider values from resources/tweaks.json, discarding unsaved adjustments.");
 
         // Impact burst tweakers; the button replays the effect at the board center
         igSliderFloat("impact size", &impactLightSize, 0.5f, 4.0f, "%.2f", 0);
+        DebugTooltip("Changes the width and height of the light burst created when a card hits a tile.");
         igSliderFloat("impact height", &impactLightHeight, 0.0f, 2.0f, "%.2f", 0);
+        DebugTooltip("Moves the card-impact light burst vertically above the tile surface.");
         igSliderFloat("impact anim speed", &impactAnimSpeed, 0.1f, 3.0f, "%.2f", 0);
+        DebugTooltip("Controls how quickly the card-impact sprite animation plays.");
 
         // Size tweakers for the visual elements
         igSliderFloat("player size", &playerSpriteSize, 0.5f, 3.0f, "%.2f", 0);
+        DebugTooltip("Scales the player sprite in the 3D board view.");
         igSliderFloat("card size", &cardScale, 0.5f, 1.5f, "%.2f", 0);
+        DebugTooltip("Scales cards in the hand and adjusts their fan spacing.");
         igSliderFloat("reticle size", &reticleScale, 0.4f, 1.6f, "%.2f", 0);
+        DebugTooltip("Scales the tile hover and placement reticle.");
         igSliderFloat("lever scale", &leverScale, 1.0f, 4.0f, "%.2f", 0);
+        DebugTooltip("Scales the end-turn lever and its crystal knob.");
         igSliderFloat("aurora", &auroraIntensity, 0.0f, 2.0f, "%.2f", 0);
+        DebugTooltip("Controls the brightness of the animated aurora background.");
         igSliderFloat("water wave amp", &waterWaveAmp, 0.0f, 1.2f, "%.2f", 0);
+        DebugTooltip("Controls how strongly the water surface is displaced by waves.");
         igSliderFloat("water wave scale", &waterWaveScale, 0.3f, 4.0f, "%.2f", 0);
+        DebugTooltip("Controls the size and frequency of the water wave pattern.");
         igSliderFloat("enemy size", &enemySize, 0.2f, 2.0f, "%.2f", 0);
+        DebugTooltip("Scales enemy models on the board.");
         igSliderFloat("enemy spikes", &enemySpikeLen, 0.0f, 1.2f, "%.2f", 0);
+        DebugTooltip("Controls how far the enemy shader pushes its spikes outward.");
         igSliderFloat("enemy spike density", &enemySpikeDensity, 0.05f, 1.0f, "%.2f", 0);
+        DebugTooltip("Controls the spacing and number of visible enemy spikes.");
         igSliderFloat("enemy rim", &enemyRim, 0.0f, 1.5f, "%.2f", 0);
+        DebugTooltip("Controls the brightness of the enemy edge-lighting effect.");
         igSliderFloat("enemy line width", &enemyLineWidth, 1.0f, 6.0f, "%.1f", 0);
+        DebugTooltip("Controls the width of ink-like lines drawn across enemies.");
         igSliderFloat("enemy red outline", &enemyOutline, 0.0f, 0.15f, "%.3f", 0);
+        DebugTooltip("Controls the thickness of the red silhouette around enemies.");
         igSliderFloat("ley hue", &leyHue, 0.0f, 1.0f, "%.2f", 0);
+        DebugTooltip("Shifts the base color of powered leyline connections.");
         igSliderFloat("ley iridescence", &leyIrid, 0.0f, 1.0f, "%.2f", 0);
+        DebugTooltip("Controls the animated rainbow color variation on leylines.");
         igSliderFloat("ley ink", &leyInk, 0.0f, 5.0f, "%.1f", 0);
+        DebugTooltip("Controls the strength of dark ink detail in leyline beams.");
         igSliderFloat("ley arc", &leyArc, 0.0f, 0.8f, "%.2f", 0);
+        DebugTooltip("Controls how strongly leyline beams curve between tiles.");
         igSliderFloat("ley width", &leyWidth, 1.0f, 8.0f, "%.1f", 0);
+        DebugTooltip("Controls the thickness of leyline beams.");
 
         // Gem tile optics
         igSliderFloat("gem ior", &gemIor, 1.0f, 2.4f, "%.2f", 0);
+        DebugTooltip("Sets the crystal index of refraction; higher values bend the background more strongly.");
         igSliderFloat("gem strength", &gemStrength, 0.0f, 1.0f, "%.2f", 0);
+        DebugTooltip("Controls the overall strength of crystal refraction.");
         igSliderFloat("gem dispersion", &gemChromatic, 0.0f, 0.15f, "%.3f", 0);
+        DebugTooltip("Separates refracted red, green, and blue channels for a prism effect.");
         igSliderFloat("gem milkiness", &gemMilkiness, 0.0f, 1.0f, "%.2f", 0);
+        DebugTooltip("Blends tile crystals toward an opaque cloudy appearance.");
         igSliderFloat("lever gem milkiness", &leverGemMilkiness, 0.0f, 1.0f, "%.2f", 0);
+        DebugTooltip("Sets the resting cloudiness of the end-turn lever crystal.");
         igSliderFloat("tile art size", &tileArtScale, 0.3f, 1.4f, "%.2f", 0);
+        DebugTooltip("Scales the decorative artwork drawn on tile tops.");
         igSliderFloat("mouse sway", &mouseSwayAmount, 0.0f, 3.0f, "%.2f", 0);
+        DebugTooltip("Controls how much the camera leans toward the mouse cursor; zero disables it.");
 
         // Air particle tweakers
         igSliderFloat("air shards", &airShardCount, 0.0f, (float)MAX_AIR_SHARDS, "%.0f", 0);
+        DebugTooltip("Sets how many 3D crystal shard particles are active, moving, and colliding.");
         igSliderFloat("air triangles", &airTriCount, 0.0f, (float)MAX_AIR_TRIS, "%.0f", 0);
+        DebugTooltip("Sets how many glowing triangle particles are active, moving, and colliding.");
         igSliderFloat("air particle scale", &airParticleScale, 0.3f, 3.0f, "%.2f", 0);
+        DebugTooltip("Scales every shard and triangle. This also changes their collision radius.");
+        igSliderFloat("particle move speed", &airMoveSpeed, 0.0f, 4.0f, "%.2f", 0);
+        DebugTooltip("Multiplies particle travel speed. At zero particles stop drifting, but existing overlaps are still separated.");
+        igSliderFloat("particle home pull", &airHomePull, 0.0f, 2.0f, "%.2f", 0);
+        DebugTooltip("Controls how strongly particles are pulled back toward their original spawn positions so they remain on screen.");
+        igSliderFloat("particle collision size", &airCollisionSize, 0.25f, 2.5f, "%.2f", 0);
+        DebugTooltip("Multiplies the invisible collision sphere around every particle. Raise it if particles appear to overlap before bouncing.");
+        igSliderFloat("particle bounce", &airBounce, 0.0f, 1.0f, "%.2f", 0);
+        DebugTooltip("Sets collision restitution: 0 makes impacts soft and inelastic; 1 preserves the most bounce energy.");
         igSliderFloat("tri glow", &triGlowStrength, 0.0f, 1.0f, "%.2f", 0);
+        DebugTooltip("Controls the bloom brightness surrounding triangle particles. It does not affect collisions.");
+
+        if (igButton(particlePokerActive ? "respawn particle poker" : "spawn particle poker", (ImVec2_c){0, 0}))
+            SpawnParticlePoker();
+        DebugTooltip("Spawns a bright pink 3D poker above the board. Grab its round tip in the game view and swing it through particles.");
+        if (particlePokerActive)
+        {
+            igSameLine(0.0f, 8.0f);
+            if (igButton("remove poker", (ImVec2_c){0, 0}))
+            {
+                particlePokerActive = false;
+                particlePokerGrabbed = false;
+            }
+            DebugTooltip("Removes the particle poker from the scene.");
+            igTextColored((ImVec4_c){1.0f, 0.45f, 0.8f, 1.0f},
+                          particlePokerGrabbed ? "poker: GRABBED - swing it!" : "poker: click and drag the pink tip");
+        }
+        igSliderFloat("poker size", &particlePokerRadius, 0.2f, 2.0f, "%.2f", 0);
+        DebugTooltip("Changes the visible tip and its collision radius. A larger poker hits more particles at once.");
+        igSliderFloat("poker impact", &particlePokerStrength, 0.2f, 4.0f, "%.2f", 0);
+        DebugTooltip("Multiplies the velocity transferred from a poker swing into struck particles. Higher values create more chaos.");
+
         igSliderFloat("center gem scale", &centerGemScale, 0.0f, 3.0f, "%.2f", 0);
+        DebugTooltip("Scales the large crystal hovering over the center tile.");
 
         if (igButton("reset camera", (ImVec2_c){0, 0}))
         {
@@ -5730,22 +6019,28 @@ static void UpdateDrawFrame(void)
             camera.target = (Vector3){0.0f, 0.0f, 0.0f};
             camera.fovy = 16.0f;
         }
+        DebugTooltip("Restores the default camera position, target, and zoom.");
 
         // Card model tweakers
         igText("card models: %d", cardModelCount);
         igSliderFloat("card model scale", &cardModelScale, 0.3f, 2.0f, "%.2f", 0);
+        DebugTooltip("Scales the 3D models used for cards in the hand.");
         igSliderFloat("hex model scale", &hexModelScale, 0.5f, 1.5f, "%.2f", 0);
+        DebugTooltip("Scales the 3D card models after they are placed in hex form.");
         igSliderFloat("press tilt", &cardPressTiltDeg, 0.0f, 45.0f, "%.0f", 0);
+        DebugTooltip("Sets the maximum angle a hand card tilts toward the hovered mouse position.");
         if (igButton("test impact", (ImVec2_c){0, 0}))
         {
             impact = (ImpactFx){.position = HexAxialToWorld(0, 0), .tint = (Color){255, 203, 0, 255}, .age = 0.0f, .active = true};
         }
+        DebugTooltip("Plays the card-impact effect once on the center tile.");
 
         for (int i = 0; i < entityCount; i++)
         {
             if (entities[i].kind == ENTITY_HEALTH_BAR)
             {
                 igSliderInt("health", &entities[i].health, 0, entities[i].maxHealth, "%d", 0);
+                DebugTooltip("Directly changes the player's current hearts for damage and game-over testing.");
                 break;
             }
         }
@@ -6045,6 +6340,7 @@ int main(int argc, char *argv[])
 
     // De-Initialization
     //--------------------------------------------------------------------------------------
+    if (box2dTestReady) b2DestroyWorld(box2dTestWorld);
     rlImGuiShutdown();
     UnloadTexture(heartTexture);
     UnloadTexture(mouseRightTexture);
